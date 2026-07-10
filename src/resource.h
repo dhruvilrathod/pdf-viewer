@@ -29,6 +29,7 @@
 #define IDM_EDIT_SELECTALL   1044
 
 #define IDM_HELP_ABOUT       1030
+#define IDM_HELP_CHECKUPDATE 1031  // Tools menu: manual "Check for Updates"
 
 // Annotation tools & file-save (Phase 3)
 #define IDM_TOOL_SELECT      1200

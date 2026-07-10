@@ -26,15 +26,24 @@ add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp)
 target_link_libraries(pdfviewer_savetest PRIVATE mupdf)
 target_compile_definitions(pdfviewer_savetest PRIVATE NOMINMAX UNICODE _UNICODE)
 
+# Console harness for the auto-updater's network + parse path (no GUI). Point
+# it at any public GitHub repo with releases to validate the update check.
+add_executable(pdfviewer_updatetest src/updatetest_main.cpp src/updater.cpp)
+target_link_libraries(pdfviewer_updatetest PRIVATE winhttp shell32 comctl32 user32)
+target_compile_definitions(pdfviewer_updatetest PRIVATE NOMINMAX UNICODE _UNICODE)
+
 # The real GUI application: single self-contained pdfviewer.exe
 add_executable(pdfviewer WIN32
 	src/main.cpp
 	src/viewer_window.cpp
 	src/pdf_document.cpp
 	src/print_document.cpp
+	src/updater.cpp
 	resources/app.rc
 )
-target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 uxtheme)
+# winhttp: GitHub-releases update check + download (stock Windows system DLL,
+# keeps the single-exe/no-redist property). See src/updater.cpp.
+target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 uxtheme winhttp)
 target_compile_definitions(pdfviewer PRIVATE NOMINMAX UNICODE _UNICODE)
 # App/taskbar/Explorer icon, if resources/app.ico has been generated (see
 # icon.png at the repo root -- not committed as .ico directly since it's

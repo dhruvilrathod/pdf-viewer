@@ -50,6 +50,11 @@ Hand it to anyone on a clean Windows 10/11 PC and it just runs.
 - Open **password-protected** PDFs (inline password prompt).
 - **Remove password / restrictions** from an encrypted PDF you can open.
 
+**Automatic updates**
+- On launch the app quietly checks GitHub for a newer release. If one exists it
+  offers a **one-click update** — downloads the new build, swaps it in, and
+  relaunches. Also available on demand via **Tools → Check for Updates**.
+
 **Document tools** (toolbar → wrench menu)
 - **Organize pages** — reorder (drag), rotate, delete, insert pages from other files.
 - **Merge** several PDFs; **Split** by page ranges.
@@ -107,12 +112,23 @@ cmake -S . -B build -DPDFVIEWER_FONTS=cjk
 
 ## Publishing a release (for maintainers)
 
-1. Build Release (above); the artifact is `build/Release/pdfviewer.exe`.
-2. On GitHub: **Releases → Draft a new release**, create a tag (e.g. `v1.0`),
-   and drag `pdfviewer.exe` into the assets box.
-3. Publish. The download link is then
-   `https://github.com/<you>/<repo>/releases/download/v1.0/pdfviewer.exe`, and
-   the README's [Releases](../../releases) link resolves automatically.
+The in-app auto-updater checks the GitHub repo named in
+[`src/updater.h`](src/updater.h) (`kGitHubRepo`) — make sure that matches your
+repo before your first release.
+
+1. Bump the version in [`src/version.h`](src/version.h) (e.g. `1.1.0`).
+2. Build Release (above); the artifact is `build/Release/pdfviewer.exe`.
+3. On GitHub: **Releases → Draft a new release**, create a tag that matches the
+   version with a leading `v` (e.g. `v1.1.0`), and drag `pdfviewer.exe` into the
+   assets box. **The asset must be named `pdfviewer.exe`** (a `.exe`) — that's
+   what the updater downloads.
+4. Publish. Everyone running an older build gets the update prompt on their next
+   launch; the download link is
+   `https://github.com/<you>/<repo>/releases/download/v1.1.0/pdfviewer.exe`.
+
+> The updater only works from a build that already contains it, so include it in
+> your **first** published release — otherwise the initial `v1.0` users have to
+> update once by hand.
 
 ## License
 

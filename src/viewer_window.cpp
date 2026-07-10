@@ -5,6 +5,8 @@
 #include "pdf_document.h"
 #include "print_document.h"
 #include "resource.h"
+#include "updater.h"
+#include "version.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -22,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +47,11 @@ constexpr wchar_t kCanvasClass[] = L"PdfViewerCanvas";
 constexpr wchar_t kThumbClass[] = L"PdfViewerThumbs";
 constexpr wchar_t kColorPopupClass[] = L"PdfColorPopup";
 constexpr wchar_t kResizeHandleClass[] = L"PdfResizeHandle";
+
+// Posted from the background update-check thread back to the frame; LPARAM is
+// a heap-allocated updater::UpdateInfo (frame takes ownership), WPARAM is the
+// `manual` flag. See startUpdateCheck()/onUpdateResult().
+constexpr UINT WM_APP_UPDATE_RESULT = WM_APP + 1;
 
 // Resize-handle direction indices, matching the 8-entry layout used by
 // positionResizeHandles()/updateResize(): NW,N,NE,W,E,SW,S,SE. kResizeMove is
@@ -716,6 +724,15 @@ private:
 	// Protection info bar (see protVisible_'s comment).
 	void updateProtectionBar();
 	void removeProtection();
+
+	// Auto-update (see updater.h). startUpdateCheck spawns a background thread
+	// that posts WM_APP_UPDATE_RESULT back here; onUpdateResult handles the
+	// prompt/download/relaunch on the UI thread. `manual` distinguishes the
+	// Tools-menu "Check for Updates" (which reports "up to date"/errors) from
+	// the silent on-launch check.
+	void startUpdateCheck(bool manual);
+	void onUpdateResult(const updater::UpdateInfo& info, bool manual);
+	bool promptSaveAllIfDirty(); // save-guard across every tab; false = user cancelled
 
 	// Shared operation-result bar (see opResultVisible_'s comment).
 	void showOpResultBar(bool show);
@@ -3274,6 +3291,12 @@ HWND FrameWindow::create(int nCmdShow)
 	if (!hwnd_) return nullptr;
 	ShowWindow(hwnd_, nCmdShow);
 	UpdateWindow(hwnd_);
+
+	// Auto-update: sweep away any leftover from a prior self-replace, then
+	// kick off a silent background check for a newer GitHub release. The
+	// result comes back via WM_APP_UPDATE_RESULT once the message loop runs.
+	updater::CleanupAfterUpdate();
+	startUpdateCheck(/*manual=*/false);
 	return hwnd_;
 }
 
@@ -3713,6 +3736,75 @@ void FrameWindow::removeProtection()
 	}
 	at->protDismissed = true;
 	updateProtectionBar();
+}
+
+// --- Auto-update -----------------------------------------------------------
+
+void FrameWindow::startUpdateCheck(bool manual)
+{
+	HWND hwnd = hwnd_;
+	// Detached worker: the GitHub API round-trip must not block the UI. It
+	// hands the result back via a posted message so all UI happens on the
+	// main thread. The heap UpdateInfo is owned by the message handler.
+	std::thread([hwnd, manual] {
+		auto* info = new updater::UpdateInfo(updater::CheckForUpdate());
+		if (!PostMessageW(hwnd, WM_APP_UPDATE_RESULT, manual ? 1 : 0,
+				reinterpret_cast<LPARAM>(info)))
+			delete info; // window gone -- don't leak
+	}).detach();
+}
+
+bool FrameWindow::promptSaveAllIfDirty()
+{
+	for (int i = 0; i < static_cast<int>(tabs_.size()); ++i) {
+		switchToTab(i);
+		if (!promptSaveIfDirty()) return false;
+	}
+	return true;
+}
+
+void FrameWindow::onUpdateResult(const updater::UpdateInfo& info, bool manual)
+{
+	if (info.checkFailed) {
+		if (manual)
+			MessageBoxW(hwnd_, L"Couldn't check for updates. Please check your internet connection and try again.",
+				L"Check for Updates", MB_OK | MB_ICONWARNING);
+		return; // silent on the automatic launch check
+	}
+	if (!info.available) {
+		if (manual) {
+			std::wstring msg = L"You're on the latest version (" L"" APP_VERSION_STR L").";
+			MessageBoxW(hwnd_, msg.c_str(), L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+		}
+		return;
+	}
+
+	std::wstring prompt = L"Version " + info.latestVersion + L" is available (you have "
+		L"" APP_VERSION_STR L").\n\nUpdate now? The app will briefly close and reopen.";
+	if (MessageBoxW(hwnd_, prompt.c_str(), L"Update Available", MB_YESNO | MB_ICONINFORMATION) != IDYES)
+		return;
+
+	// Don't lose unsaved work across the relaunch.
+	if (!promptSaveAllIfDirty()) return;
+
+	// No .exe in the release (or self-replace not possible) -- fall back to the
+	// browser so the user can grab it manually.
+	if (info.downloadUrl.empty()) {
+		ShellExecuteW(hwnd_, L"open", info.releaseUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+		return;
+	}
+
+	updater::ApplyResult r = updater::DownloadAndApply(hwnd_, info);
+	if (r == updater::ApplyResult::Relaunching) {
+		DestroyWindow(hwnd_); // tabs already saved above; new version is launching
+	} else if (r == updater::ApplyResult::Failed) {
+		int open = MessageBoxW(hwnd_,
+			L"The update couldn't be installed automatically. Open the download page in your browser?",
+			L"Update Failed", MB_YESNO | MB_ICONERROR);
+		if (open == IDYES)
+			ShellExecuteW(hwnd_, L"open", info.releaseUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	}
+	// Canceled: nothing to do.
 }
 
 void FrameWindow::showOpResultBar(bool show)
@@ -4680,6 +4772,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOLS_RESIZE_A4: doResizeToA4(); break;
 	case IDM_TOOLS_FLATTEN: doFlatten(); break;
 	case IDM_TOOLS_COMPRESS: doCompress(); break;
+	case IDM_HELP_CHECKUPDATE: startUpdateCheck(/*manual=*/true); break;
 	case IDC_ORGANIZE_INSERT: organizeInsertPages(); break;
 	case IDC_ORGANIZE_DONE: organizeDone(); break;
 	case IDC_ORGANIZE_CANCEL: organizeCancel(); break;
@@ -4765,6 +4858,8 @@ void FrameWindow::showToolsMenu()
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_RESIZE_A4, L"Resize Pages to A4");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN, L"Convert to Read-Only (Flatten)");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_COMPRESS, L"Compress PDF");
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	AppendMenuW(m, MF_STRING, IDM_HELP_CHECKUPDATE, L"Check for Updates…");
 	int sel = popupUnderButton(IDM_TOOLS_MENU, m);
 	if (sel != 0) onCommand(sel);
 }
@@ -5003,6 +5098,12 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		for (UINT i = 0; i < n; ++i)
 			if (DragQueryFileW(drop, i, path, MAX_PATH)) self->openDocument(path);
 		DragFinish(drop);
+		return 0;
+	}
+	case WM_APP_UPDATE_RESULT: {
+		// Posted from the background update-check thread; we own the UpdateInfo.
+		std::unique_ptr<updater::UpdateInfo> info(reinterpret_cast<updater::UpdateInfo*>(lp));
+		self->onUpdateResult(*info, wp != 0);
 		return 0;
 	}
 	case WM_CLOSE:
