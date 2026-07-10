@@ -1,0 +1,16 @@
+# Normalize text line endings in the repo; check out native on each OS.
+* text=auto
+
+# Keep C/C++/build sources as LF in the repo.
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.rc    text eol=lf
+*.manifest text eol=lf
+*.cmake text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+
+# Binary assets — never touch line endings.
+*.ico   binary
+*.png   binary
+*.pdf   binary

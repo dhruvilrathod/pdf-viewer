@@ -1,0 +1,68 @@
+#include <windows.h>
+#include "../src/resource.h"
+
+IDR_MAINMENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&Open...\tCtrl+O",        IDM_FILE_OPEN
+        MENUITEM "&Save\tCtrl+S",           IDM_FILE_SAVE
+        MENUITEM "Save &As...\tCtrl+Shift+S",IDM_FILE_SAVEAS
+        MENUITEM "&Print...\tCtrl+P",       IDM_FILE_PRINT
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",                    IDM_FILE_EXIT
+    END
+    POPUP "&Edit"
+    BEGIN
+        MENUITEM "&Copy\tCtrl+C",            IDM_EDIT_COPY
+        MENUITEM "Select &All\tCtrl+A",      IDM_EDIT_SELECTALL
+        MENUITEM SEPARATOR
+        MENUITEM "&Find...\tCtrl+F",         IDM_EDIT_FIND
+        MENUITEM "Find &Next\tF3",           IDM_EDIT_FINDNEXT
+        MENUITEM "Find &Previous\tShift+F3", IDM_EDIT_FINDPREV
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "Zoom &In\tCtrl++",         IDM_VIEW_ZOOMIN
+        MENUITEM "Zoom &Out\tCtrl+-",        IDM_VIEW_ZOOMOUT
+        MENUITEM "&Actual Size\tCtrl+0",     IDM_VIEW_ACTUALSIZE
+        MENUITEM "Fit &Width",                IDM_VIEW_FITWIDTH
+        MENUITEM "Fit &Page",                 IDM_VIEW_FITPAGE
+        MENUITEM SEPARATOR
+        MENUITEM "&Continuous Scroll",        IDM_VIEW_CONTINUOUS
+        MENUITEM "&Single Page",              IDM_VIEW_SINGLEPAGE
+        MENUITEM SEPARATOR
+        MENUITEM "Page &Thumbnails",          IDM_VIEW_THUMBS
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About",                    IDM_HELP_ABOUT
+    END
+END
+
+IDR_ACCEL ACCELERATORS
+BEGIN
+    "O",        IDM_FILE_OPEN,      VIRTKEY, CONTROL
+    "S",        IDM_FILE_SAVE,      VIRTKEY, CONTROL
+    "S",        IDM_FILE_SAVEAS,    VIRTKEY, CONTROL, SHIFT
+    "P",        IDM_FILE_PRINT,     VIRTKEY, CONTROL
+    "C",        IDM_EDIT_COPY,      VIRTKEY, CONTROL
+    "A",        IDM_EDIT_SELECTALL, VIRTKEY, CONTROL
+    "F",        IDM_EDIT_FIND,      VIRTKEY, CONTROL
+    VK_F3,      IDM_EDIT_FINDNEXT,  VIRTKEY
+    VK_F3,      IDM_EDIT_FINDPREV,  VIRTKEY, SHIFT
+    VK_ADD,     IDM_VIEW_ZOOMIN,    VIRTKEY, CONTROL
+    VK_OEM_PLUS,IDM_VIEW_ZOOMIN,    VIRTKEY, CONTROL
+    VK_SUBTRACT,IDM_VIEW_ZOOMOUT,   VIRTKEY, CONTROL
+    VK_OEM_MINUS,IDM_VIEW_ZOOMOUT,  VIRTKEY, CONTROL
+    "0",        IDM_VIEW_ACTUALSIZE,VIRTKEY, CONTROL
+    VK_TAB,     IDM_TAB_NEXT,       VIRTKEY, CONTROL
+    VK_TAB,     IDM_TAB_PREV,       VIRTKEY, CONTROL, SHIFT
+    "W",        IDM_TAB_CLOSE,      VIRTKEY, CONTROL
+END
+
+#ifdef PDFVIEWER_HAS_ICON
+IDI_APPICON ICON "app.ico"
+#endif
+
+1 24 "app.manifest"

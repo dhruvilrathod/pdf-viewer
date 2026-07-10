@@ -1,0 +1,27 @@
+# Build output
+/build/
+
+# Vendored MuPDF — fetched via `git clone` at build time (see README),
+# NOT committed: it's large and maintained upstream by Artifex.
+/third_party/mupdf/
+
+# Note: resources/app.ico IS committed (generated from icon.png, but the
+# generation isn't part of the CMake build, so committing it lets a fresh
+# clone build a properly-iconned exe with no extra steps).
+
+# Local/sample PDFs at the repo root — may contain personal/real data,
+# do not publish. (icon.png etc. are unaffected — this only matches *.pdf.)
+/*.pdf
+*.pdfviewer_tmp
+
+# Local Claude Code / editor config — not part of the project.
+/.claude/
+
+# Editor / OS / MSVC cruft
+.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+Thumbs.db
+Desktop.ini
