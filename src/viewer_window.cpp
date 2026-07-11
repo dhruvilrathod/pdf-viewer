@@ -14,6 +14,7 @@
 #include <shlobj.h>   // SHChangeNotify
 #include <shobjidl.h> // IApplicationAssociationRegistrationUI (offer-set-as-default)
 #include <uxtheme.h>  // SetWindowTheme (flat "Explorer" edit-box border)
+#include <dwmapi.h>   // DwmSetWindowAttribute (Win11 rounded corners, Mica, dark title bar)
 #include <windowsx.h>
 
 #include <algorithm>
@@ -39,6 +40,62 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+// ---------------------------------------------------------------------------
+// Windows 11 native chrome (DwmSetWindowAttribute) -- rounded corners, Mica
+// backdrop, dark title bar. These attribute/enum values landed in newer
+// Windows SDK headers; define them defensively so the build works regardless
+// of the installed SDK vintage. On pre-Win11 the DwmSetWindowAttribute calls
+// simply return a failure HRESULT we ignore -- no version gating needed.
+// ---------------------------------------------------------------------------
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMWCP_ROUND
+#define DWMWCP_ROUND 2
+#endif
+#ifndef DWMSBT_MAINWINDOW
+#define DWMSBT_MAINWINDOW 2   // Mica
+#endif
+
+namespace {
+
+// True if the user's Windows app theme is Dark (HKCU AppsUseLightTheme == 0).
+// Defaults to light on any read failure. Reused by the DWM dark-title-bar call
+// and (later) the custom-drawn chrome palette.
+bool SystemUsesDarkTheme()
+{
+	DWORD value = 1, size = sizeof(value);
+	if (RegGetValueW(HKEY_CURRENT_USER,
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+			L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+		return false;
+	return value == 0;
+}
+
+// Apply Win11 native window chrome: rounded corners + Mica backdrop + a title
+// bar tinted to match the current app theme. Each call fails harmlessly on
+// pre-Win11 builds. Safe to call again after a theme change.
+void ApplyModernWindowChrome(HWND hwnd)
+{
+	BOOL dark = SystemUsesDarkTheme() ? TRUE : FALSE;
+	DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+
+	int corner = DWMWCP_ROUND;
+	DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+
+	int backdrop = DWMSBT_MAINWINDOW;
+	DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+}
+
+} // anonymous namespace for DWM chrome helpers
 
 namespace {
 
@@ -2779,6 +2836,17 @@ void ThumbPanel::onPaint()
 	if (doc_ && (organizeMode_ || doc_->isOpen())) {
 		int rowH = organizeMode_ ? Scale(26, dpi_) : Scale(16, dpi_);
 		SetBkMode(mem, TRANSPARENT);
+		// Page-number labels / organize glyphs were drawing in the DC's default
+		// (ancient SYSTEM_FONT) face, which looked dated. Render them in Segoe
+		// UI (ClearType) for a modern look, matching the rest of the chrome.
+		HFONT thumbFont = CreateFontW(-Scale(11, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		// Slightly larger face just for the organize rotate/delete glyphs.
+		HFONT glyphFont = CreateFontW(-Scale(15, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		HGDIOBJ oldFont = SelectObject(mem, thumbFont);
 		HDC src = CreateCompatibleDC(mem);
 		for (int i = 0; i < static_cast<int>(slots_.size()); ++i) {
 			int top = slots_[i].y - scrollY_;
@@ -2820,11 +2888,16 @@ void ThumbPanel::onPaint()
 					DrawTextW(mem, badge, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 				}
 				OrganizeIconRects ir = organizeIconRects(i);
+				// The rotate/delete glyphs read too faint at the number's size;
+				// draw them a couple points larger with the glyph font, then
+				// restore the number font.
+				HGDIOBJ prevF = SelectObject(mem, glyphFont);
 				SetTextColor(mem, RGB(70, 70, 70));
 				DrawTextW(mem, L"↺", -1, &ir.ccw, DT_CENTER | DT_VCENTER | DT_SINGLELINE); // rotate CCW
 				DrawTextW(mem, L"↻", -1, &ir.cw, DT_CENTER | DT_VCENTER | DT_SINGLELINE);  // rotate CW
 				SetTextColor(mem, RGB(180, 40, 40));
 				DrawTextW(mem, L"✕", -1, &ir.del, DT_CENTER | DT_VCENTER | DT_SINGLELINE); // delete
+				SelectObject(mem, prevF);
 				wchar_t num[16]; swprintf(num, 16, L"%d", i + 1);
 				RECT nr = { ir.ccw.right, ir.ccw.top, ir.cw.left, ir.ccw.bottom };
 				SetTextColor(mem, RGB(90, 90, 90));
@@ -2837,6 +2910,9 @@ void ThumbPanel::onPaint()
 			}
 		}
 		DeleteDC(src);
+		SelectObject(mem, oldFont);
+		DeleteObject(thumbFont);
+		DeleteObject(glyphFont);
 	}
 
 	BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
@@ -3034,7 +3110,14 @@ LRESULT CALLBACK ThumbPanel::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ===========================================================================
 namespace icons {
 
-constexpr Gdiplus::ARGB kInk = 0xFF505050; // lighter/thinner-reading gray, closer to Edge's icon tone
+// Crisper Fluent neutral (was 0xFF505050, which read washed-out). Dark enough
+// to feel modern/legible, not a harsh pure black.
+constexpr Gdiplus::ARGB kInk = 0xFF424242;
+// Single shared stroke weight so every glyph reads at a consistent thickness
+// (~1.25px at the 20px icon size -- a lighter, more modern Fluent line; the
+// earlier 0.08 read too heavy). Icons that intentionally deviate (Width's
+// graded lines, Opacity's pie) still pass their own value.
+constexpr float kStroke = 0.0625f;
 
 // Normalized-coordinate drawing helper: every icon function works in a
 // [0,1] x [0,1] unit square regardless of final pixel size, which keeps the
@@ -3043,7 +3126,7 @@ struct IconPen {
 	Gdiplus::Graphics& g;
 	float s;
 	Gdiplus::Pen pen;
-	explicit IconPen(Gdiplus::Graphics& g_, float s_, float widthFrac = 0.085f)
+	explicit IconPen(Gdiplus::Graphics& g_, float s_, float widthFrac = kStroke)
 		: g(g_), s(s_), pen(Gdiplus::Color(kInk), s_ * widthFrac)
 	{
 		pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -3089,7 +3172,7 @@ void DrawOpen(Gdiplus::Graphics& g, float s)
 
 void DrawSave(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.18f, 0.16f, 0.64f, 0.68f);
 	p.rect(0.32f, 0.18f, 0.24f, 0.16f);
 	p.rect(0.26f, 0.52f, 0.48f, 0.26f);
@@ -3097,7 +3180,7 @@ void DrawSave(Gdiplus::Graphics& g, float s)
 
 void DrawSaveAs(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.12f, 0.14f, 0.56f, 0.58f);
 	p.rect(0.22f, 0.16f, 0.20f, 0.14f);
 	p.rect(0.18f, 0.44f, 0.40f, 0.20f);
@@ -3125,20 +3208,20 @@ void DrawFind(Gdiplus::Graphics& g, float s)
 // toolbar exactly, which uses bare +/- for zoom.
 void DrawZoomOut(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.line(0.20f, 0.5f, 0.80f, 0.5f);
 }
 
 void DrawZoomIn(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.line(0.20f, 0.5f, 0.80f, 0.5f);
 	p.line(0.5f, 0.20f, 0.5f, 0.80f);
 }
 
 void DrawFitWidth(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.32f, 0.12f, 0.36f, 0.76f);
 	p.line(0.06f, 0.5f, 0.24f, 0.5f);
 	p.polyline({ {0.14f,0.40f}, {0.06f,0.50f}, {0.14f,0.60f} });
@@ -3148,7 +3231,7 @@ void DrawFitWidth(Gdiplus::Graphics& g, float s)
 
 void DrawFitPage(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.28f, 0.22f, 0.44f, 0.56f);
 	p.line(0.5f, 0.02f, 0.5f, 0.18f);
 	p.polyline({ {0.40f,0.10f}, {0.50f,0.02f}, {0.60f,0.10f} });
@@ -3166,7 +3249,7 @@ void DrawContinuous(Gdiplus::Graphics& g, float s)
 
 void DrawSinglePage(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.28f, 0.12f, 0.44f, 0.76f);
 }
 
@@ -3181,21 +3264,21 @@ void DrawThumbs(Gdiplus::Graphics& g, float s)
 
 void DrawSelectTool(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.polyline({ {0.20f,0.14f}, {0.20f,0.80f}, {0.38f,0.63f}, {0.50f,0.86f},
 		{0.60f,0.81f}, {0.47f,0.58f}, {0.70f,0.55f}, {0.20f,0.14f} });
 }
 
 void DrawHighlightTool(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.polyline({ {0.20f,0.68f}, {0.54f,0.28f}, {0.76f,0.48f}, {0.42f,0.86f}, {0.20f,0.68f} });
 	p.line(0.14f, 0.90f, 0.42f, 0.90f);
 }
 
 void DrawDrawTool(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.line(0.20f, 0.80f, 0.60f, 0.40f);
 	p.polyline({ {0.60f,0.40f}, {0.76f,0.20f}, {0.84f,0.28f}, {0.68f,0.48f}, {0.60f,0.40f} });
 	p.line(0.16f, 0.84f, 0.24f, 0.84f);
@@ -3219,7 +3302,7 @@ void DrawTextTool(Gdiplus::Graphics& g, float s)
 // glance, without breaking the flat monochrome look everywhere else.
 void DrawColorTool(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.085f);
+	IconPen p(g, s);
 	p.ellipse(0.16f, 0.16f, 0.60f, 0.60f);
 	Gdiplus::SolidBrush dot(Gdiplus::Color(255, 205, 60, 55));
 	g.FillEllipse(&dot, s * 0.32f, s * 0.32f, s * 0.28f, s * 0.28f);
@@ -3246,9 +3329,9 @@ void DrawWidthTool(Gdiplus::Graphics& g, float s)
 void DrawOpacityTool(Gdiplus::Graphics& g, float s)
 {
 	Gdiplus::RectF rc(s * 0.18f, s * 0.18f, s * 0.54f, s * 0.54f);
-	Gdiplus::SolidBrush fill(Gdiplus::Color(200, 0x50, 0x50, 0x50));
+	Gdiplus::SolidBrush fill(Gdiplus::Color(200, 0x42, 0x42, 0x42));
 	g.FillPie(&fill, rc, 90, 180);
-	Gdiplus::Pen pen(Gdiplus::Color(kInk), s * 0.075f);
+	Gdiplus::Pen pen(Gdiplus::Color(kInk), s * kStroke);
 	g.DrawEllipse(&pen, rc);
 }
 
@@ -3256,7 +3339,7 @@ void DrawOpacityTool(Gdiplus::Graphics& g, float s)
 // reads as "blackout/redact" at a glance.
 void DrawRedactTool(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.line(0.16f, 0.24f, 0.84f, 0.24f);
 	p.line(0.16f, 0.76f, 0.60f, 0.76f);
 	Gdiplus::SolidBrush black(Gdiplus::Color(255, 20, 20, 20));
@@ -3267,7 +3350,7 @@ void DrawRedactTool(Gdiplus::Graphics& g, float s)
 // Tools popup-menu button (Organize/Merge/Split/Resize/Flatten/Compress).
 void DrawToolsMenu(Gdiplus::Graphics& g, float s)
 {
-	IconPen p(g, s, 0.09f);
+	IconPen p(g, s);
 	p.rect(0.14f, 0.42f, 0.72f, 0.42f);
 	Gdiplus::RectF arc(s * 0.30f, s * 0.14f, s * 0.40f, s * 0.36f);
 	g.DrawArc(&p.pen, arc, 180, 180);
@@ -3289,7 +3372,17 @@ HWND FrameWindow::create(int nCmdShow)
 		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
 		Scale(1100, 96), Scale(800, 96), nullptr, nullptr, hInst_, this);
 	if (!hwnd_) return nullptr;
-	ShowWindow(hwnd_, nCmdShow);
+	// Windows 11 native chrome: rounded corners, Mica backdrop, themed title
+	// bar. No-op on older Windows. Applied before ShowWindow so the first
+	// paint already has the correct frame.
+	ApplyModernWindowChrome(hwnd_);
+	// Open maximized by default (fills the screen, keeping the title bar and
+	// taskbar -- what users mean by "full screen" for a document app). Still
+	// honor an explicit minimized/hidden launch (e.g. a shortcut set to run
+	// minimized); the CW_USEDEFAULT size above becomes the restored size.
+	int show = (nCmdShow == SW_SHOWMINIMIZED || nCmdShow == SW_SHOWMINNOACTIVE ||
+	            nCmdShow == SW_HIDE) ? nCmdShow : SW_SHOWMAXIMIZED;
+	ShowWindow(hwnd_, show);
 	UpdateWindow(hwnd_);
 
 	// Auto-update: sweep away any leftover from a prior self-replace, then
@@ -3323,6 +3416,10 @@ void FrameWindow::createChildren()
 	int iconPx = Scale(20, dpi);
 	toolbarImages_ = ImageList_Create(iconPx, iconPx, ILC_COLOR32, 0, 1);
 	SendMessageW(toolbar_, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(toolbarImages_));
+	// Roomier, even hit targets on a Fluent 4/8 spacing grid: with the 20px
+	// icon this yields ~36px-tall square-ish buttons and consistent gaps,
+	// giving the rounded hover pills room to breathe.
+	SendMessageW(toolbar_, TB_SETPADDING, 0, MAKELPARAM(Scale(10, dpi), Scale(8, dpi)));
 	auto addIcon = [&](const icons::DrawFn& draw) -> int {
 		HBITMAP hb = icons::MakeIcon(iconPx, draw);
 		int idx = ImageList_Add(toolbarImages_, hb, nullptr);
@@ -5069,15 +5166,62 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
 				FillRect(cd->nmcd.hdc, &rc, bg);
 				DeleteObject(bg);
-				SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
-				return TRUE;
+				// This is a normal WNDPROC, so the custom-draw result must be the
+				// procedure's RETURN value -- DWLP_MSGRESULT is a dialog-proc
+				// mechanism and is ignored here. (Returning it wrong is why an
+				// earlier attempt's per-item drawing never ran.)
+				return CDRF_NOTIFYITEMDRAW;
 			}
-			case CDDS_ITEMPREPAINT:
-				cd->clrText = RGB(0x30, 0x30, 0x30);
-				cd->clrBtnFace = RGB(255, 255, 255);
-				cd->clrHighlightHotTrack = RGB(229, 241, 251);
-				SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, TBCDRF_USECDCOLORS | CDRF_DODEFAULT);
-				return TRUE;
+			case CDDS_ITEMPREPAINT: {
+				// Fluent-style state layer: a soft rounded "pill" behind the
+				// icon for hover / pressed / active(checked), instead of the
+				// dated light-blue Aero highlight. On a *themed* toolbar the
+				// TBCDRF_NOBACKGROUND/NOMARK flags are ignored (the theme's
+				// DrawThemeBackground repaints the blue over us), so we fully
+				// own-draw the button -- pill + glyph -- and CDRF_SKIPDEFAULT.
+				// Separators (and anything we can't resolve) fall through to
+				// the default drawing, which renders them on the white bg.
+				UINT id = static_cast<UINT>(cd->nmcd.dwItemSpec);
+				TBBUTTONINFOW bi = {};
+				bi.cbSize = sizeof(bi);
+				bi.dwMask = TBIF_IMAGE | TBIF_STYLE;
+				LRESULT gi = SendMessageW(self->toolbar_, TB_GETBUTTONINFOW, id,
+					reinterpret_cast<LPARAM>(&bi));
+				if (gi < 0 || (bi.fsStyle & BTNS_SEP)) {
+					return CDRF_DODEFAULT;
+				}
+
+				UINT st = cd->nmcd.uItemState;
+				COLORREF fill = 0;
+				bool paint = true;
+				if (st & CDIS_SELECTED)        fill = RGB(0xDE, 0xDE, 0xDE); // pressed
+				else if (st & CDIS_CHECKED)
+					fill = (st & CDIS_HOT) ? RGB(0xDE, 0xDE, 0xDE)          // active + hover
+					                       : RGB(0xE8, 0xE8, 0xE8);          // active tool
+				else if (st & CDIS_HOT)        fill = RGB(0xF2, 0xF2, 0xF2); // hover
+				else paint = false;
+
+				RECT r = cd->nmcd.rc;
+				UINT dpi = GetDpiForWindow(self->toolbar_);
+				if (paint) {
+					RECT pr = r;
+					InflateRect(&pr, -Scale(2, dpi), -Scale(2, dpi));
+					int rad = Scale(5, dpi) * 2;
+					HRGN rgn = CreateRoundRectRgn(pr.left, pr.top, pr.right + 1, pr.bottom + 1, rad, rad);
+					HBRUSH br = CreateSolidBrush(fill);
+					FillRgn(cd->nmcd.hdc, rgn, br);
+					DeleteObject(br);
+					DeleteObject(rgn);
+				}
+				if (bi.iImage >= 0) {
+					int cx = 0, cy = 0;
+					ImageList_GetIconSize(self->toolbarImages_, &cx, &cy);
+					int ix = r.left + ((r.right - r.left) - cx) / 2;
+					int iy = r.top + ((r.bottom - r.top) - cy) / 2;
+					ImageList_Draw(self->toolbarImages_, bi.iImage, cd->nmcd.hdc, ix, iy, ILD_NORMAL);
+				}
+				return CDRF_SKIPDEFAULT;
+			}
 			}
 			break;
 		}

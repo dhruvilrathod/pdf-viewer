@@ -43,7 +43,7 @@ add_executable(pdfviewer WIN32
 )
 # winhttp: GitHub-releases update check + download (stock Windows system DLL,
 # keeps the single-exe/no-redist property). See src/updater.cpp.
-target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 uxtheme winhttp)
+target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 uxtheme dwmapi winhttp)
 target_compile_definitions(pdfviewer PRIVATE NOMINMAX UNICODE _UNICODE)
 # App/taskbar/Explorer icon, if resources/app.ico has been generated (see
 # icon.png at the repo root -- not committed as .ico directly since it's
