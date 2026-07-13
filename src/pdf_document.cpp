@@ -75,6 +75,20 @@ std::wstring cleanFontFamily(const char* rawName, int& bold, int& italic)
 	for (auto& a : kAliases)
 		if (_stricmp(n.c_str(), a.ps) == 0) return a.win;
 
+	// PDF/PostScript font names are typically spaceless CamelCase
+	// ("CenturyGothic", "MyriadPro"), but Windows family names have spaces
+	// ("Century Gothic"). Insert a space at each lowercase->uppercase boundary
+	// so CreateFontW can find the installed family instead of falling back.
+	std::string spaced;
+	spaced.reserve(n.size() + 4);
+	for (size_t i = 0; i < n.size(); ++i) {
+		if (i > 0 && std::isupper(static_cast<unsigned char>(n[i])) &&
+			std::islower(static_cast<unsigned char>(n[i - 1])))
+			spaced.push_back(' ');
+		spaced.push_back(n[i]);
+	}
+	n = spaced;
+
 	int wn = MultiByteToWideChar(CP_UTF8, 0, n.c_str(), -1, nullptr, 0);
 	if (wn <= 0) return {};
 	std::wstring w(static_cast<size_t>(wn - 1), L'\0');
