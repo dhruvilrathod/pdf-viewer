@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "../src/resource.h"
+#include "../src/version.h"
 
 IDR_MAINMENU MENU
 BEGIN
@@ -66,3 +67,32 @@ IDI_APPICON ICON "app.ico"
 #endif
 
 1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,0
+ PRODUCTVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Dhruvil Rathod"
+            VALUE "FileDescription",  "PDFast - fast, lightweight PDF viewer and editor"
+            VALUE "FileVersion",      APP_VERSION_STR
+            VALUE "InternalName",     "PDFast"
+            VALUE "OriginalFilename", "PDFast.exe"
+            VALUE "ProductName",      "PDFast"
+            VALUE "ProductVersion",   APP_VERSION_STR
+            VALUE "LegalCopyright",   "(C) Dhruvil Rathod. Licensed under AGPL-3.0."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

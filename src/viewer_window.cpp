@@ -3368,7 +3368,7 @@ HWND FrameWindow::create(int nCmdShow)
 	// (Ctrl+O, Ctrl+S, Ctrl+F, ...) cover everything, matching Edge's PDF
 	// viewer chrome. IDR_MAINMENU is left in the .rc file unused rather than
 	// deleted, in case a "more options" overflow menu wants it later.
-	hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, kFrameClass, L"PDF Viewer",
+	hwnd_ = CreateWindowExW(WS_EX_ACCEPTFILES, kFrameClass, L"PDFast",
 		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
 		Scale(1100, 96), Scale(800, 96), nullptr, nullptr, hInst_, this);
 	if (!hwnd_) return nullptr;
@@ -4899,9 +4899,9 @@ void FrameWindow::onCommand(int id)
 	case IDM_GO_NEXT: if (canvas_) canvas_->goToPage(canvas_->currentPage() + 1); break;
 	case IDM_HELP_ABOUT:
 		MessageBoxW(hwnd_,
-			L"PDF Viewer\nA lightweight native Windows PDF viewer.\n"
+			L"PDFast\nA fast, lightweight native Windows PDF viewer and editor.\n"
 			L"Rendering by MuPDF (statically linked).",
-			L"About PDF Viewer", MB_OK | MB_ICONINFORMATION);
+			L"About PDFast", MB_OK | MB_ICONINFORMATION);
 		break;
 	}
 }
@@ -5042,10 +5042,10 @@ void FrameWindow::updateTitle()
 {
 	DocTab* at = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size())) ? tabs_[activeTab_].get() : nullptr;
 	std::wstring t;
-	if (!at || at->name.empty()) t = L"PDF Viewer";
+	if (!at || at->name.empty()) t = L"PDFast";
 	else {
 		if (at->doc && at->doc->dirty()) t += L"*";
-		t += at->name + L" - PDF Viewer";
+		t += at->name + L" - PDFast";
 	}
 	SetWindowTextW(hwnd_, t.c_str());
 	if (activeTab_ >= 0) updateTabLabel(activeTab_);
@@ -5102,7 +5102,7 @@ bool FrameWindow::promptSaveIfDirty()
 {
 	if (canvas_) canvas_->flushPendingEdit(); // in-progress typing counts as a change
 	if (!doc_ || !doc_->dirty()) return true;
-	int r = MessageBoxW(hwnd_, L"Save changes to this document?", L"PDF Viewer",
+	int r = MessageBoxW(hwnd_, L"Save changes to this document?", L"PDFast",
 		MB_YESNOCANCEL | MB_ICONWARNING);
 	if (r == IDCANCEL) return false;
 	if (r == IDYES) {
@@ -5280,9 +5280,10 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ===========================================================================
 namespace {
 
-const wchar_t kProgId[] = L"PDFViewerApp.pdf";
-const wchar_t kAppRegKey[] = L"Software\\PDFViewerApp";
-const wchar_t kAppName[] = L"PDF Viewer";
+const wchar_t kProgId[] = L"PDFast.pdf";
+const wchar_t kAppRegKey[] = L"Software\\PDFast";
+const wchar_t kAppName[] = L"PDFast";
+const wchar_t kExeRegName[] = L"PDFast.exe"; // HKCU\...\Classes\Applications\<this> for "Open with"
 
 void SetRegString(HKEY root, const std::wstring& subkey, const wchar_t* name, const std::wstring& value)
 {
@@ -5306,14 +5307,75 @@ void RegisterFileAssociation()
 	SetRegString(HKEY_CURRENT_USER, progIdKey + L"\\DefaultIcon", nullptr, std::wstring(exePath) + L",0");
 
 	std::wstring capKey = std::wstring(kAppRegKey) + L"\\Capabilities";
-	const wchar_t* desc = L"A lightweight native PDF viewer and editor.";
+	const wchar_t* desc = L"A fast, lightweight native PDF viewer and editor.";
 	SetRegString(HKEY_CURRENT_USER, capKey, L"ApplicationName", kAppName);
 	SetRegString(HKEY_CURRENT_USER, capKey, L"ApplicationDescription", desc);
 	SetRegString(HKEY_CURRENT_USER, capKey + L"\\FileAssociations", L".pdf", kProgId);
 
 	SetRegString(HKEY_CURRENT_USER, L"Software\\RegisteredApplications", kAppName, capKey);
 
+	// Populate the right-click "Open with" list. This needs the per-application
+	// registration under Classes\Applications\<exe> (friendly name + open verb +
+	// declared supported types) AND the .pdf's OpenWithProgIds pointing at our
+	// ProgID -- the RegisteredApplications/Capabilities block above only makes
+	// us a *Default Apps* candidate, it does not by itself surface us in
+	// "Open with".
+	std::wstring appKey = L"Software\\Classes\\Applications\\" + std::wstring(kExeRegName);
+	SetRegString(HKEY_CURRENT_USER, appKey, L"FriendlyAppName", kAppName);
+	SetRegString(HKEY_CURRENT_USER, appKey + L"\\shell\\open\\command", nullptr, openCmd);
+	SetRegString(HKEY_CURRENT_USER, appKey + L"\\DefaultIcon", nullptr, std::wstring(exePath) + L",0");
+	SetRegString(HKEY_CURRENT_USER, appKey + L"\\SupportedTypes", L".pdf", L"");
+	SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\.pdf\\OpenWithProgIds", kProgId, L"");
+
 	SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
+// Create (or self-heal) a Start Menu shortcut so PDFast shows up in the Start
+// menu and in search -- there's no installer to do it, so the app plants its
+// own .lnk on launch. Idempotent: if a shortcut already points at the current
+// exe we leave it; if the exe was moved we repoint it (matching the file-
+// association self-heal behavior). Under the *user's* Programs folder, so no
+// admin rights are needed.
+void EnsureStartMenuShortcut()
+{
+	wchar_t exePath[MAX_PATH];
+	if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
+
+	PWSTR programs = nullptr;
+	if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs)) || !programs) return;
+	std::wstring lnkPath = std::wstring(programs) + L"\\" + std::wstring(kAppName) + L".lnk";
+	CoTaskMemFree(programs);
+
+	HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	bool comOwned = SUCCEEDED(hr);
+	if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+		IShellLinkW* link = nullptr;
+		if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) {
+			IPersistFile* pf = nullptr;
+			if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&pf)))) {
+				bool exists = false, sameTarget = false;
+				if (SUCCEEDED(pf->Load(lnkPath.c_str(), STGM_READ))) {
+					exists = true;
+					wchar_t cur[MAX_PATH] = {};
+					if (SUCCEEDED(link->GetPath(cur, MAX_PATH, nullptr, 0)))
+						sameTarget = (_wcsicmp(cur, exePath) == 0);
+				}
+				if (!exists || !sameTarget) {
+					std::wstring dir(exePath);
+					size_t slash = dir.find_last_of(L"\\/");
+					if (slash != std::wstring::npos) dir.resize(slash);
+					link->SetPath(exePath);
+					link->SetDescription(L"Fast, lightweight PDF viewer and editor");
+					link->SetIconLocation(exePath, 0);
+					link->SetWorkingDirectory(dir.c_str());
+					pf->Save(lnkPath.c_str(), TRUE);
+				}
+				pf->Release();
+			}
+			link->Release();
+		}
+	}
+	if (comOwned) CoUninitialize();
 }
 
 bool AlreadyOfferedDefaultPrompt()
@@ -5365,8 +5427,8 @@ void OfferSetAsDefault(HWND owner)
 	if (AlreadyOfferedDefaultPrompt()) return;
 	MarkOfferedDefaultPrompt();
 	int r = MessageBoxW(owner,
-		L"Would you like to set PDF Viewer as your default app for opening PDF files?",
-		L"PDF Viewer", MB_YESNO | MB_ICONQUESTION);
+		L"Would you like to set PDFast as your default app for opening PDF files?",
+		L"PDFast", MB_YESNO | MB_ICONQUESTION);
 	if (r == IDYES) LaunchDefaultAppsUI(owner);
 }
 
@@ -5397,10 +5459,15 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 
 	if (optionalPath && *optionalPath) frame->openDocument(optionalPath);
 
+	// Plant/refresh the Start Menu shortcut (no installer does it for us) so
+	// PDFast is reachable from Start and search. Cheap + idempotent per launch.
+	EnsureStartMenuShortcut();
+
 	// One-time (per user) offer to register as the default .pdf handler.
 	// Registers the file association candidate unconditionally (cheap,
-	// idempotent, HKCU-only); the actual "make it default" confirmation
-	// always goes through Windows' own UI, never silently.
+	// idempotent, HKCU-only) -- this also populates the right-click "Open with"
+	// list; the actual "make it default" confirmation always goes through
+	// Windows' own UI, never silently.
 	OfferSetAsDefault(frame->hwnd());
 
 	HACCEL accel = LoadAcceleratorsW(hInstance, MAKEINTRESOURCEW(IDR_ACCEL));

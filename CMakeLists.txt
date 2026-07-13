@@ -53,6 +53,10 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/resources/app.ico")
 endif()
 # Treat our source as UTF-8 so non-ASCII string literals (→, etc.) encode right.
 target_compile_options(pdfviewer PRIVATE /utf-8)
+# Ship the binary as PDFast.exe (the product name) while keeping the internal
+# CMake target name `pdfviewer` stable. The self-updater finds its own path via
+# GetModuleFileNameW, so the renamed output updates itself fine.
+set_target_properties(pdfviewer PROPERTIES OUTPUT_NAME "PDFast")
 # app.rc embeds our own manifest (id 1); stop the linker generating a second.
 target_link_options(pdfviewer PRIVATE /MANIFEST:NO)
 # Ensure the resource compiler can find app.manifest referenced by app.rc.
