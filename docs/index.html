@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDFast — A fast, native Windows PDF viewer &amp; editor</title>
+<meta name="description" content="PDFast is a fast, lightweight, native Windows PDF viewer and editor packed into a single self-contained .exe. No installer, no dependencies. Free and open source.">
+
+<meta property="og:title" content="PDFast — A fast, native Windows PDF viewer &amp; editor">
+<meta property="og:description" content="A single self-contained .exe. No installer, no dependencies. Open, annotate, fill, merge, split, compress and redact PDFs.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="icon.png">
+
+<link rel="icon" type="image/png" href="icon.png">
+
+<style>
+  :root{
+    --accent:#e10600;
+    --accent-hover:#c40500;
+    --bg:#ffffff;
+    --bg-soft:#f6f7f9;
+    --bg-card:#ffffff;
+    --text:#1a1c1f;
+    --text-soft:#5b6470;
+    --border:#e6e8ec;
+    --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.06);
+    --radius:14px;
+    --maxw:1080px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0e1013;
+      --bg-soft:#15181d;
+      --bg-card:#171a20;
+      --text:#eef1f5;
+      --text-soft:#9aa4b2;
+      --border:#252a32;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.4);
+    }
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    font-family:"Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* ---- Nav ---- */
+  header{
+    position:sticky;top:0;z-index:50;
+    background:color-mix(in srgb,var(--bg) 82%,transparent);
+    backdrop-filter:saturate(160%) blur(12px);
+    border-bottom:1px solid var(--border);
+  }
+  .nav{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.15rem;letter-spacing:-.01em}
+  .brand img{width:28px;height:28px;border-radius:6px}
+  .nav-links{display:flex;align-items:center;gap:8px}
+  .nav-links a{color:var(--text-soft);font-size:.94rem;padding:8px 12px;border-radius:8px;transition:.15s}
+  .nav-links a:hover{color:var(--text);background:var(--bg-soft)}
+  .nav-links .ghost{border:1px solid var(--border)}
+
+  /* ---- Buttons ---- */
+  .btn{
+    display:inline-flex;align-items:center;gap:9px;
+    font-size:1rem;font-weight:600;
+    padding:13px 22px;border-radius:11px;
+    border:1px solid transparent;cursor:pointer;transition:.15s;white-space:nowrap;
+  }
+  .btn-primary{background:var(--accent);color:#fff;box-shadow:0 6px 16px rgba(225,6,0,.28)}
+  .btn-primary:hover{background:var(--accent-hover);transform:translateY(-1px)}
+  .btn-secondary{background:var(--bg-card);color:var(--text);border-color:var(--border)}
+  .btn-secondary:hover{background:var(--bg-soft)}
+  .btn svg{width:19px;height:19px}
+
+  /* ---- Hero ---- */
+  .hero{padding:88px 0 64px;text-align:center;position:relative;overflow:hidden}
+  .hero::before{
+    content:"";position:absolute;inset:0;z-index:-1;
+    background:
+      radial-gradient(60% 55% at 50% -10%,rgba(225,6,0,.10),transparent 70%);
+  }
+  .badge{
+    display:inline-flex;align-items:center;gap:8px;
+    font-size:.82rem;font-weight:600;color:var(--text-soft);
+    background:var(--bg-soft);border:1px solid var(--border);
+    padding:6px 14px;border-radius:999px;margin-bottom:26px;
+  }
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .hero h1{
+    font-size:clamp(2.4rem,6vw,4rem);line-height:1.05;letter-spacing:-.03em;
+    margin:0 0 20px;font-weight:800;
+  }
+  .hero h1 .accent{color:var(--accent)}
+  .hero p.sub{
+    font-size:clamp(1.05rem,2.2vw,1.3rem);color:var(--text-soft);
+    max-width:640px;margin:0 auto 36px;
+  }
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+  .hero .meta{margin-top:22px;font-size:.86rem;color:var(--text-soft)}
+  .hero .meta b{color:var(--text)}
+
+  /* ---- App window mock ---- */
+  .mock-wrap{margin:60px auto 0;max-width:900px;padding:0 24px}
+  .mock{
+    border:1px solid var(--border);border-radius:16px;overflow:hidden;
+    box-shadow:var(--shadow);background:var(--bg-card);
+  }
+  .mock .titlebar{
+    display:flex;align-items:center;gap:8px;padding:11px 14px;
+    background:var(--bg-soft);border-bottom:1px solid var(--border);
+  }
+  .mock .titlebar .tdot{width:11px;height:11px;border-radius:50%}
+  .mock .titlebar .tab{
+    margin-left:8px;font-size:.82rem;color:var(--text-soft);
+    background:var(--bg-card);padding:5px 14px;border-radius:7px 7px 0 0;
+    border:1px solid var(--border);border-bottom:none;
+    display:inline-flex;align-items:center;gap:7px;
+  }
+  .mock .toolbar{
+    display:flex;align-items:center;gap:6px;padding:9px 14px;
+    border-bottom:1px solid var(--border);flex-wrap:wrap;
+  }
+  .mock .tool{width:26px;height:26px;border-radius:6px;background:var(--bg-soft);display:inline-block}
+  .mock .tool.sep{width:1px;background:var(--border);border-radius:0;height:22px}
+  .mock .page-area{
+    padding:34px;display:flex;justify-content:center;
+    background:repeating-linear-gradient(45deg,var(--bg-soft),var(--bg-soft) 12px,transparent 12px,transparent 24px);
+  }
+  .mock .page{
+    width:min(420px,72%);aspect-ratio:1/1.32;background:#fff;border-radius:4px;
+    box-shadow:0 4px 22px rgba(16,24,40,.16);padding:26px 24px;
+  }
+  .mock .page .ln{height:8px;border-radius:4px;background:#e9ebef;margin-bottom:11px}
+  .mock .page .ln.t{height:13px;width:55%;margin-bottom:20px;background:#d7dbe0}
+  .mock .page .ln.s{width:88%}
+  .mock .page .ln.m{width:72%}
+  .mock .page .band{height:44px;border-radius:4px;background:var(--accent);margin:22px 0;
+    display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;letter-spacing:.35em;font-size:1.1rem}
+  .mock .page .hl{background:#fff3b0;box-shadow:0 0 0 3px #fff3b0}
+
+  /* ---- Sections ---- */
+  section{padding:80px 0}
+  .section-soft{background:var(--bg-soft);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+  .sec-head{text-align:center;max-width:640px;margin:0 auto 52px}
+  .sec-head h2{font-size:clamp(1.7rem,3.5vw,2.4rem);letter-spacing:-.02em;margin:0 0 14px;font-weight:800}
+  .sec-head p{color:var(--text-soft);font-size:1.08rem;margin:0}
+
+  /* ---- Why ---- */
+  .why{max-width:720px;margin:0 auto;text-align:center}
+  .why p{font-size:1.15rem;color:var(--text-soft);margin:0 0 20px}
+  .why p b{color:var(--text)}
+
+  /* ---- Features ---- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+  .card{
+    background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+    padding:26px;transition:.18s;
+  }
+  .card:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:color-mix(in srgb,var(--accent) 30%,var(--border))}
+  .card .ic{
+    width:44px;height:44px;border-radius:11px;margin-bottom:16px;
+    display:flex;align-items:center;justify-content:center;
+    background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);
+  }
+  .card .ic svg{width:23px;height:23px}
+  .card h3{margin:0 0 8px;font-size:1.15rem;letter-spacing:-.01em}
+  .card p{margin:0;color:var(--text-soft);font-size:.96rem}
+
+  /* ---- Download ---- */
+  .dl{max-width:680px;margin:0 auto;text-align:center}
+  .steps{text-align:left;margin:34px auto 0;display:grid;gap:16px}
+  .step{display:flex;gap:16px;align-items:flex-start;background:var(--bg-card);
+    border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+  .step .n{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accent);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem}
+  .step p{margin:0;font-size:.98rem}
+  .step p b{color:var(--text)}
+  .note{
+    margin-top:26px;text-align:left;font-size:.9rem;color:var(--text-soft);
+    background:var(--bg-soft);border:1px solid var(--border);border-left:3px solid var(--accent);
+    border-radius:10px;padding:16px 18px;
+  }
+  .note b{color:var(--text)}
+
+  /* ---- Footer ---- */
+  footer{border-top:1px solid var(--border);padding:48px 0 60px;color:var(--text-soft);font-size:.9rem}
+  .foot-grid{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  .foot-brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--text);margin-bottom:10px}
+  .foot-brand img{width:24px;height:24px;border-radius:5px}
+  .foot-links{display:flex;gap:28px;flex-wrap:wrap}
+  .foot-links a{color:var(--text-soft)}
+  .foot-links a:hover{color:var(--accent)}
+  footer .lic{margin-top:24px;padding-top:22px;border-top:1px solid var(--border);max-width:560px}
+  code{background:var(--bg-soft);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:.86em}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top"><img src="icon.png" alt="PDFast logo">PDFast</a>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#download">Download</a>
+      <a class="ghost" href="https://github.com/dhruvilrathod/pdf-viewer" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap">
+      <span class="badge"><span class="dot"></span>Free &amp; open source · Windows 10/11</span>
+      <h1>The PDF viewer that just<br><span class="accent">gets out of your way</span></h1>
+      <p class="sub">A fast, lightweight, native Windows PDF viewer &amp; editor — packed into a single
+        self-contained <code>.exe</code>. No installer. No .NET. No dependencies.</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/dhruvilrathod/pdf-viewer/releases/latest" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download for Windows
+        </a>
+        <a class="btn btn-secondary" href="https://github.com/dhruvilrathod/pdf-viewer" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/></svg>
+          View on GitHub
+        </a>
+      </div>
+      <p class="meta">~5.5&nbsp;MB single file · <b>Nothing to install</b> — download and double-click</p>
+    </div>
+
+    <!-- app window mock -->
+    <div class="mock-wrap">
+      <div class="mock">
+        <div class="titlebar">
+          <span class="tdot" style="background:#ff5f57"></span>
+          <span class="tdot" style="background:#febc2e"></span>
+          <span class="tdot" style="background:#28c840"></span>
+          <span class="tab"><img src="icon.png" alt="" style="width:14px;height:14px;border-radius:3px">document.pdf</span>
+        </div>
+        <div class="toolbar">
+          <span class="tool"></span><span class="tool"></span><span class="tool"></span><span class="tool"></span>
+          <span class="tool sep"></span>
+          <span class="tool"></span><span class="tool"></span><span class="tool"></span>
+          <span class="tool sep"></span>
+          <span class="tool"></span><span class="tool"></span><span class="tool"></span>
+        </div>
+        <div class="page-area">
+          <div class="page">
+            <div class="ln t"></div>
+            <div class="ln s"></div>
+            <div class="ln m"></div>
+            <div class="ln s hl"></div>
+            <div class="band">P D F</div>
+            <div class="ln s"></div>
+            <div class="ln m"></div>
+            <div class="ln s"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- WHY -->
+  <section class="section-soft">
+    <div class="wrap">
+      <div class="sec-head"><h2>Why PDFast?</h2></div>
+      <div class="why">
+        <p>The PDF viewer built into <b>Microsoft Edge</b> stopped being good. After Edge switched its
+          underlying PDF engine, everyday viewing got slower and buggier — and the setting that let you
+          fall back to the old, reliable viewer was quietly <b>removed</b>.</p>
+        <p>PDFast brings that experience back: a <b>fast, no-nonsense, native</b> viewer that opens
+          instantly, scrolls smoothly and renders crisply — plus the editing and document tools the
+          built-in viewer never had.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section id="features">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Everything you need, nothing you don't</h2>
+        <p>A complete PDF toolkit that stays small, quick and native.</p>
+      </div>
+      <div class="grid">
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 13 9 20 9"/><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/></svg></div>
+          <h3>Fast, crisp viewing</h3>
+          <p>Smooth continuous scroll, zoom, Fit Width &amp; Fit Page, page drop shadows, and sharp
+            rendering on HiDPI displays — powered by MuPDF.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></div>
+          <h3>Tabs &amp; multi-doc</h3>
+          <p>Open several PDFs at once in tabs. Drag to reorder, middle-click or Ctrl+W to close. Opens
+            maximized with native Windows 11 chrome.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></div>
+          <h3>Annotate &amp; fill forms</h3>
+          <p>Highlight, draw freehand and add text boxes — all edited <b>inline</b>, no modal dialogs.
+            Fill AcroForm fields right on the page.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+          <h3>Find &amp; print</h3>
+          <p>Incremental Find (Ctrl+F) with a live match counter and jump-to-next. Print via the standard
+            Windows dialog with page-range support.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+          <h3>Security</h3>
+          <p>Open password-protected PDFs with an inline prompt, and remove passwords or restrictions from
+            files you're able to open.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg></div>
+          <h3>Document tools</h3>
+          <p>Organize, merge, split, resize to A4, flatten to read-only, compress, and <b>truly redact</b>
+            content — all from one wrench menu.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg></div>
+          <h3>Automatic updates</h3>
+          <p>Quietly checks GitHub for a newer release on launch and offers a <b>one-click update</b> —
+            downloads, swaps itself in, and relaunches.</p>
+        </div>
+
+        <div class="card">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg></div>
+          <h3>Truly standalone</h3>
+          <p>One ~5.5&nbsp;MB <code>.exe</code>. No installer, no .NET, no VC++ redistributable — only
+            stock Windows DLLs. Copy it anywhere and run.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- DOWNLOAD -->
+  <section id="download" class="section-soft">
+    <div class="wrap dl">
+      <div class="sec-head" style="margin-bottom:22px">
+        <h2>Download PDFast</h2>
+        <p>Windows 10 &amp; 11 · 64-bit · free forever</p>
+      </div>
+      <a class="btn btn-primary" href="https://github.com/dhruvilrathod/pdf-viewer/releases/latest" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Get the latest release
+      </a>
+
+      <div class="steps">
+        <div class="step"><span class="n">1</span><p>Download <b>PDFast.exe</b> from the latest release and put it anywhere you like.</p></div>
+        <div class="step"><span class="n">2</span><p>Double-click it. There's <b>nothing to install</b> — it just runs.</p></div>
+        <div class="step"><span class="n">3</span><p>On first launch it adds itself to the <b>Start menu</b> and the right-click <b>"Open with"</b> list, and offers (once) to become your default PDF app.</p></div>
+      </div>
+
+      <div class="note">
+        <b>SmartScreen note:</b> because the download isn't code-signed, Windows may show
+        <em>"Windows protected your PC."</em> Click <b>More info → Run anyway</b> — this is normal for
+        unsigned open-source software. (Or right-click the file → <b>Properties → Unblock</b> first.)
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <div class="wrap">
+      <div class="foot-grid">
+        <div>
+          <div class="foot-brand"><img src="icon.png" alt="">PDFast</div>
+          <div>A fast, native Windows PDF viewer &amp; editor.</div>
+        </div>
+        <div class="foot-links">
+          <a href="https://github.com/dhruvilrathod/pdf-viewer" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/dhruvilrathod/pdf-viewer/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="#features">Features</a>
+          <a href="https://github.com/dhruvilrathod/pdf-viewer/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+        </div>
+      </div>
+      <div class="lic">
+        Licensed under the <b>GNU Affero General Public License v3.0</b>. Built on
+        <a href="https://mupdf.com/" target="_blank" rel="noopener" style="color:var(--accent)">MuPDF</a>
+        (also AGPL v3), statically linked. Not affiliated with Microsoft or Artifex.
+      </div>
+    </div>
+  </footer>
+
+</main>
+</body>
+</html>
