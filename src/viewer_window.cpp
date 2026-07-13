@@ -102,6 +102,12 @@ namespace {
 constexpr wchar_t kFrameClass[] = L"PdfViewerFrame";
 constexpr wchar_t kCanvasClass[] = L"PdfViewerCanvas";
 constexpr wchar_t kThumbClass[] = L"PdfViewerThumbs";
+
+// Single-instance plumbing: a second launch (e.g. double-clicking another PDF
+// while PDFast is the default handler) hands its path to the already-running
+// instance via WM_COPYDATA and exits, so everything lives in one window as
+// tabs. This magic tags our WM_COPYDATA so we don't act on stray ones.
+constexpr ULONG_PTR kCopyDataOpenFile = 0x50444601; // 'PDF\1'
 constexpr wchar_t kColorPopupClass[] = L"PdfColorPopup";
 constexpr wchar_t kResizeHandleClass[] = L"PdfResizeHandle";
 
@@ -5244,6 +5250,22 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		DragFinish(drop);
 		return 0;
 	}
+	case WM_COPYDATA: {
+		// A second PDFast instance forwarded a file to open here (single-instance
+		// routing -- see RunViewer). Open it as a tab and surface the window.
+		auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lp);
+		if (cds && cds->dwData == kCopyDataOpenFile && cds->lpData && cds->cbData >= sizeof(wchar_t)) {
+			std::wstring path(reinterpret_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+			while (!path.empty() && path.back() == L'\0') path.pop_back();
+			if (!path.empty()) {
+				if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+				self->openDocument(path.c_str());
+				SetForegroundWindow(hwnd);
+			}
+			return TRUE;
+		}
+		break;
+	}
 	case WM_APP_UPDATE_RESULT: {
 		// Posted from the background update-check thread; we own the UpdateInfo.
 		std::unique_ptr<updater::UpdateInfo> info(reinterpret_cast<updater::UpdateInfo*>(lp));
@@ -5435,6 +5457,34 @@ void OfferSetAsDefault(HWND owner)
 // ===========================================================================
 int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 {
+	// Single instance: if PDFast is already running, hand our file path to that
+	// instance (as a new tab) and exit, instead of spawning another window.
+	// The named mutex is process-lifetime; only the FIRST instance keeps it.
+	HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"PDFast.SingleInstance.Mutex");
+	if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+		// The first instance may still be creating its window; retry briefly.
+		HWND existing = nullptr;
+		for (int i = 0; i < 50 && !existing; ++i) {
+			existing = FindWindowW(kFrameClass, nullptr);
+			if (!existing) Sleep(20);
+		}
+		if (existing) {
+			if (optionalPath && *optionalPath) {
+				COPYDATASTRUCT cds = {};
+				cds.dwData = kCopyDataOpenFile;
+				cds.cbData = static_cast<DWORD>((wcslen(optionalPath) + 1) * sizeof(wchar_t));
+				cds.lpData = const_cast<wchar_t*>(optionalPath);
+				SendMessageW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds));
+			}
+			// We're the freshly-launched (foreground) process, so we're allowed
+			// to hand the foreground to the existing window.
+			if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
+			SetForegroundWindow(existing);
+		}
+		CloseHandle(instanceMutex);
+		return 0;
+	}
+
 	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES };
 	InitCommonControlsEx(&icc);
 
