@@ -1,8 +1,13 @@
 #include "pdf_document.h"
 
+#include <windows.h>
+
 #include <algorithm>
+#include <cstring>
+#include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 extern "C" {
 #include <mupdf/pdf.h>
@@ -20,6 +25,119 @@ std::string toUtf8(const wchar_t* w)
 	std::string s(static_cast<size_t>(n - 1), '\0');
 	WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
 	return s;
+}
+
+// ---------------------------------------------------------------------------
+// Windows system-font loader for MuPDF.
+//
+// When a PDF references a font that is NOT embedded in the file (extremely
+// common -- e.g. plain "Arial", "Calibri", "Times New Roman"), MuPDF by default
+// falls back to its own built-in base14 look-alikes, whose letterforms (notably
+// 's') and stroke weight differ from the real font. Installing this hook lets
+// MuPDF pull the ACTUAL installed Windows font instead, so those PDFs render the
+// way Adobe/Edge/Chrome show them. (Embedded fonts are unaffected -- MuPDF only
+// calls this when it needs a substitute.)
+// ---------------------------------------------------------------------------
+
+// Turn a PDF/PostScript font name into a Windows family name, inferring style.
+// Handles subset prefixes ("ABCDEF+Arial"), style separators ("Arial-BoldMT",
+// "Arial,Italic"), PS decorations ("MT"/"PS"), and a few base14 aliases.
+std::wstring cleanFontFamily(const char* rawName, int& bold, int& italic)
+{
+	std::string n = rawName ? rawName : "";
+	if (n.size() > 7 && n[6] == '+') n = n.substr(7); // subset tag "ABCDEF+"
+
+	std::string low = n;
+	std::transform(low.begin(), low.end(), low.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (low.find("bold") != std::string::npos) bold = 1;
+	if (low.find("italic") != std::string::npos || low.find("oblique") != std::string::npos) italic = 1;
+
+	size_t cut = n.find_first_of(",-"); // "Arial,Bold" / "Arial-BoldMT"
+	if (cut != std::string::npos) n = n.substr(0, cut);
+
+	auto endsWith = [&](const char* s) {
+		size_t l = std::strlen(s);
+		return n.size() >= l && _stricmp(n.c_str() + n.size() - l, s) == 0;
+	};
+	for (bool more = true; more; ) {
+		if (endsWith("PSMT")) n.resize(n.size() - 4);
+		else if (endsWith("MT")) n.resize(n.size() - 2);
+		else if (endsWith("PS")) n.resize(n.size() - 2);
+		else more = false;
+	}
+
+	static const struct { const char* ps; const wchar_t* win; } kAliases[] = {
+		{ "Helvetica", L"Arial" }, { "Arial", L"Arial" },
+		{ "TimesNewRoman", L"Times New Roman" }, { "Times", L"Times New Roman" },
+		{ "Courier", L"Courier New" }, { "CourierNew", L"Courier New" },
+	};
+	for (auto& a : kAliases)
+		if (_stricmp(n.c_str(), a.ps) == 0) return a.win;
+
+	int wn = MultiByteToWideChar(CP_UTF8, 0, n.c_str(), -1, nullptr, 0);
+	if (wn <= 0) return {};
+	std::wstring w(static_cast<size_t>(wn - 1), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, n.c_str(), -1, w.data(), wn);
+	return w;
+}
+
+fz_font* loadWindowsFont(fz_context* ctx, const char* name, int bold, int italic, int /*needs_exact_metrics*/)
+{
+	std::wstring family = cleanFontFamily(name, bold, italic);
+	if (family.empty()) return nullptr;
+
+	HDC hdc = CreateCompatibleDC(nullptr);
+	if (!hdc) return nullptr;
+	HFONT hf = CreateFontW(0, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, italic ? TRUE : FALSE,
+		FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+		DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, family.c_str());
+	if (!hf) { DeleteDC(hdc); return nullptr; }
+	HGDIOBJ oldFont = SelectObject(hdc, hf);
+
+	// Guard against GDI silently substituting an unrelated family (e.g. the PDF
+	// names a font that isn't installed): if the face GDI actually resolved to
+	// doesn't match what we asked for, bail and let MuPDF use its own fallback
+	// rather than shipping a random system face (which would be worse, e.g. for
+	// CJK-named fonts we don't have installed).
+	wchar_t actual[LF_FACESIZE] = {};
+	GetTextFaceW(hdc, LF_FACESIZE, actual);
+
+	fz_font* font = nullptr;
+	if (_wcsicmp(actual, family.c_str()) == 0) {
+		DWORD size = GetFontData(hdc, 0, 0, nullptr, 0); // whole file
+		if (size != GDI_ERROR && size > 0) {
+			std::vector<unsigned char> data(size);
+			if (GetFontData(hdc, 0, 0, data.data(), size) == size) {
+				std::string fname = toUtf8(family.c_str());
+				fz_buffer* buf = nullptr;
+				fz_var(buf);
+				fz_try(ctx) {
+					buf = fz_new_buffer_from_copied_data(ctx, data.data(), size);
+					font = fz_new_font_from_buffer(ctx, fname.c_str(), buf, 0, 0);
+				}
+				fz_always(ctx) {
+					fz_drop_buffer(ctx, buf);
+				}
+				fz_catch(ctx) {
+					font = nullptr;
+				}
+			}
+		}
+	}
+
+	SelectObject(hdc, oldFont);
+	DeleteObject(hf);
+	DeleteDC(hdc);
+	return font;
+}
+
+// Install the Windows font hook on a context. Latin/named lookups go through
+// loadWindowsFont; CJK-ordering and script-fallback hooks are left default
+// (MuPDF's built-in Noto handling) since those aren't the substitution problem.
+void installSystemFontHook(fz_context* ctx)
+{
+	if (ctx) fz_install_load_system_font_funcs(ctx, loadWindowsFont, nullptr, nullptr);
 }
 
 // Build a 32-bit top-down BGRA DIB section from an RGB (3-component) pixmap.
@@ -67,6 +185,7 @@ PdfDocument::PdfDocument()
 {
 	ctx_ = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
 	if (ctx_) {
+		installSystemFontHook(ctx_); // use real installed fonts for non-embedded refs
 		fz_try(ctx_) {
 			fz_register_document_handlers(ctx_);
 		}
@@ -1068,6 +1187,7 @@ bool verifyPdfFile(const std::string& utf8path, int expectedPageCount)
 {
 	fz_context* vctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
 	if (!vctx) return false;
+	installSystemFontHook(vctx);
 	bool ok = false;
 	fz_try(vctx) {
 		fz_register_document_handlers(vctx);

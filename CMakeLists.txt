@@ -23,7 +23,9 @@ target_link_libraries(pdfviewer_poc PRIVATE mupdf)
 # Console diagnostic tool for the edit+save code path (no GUI/window
 # involved) -- lets us isolate save-corruption bugs from Win32 input issues.
 add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp)
-target_link_libraries(pdfviewer_savetest PRIVATE mupdf)
+# gdi32/user32: pdf_document.cpp now loads installed Windows fonts (CreateFontW/
+# GetFontData) so MuPDF can substitute real fonts for non-embedded references.
+target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32)
 target_compile_definitions(pdfviewer_savetest PRIVATE NOMINMAX UNICODE _UNICODE)
 
 # Console harness for the auto-updater's network + parse path (no GUI). Point
