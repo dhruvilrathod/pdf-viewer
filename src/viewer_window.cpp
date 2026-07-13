@@ -1561,13 +1561,9 @@ void CanvasView::drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY
 		r.top = pageY + static_cast<int>(w.rect.y0 * sc);
 		r.right = pageX + static_cast<int>(w.rect.x1 * sc);
 		r.bottom = pageY + static_cast<int>(w.rect.y1 * sc);
-		FillAlpha(dc, r, RGB(150, 190, 250), 70);
-		HPEN pen = CreatePen(PS_SOLID, 1, RGB(90, 140, 230));
-		HGDIOBJ oldPen = SelectObject(dc, pen);
-		HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
-		Rectangle(dc, r.left, r.top, r.right, r.bottom);
-		SelectObject(dc, oldPen); SelectObject(dc, oldBr);
-		DeleteObject(pen);
+		// Subtle pale-blue fill with no border, matching Chrome's PDF viewer
+		// (the old saturated fill + solid blue outline read as "too highlighted").
+		FillAlpha(dc, r, RGB(140, 165, 235), 34);
 	}
 }
 
