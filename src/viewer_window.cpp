@@ -5399,25 +5399,21 @@ void MarkOfferedDefaultPrompt()
 	}
 }
 
-// Opens the OS's own "choose default app" UI. LaunchAdvancedAssociationUI is
-// the Microsoft-sanctioned API for exactly this (stable since Vista); if it
-// or COM init fails for any reason, fall back to the Settings page so the
-// user can still get there manually.
+// Opens the Windows Settings "Default apps" screen, deep-linked to PDFast's own
+// page when possible. NOTE: the old COM API IApplicationAssociationRegistrationUI
+// ::LaunchAdvancedAssociationUI is DEPRECATED on Windows 10/11 -- it no longer
+// shows an association picker, it just pops a "go to Settings > Apps > Default
+// apps" message box and returns S_OK, so we must NOT use it. Modern Windows also
+// forbids apps from setting a per-extension default programmatically (anti-
+// hijack), so the user has to make the final choice in Settings; the best we can
+// do is take them straight there. `registeredAppUser=<name>` jumps to our app's
+// page (name matches HKCU\Software\RegisteredApplications); if a build doesn't
+// understand the parameter it simply opens the general Default-apps page.
 void LaunchDefaultAppsUI(HWND owner)
 {
-	HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-	bool comOwned = SUCCEEDED(hr);
-	bool launched = false;
-	if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
-		IApplicationAssociationRegistrationUI* ui = nullptr;
-		if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationAssociationRegistrationUI, nullptr,
-			CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ui)))) {
-			if (SUCCEEDED(ui->LaunchAdvancedAssociationUI(kAppName))) launched = true;
-			ui->Release();
-		}
-	}
-	if (comOwned) CoUninitialize();
-	if (!launched)
+	std::wstring deep = L"ms-settings:defaultapps?registeredAppUser=" + std::wstring(kAppName);
+	HINSTANCE r = ShellExecuteW(owner, L"open", deep.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+	if (reinterpret_cast<INT_PTR>(r) <= 32)
 		ShellExecuteW(owner, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
