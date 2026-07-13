@@ -53,6 +53,15 @@ struct AnnotInfo {
 	std::string font;        // FreeText only, e.g. "Helv"
 };
 
+// A hyperlink on a page (from the PDF's link annotations): an external URL /
+// mailto target, or an internal jump to another page.
+struct LinkInfo {
+	PageRectPt rect;       // page-space bounds (points), same space as widgets
+	std::string uri;       // target URI (UTF-8); external URL/mailto, or internal
+	bool external = false; // true = open in browser/mail; false = jump in-document
+	int targetPage = -1;   // 0-based destination page for internal links, else -1
+};
+
 // A rendered page bitmap. Owns the HBITMAP; deletes it on destruction.
 struct PageBitmap {
 	HBITMAP hbmp = nullptr;
@@ -123,6 +132,10 @@ public:
 
 	// All characters of a page in reading order, for text selection + copy.
 	std::vector<PageChar> pageChars(int page);
+
+	// Hyperlinks (link annotations) on a page: external URLs / mailto and
+	// internal page jumps, for click-to-open support.
+	std::vector<LinkInfo> pageLinks(int page);
 
 	// Existing markup annotations (not form widgets) on a page / under a
 	// point, for click-to-edit and delete support.

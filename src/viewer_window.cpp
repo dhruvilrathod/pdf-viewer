@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
+#include <regex>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -27,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Vector toolbar icons only -- no external image assets, keeps the exe
@@ -412,7 +415,7 @@ public:
 	// After Save, PdfDocument reopens its underlying fz_document internally
 	// (same PdfDocument object, new handle) -- drop caches keyed to the old
 	// handle without resetting scroll/zoom/page position like setDocument().
-	void refreshAfterSave() { widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); invalidateCache(); relayout(); invalidate(); }
+	void refreshAfterSave() { widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); invalidateCache(); relayout(); invalidate(); }
 
 	void zoomIn() { setZoom(zoom_ * kZoomStep); fit_ = Fit::None; }
 	void zoomOut() { setZoom(zoom_ / kZoomStep); fit_ = Fit::None; }
@@ -429,6 +432,7 @@ public:
 		if (inlineEdit_) commitInlineEdit(true);
 		tool_ = t;
 		SetCursor(LoadCursor(nullptr, t == Tool::Select ? IDC_ARROW : IDC_CROSS));
+		if (t != Tool::Select && !hoveredLinkText_.empty()) { hoveredLinkText_.clear(); updateStatus(); }
 	}
 	Tool tool() const { return tool_; }
 	// Commits whatever the user is currently typing (form field or new
@@ -512,7 +516,7 @@ private:
 	void onMouseMove(int mx, int my);
 	void onLButtonUp(int mx, int my);
 	void doFormFill(int page, float px, float py);
-	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); }
+	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); }
 	void drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY);
 	const std::vector<WidgetInfo>& widgetsForPage(int page);
 
@@ -557,7 +561,19 @@ private:
 	void selectLineAt(int page, float px, float py);
 	const std::vector<PageChar>& charsForPage(int page);
 	const std::vector<AnnotInfo>& annotsForPage(int page);
+	const std::vector<LinkInfo>& linksForPage(int page);
+	// Detect plain-text URLs/emails in a page's text and turn them into links
+	// (Chrome/Edge do this; these PDFs carry no real link annotations).
+	std::vector<LinkInfo> detectTextLinks(int page);
+	// If (px,py) on `page` is inside a hyperlink, returns it; else nullptr.
+	const LinkInfo* linkAt(int page, float px, float py);
+	// Opens an external link (browser/mail) or jumps to an internal page.
+	void activateLink(const LinkInfo& link);
 	HCURSOR cursorForSelectAt(int mx, int my);
+	// Browser-style link preview: shows the target in the status bar while
+	// hovering (like the bottom-left URL preview in Chrome/Edge), restoring
+	// the normal page/zoom text once the cursor leaves the link.
+	void updateLinkHover(int mx, int my);
 
 	HWND hwnd_ = nullptr;
 	PdfDocument* doc_ = nullptr;
@@ -630,6 +646,9 @@ private:
 	int clickCount_ = 0;
 	std::unordered_map<int, std::vector<PageChar>> charsCache_;
 	std::unordered_map<int, std::vector<AnnotInfo>> annotCache_;
+	std::unordered_map<int, std::vector<LinkInfo>> linksCache_;
+	std::string hoveredLinkText_; // non-empty while the cursor sits over a link
+	bool trackingMouseLeave_ = false; // TrackMouseEvent armed, so WM_MOUSELEAVE fires
 
 	// Tool state -- each tool keeps its own last-used color.
 	Tool tool_ = Tool::Select;
@@ -1150,6 +1169,8 @@ void CanvasView::setDocument(PdfDocument* doc)
 	widgetCache_.clear();
 	charsCache_.clear();
 	annotCache_.clear();
+	linksCache_.clear();
+	hoveredLinkText_.clear();
 	invalidateCache();
 	applyFit();
 	relayout();
@@ -1353,6 +1374,7 @@ void CanvasView::onLButtonDown(int mx, int my)
 		if (ai.kind == AnnotKind::FreeText) { beginExistingAnnotEdit(page, ai); return; }
 		WidgetInfo wi = doc_->widgetAt(page, { px, py });
 		if (wi.index >= 0) { doFormFill(page, px, py); return; }
+		if (const LinkInfo* lk = linkAt(page, px, py)) { activateLink(*lk); return; }
 		if (clickCount_ >= 3) { selectLineAt(page, px, py); return; }
 		if (clickCount_ == 2) { selectWordAt(page, px, py); return; }
 		beginTextSelection(page, px, py);
@@ -1373,6 +1395,12 @@ void CanvasView::onLButtonDown(int mx, int my)
 
 void CanvasView::onMouseMove(int mx, int my)
 {
+	// Arm WM_MOUSELEAVE so hover state (link preview) clears when the cursor
+	// exits the canvas; TrackMouseEvent must be re-armed after each leave.
+	if (!trackingMouseLeave_) {
+		TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd_, 0 };
+		if (TrackMouseEvent(&tme)) trackingMouseLeave_ = true;
+	}
 	if (activeResizeDir_ >= 0) { updateResize(mx, my); return; }
 	if (selDragging_) {
 		int page; float px, py;
@@ -1380,7 +1408,10 @@ void CanvasView::onMouseMove(int mx, int my)
 			updateTextSelection(page, px, py);
 		return;
 	}
-	if (!dragging_) return;
+	if (!dragging_) {
+		if (tool_ == Tool::Select) updateLinkHover(mx, my);
+		return;
+	}
 	dragCurX_ = mx; dragCurY_ = my;
 	if (tool_ == Tool::Draw) {
 		float px = dragBound_.x0 + (mx - pageOrgX_) / dragScale_;
@@ -1605,6 +1636,143 @@ const std::vector<AnnotInfo>& CanvasView::annotsForPage(int page)
 	return annotCache_.emplace(page, std::move(a)).first->second;
 }
 
+const std::vector<LinkInfo>& CanvasView::linksForPage(int page)
+{
+	auto it = linksCache_.find(page);
+	if (it != linksCache_.end()) return it->second;
+	std::vector<LinkInfo> l;
+	if (doc_ && doc_->isOpen()) {
+		l = doc_->pageLinks(page);                 // real PDF link annotations
+		auto autos = detectTextLinks(page);        // plain-text URLs / emails
+		l.insert(l.end(), std::make_move_iterator(autos.begin()),
+			std::make_move_iterator(autos.end()));
+	}
+	return linksCache_.emplace(page, std::move(l)).first->second;
+}
+
+// Scans a page's extracted text (line by line) for URL and email patterns and
+// synthesizes a LinkInfo for each, with a rect spanning the matched glyphs.
+// Matches how Chrome/Edge auto-linkify plain-text URLs/emails that the PDF
+// itself never marked up as link annotations.
+// Common TLDs, checked against a bare domain's final label (e.g. "au" in
+// "abc.com.au") before linkifying it. A protocol-less, www-less domain like
+// "abc.com.au" is otherwise indistinguishable from a file-name-shaped false
+// positive ("readme.pdf", "report.docx" -- extension "pdf"/"docx" isn't a
+// TLD, so those are correctly rejected). This list can't be exhaustive
+// (Chrome/Edge use the same kind of heuristic for the same reason); it
+// covers the generic gTLDs and the common country-code TLDs.
+const std::unordered_set<std::string>& knownTlds()
+{
+	static const std::unordered_set<std::string> tlds = {
+		"com", "net", "org", "edu", "gov", "mil", "int", "info", "biz", "name",
+		"pro", "mobi", "io", "co", "me", "tv", "cc", "app", "dev", "xyz",
+		"online", "site", "tech", "store", "shop", "cloud", "blog",
+		"au", "uk", "us", "ca", "de", "fr", "jp", "cn", "in", "nz", "ie", "za",
+		"br", "mx", "es", "it", "nl", "se", "no", "dk", "fi", "ru", "ch", "at",
+		"be", "pl", "pt", "gr", "hk", "sg", "kr", "tw", "ae", "sa", "il", "tr",
+		"id", "my", "ph", "th", "vn", "pk", "ng", "eg", "ar", "cl", "pe", "eu",
+	};
+	return tlds;
+}
+
+std::vector<LinkInfo> CanvasView::detectTextLinks(int page)
+{
+	std::vector<LinkInfo> out;
+	const auto& chars = charsForPage(page);
+	if (chars.empty()) return out;
+
+	// Group 1: http(s):// URL. Group 2: www.-prefixed URL. Group 3: email.
+	// Group 4: a protocol-less bare domain (e.g. "abc.com.au") -- accepted
+	// only if its final label is a known TLD (see knownTlds()), since unlike
+	// the other three this shape isn't otherwise distinguishable from a
+	// filename. Applied per line so a match can't span a line break.
+	static const std::regex re(
+		R"((https?://[^\s]+)|(www\.[^\s]+)|([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})|(\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?:/[^\s]*)?\b))",
+		std::regex::icase | std::regex::optimize);
+
+	size_t i = 0;
+	while (i < chars.size()) {
+		std::string line;                 // ASCII-folded (non-ASCII -> space delimiter)
+		std::vector<size_t> map;          // line offset -> index into `chars`
+		while (i < chars.size()) {
+			int u = chars[i].unicode;
+			line.push_back((u > 32 && u < 127) ? static_cast<char>(u) : ' ');
+			map.push_back(i);
+			bool brk = chars[i].lineBreakAfter;
+			++i;
+			if (brk) break;
+		}
+
+		for (auto m = std::sregex_iterator(line.begin(), line.end(), re);
+			m != std::sregex_iterator(); ++m) {
+			size_t s = static_cast<size_t>(m->position());
+			size_t e = s + static_cast<size_t>(m->length());
+			// Trim trailing sentence punctuation that regex greedily grabbed.
+			while (e > s && std::strchr(".,;:)]}>\"'", line[e - 1])) --e;
+			if (e <= s) continue;
+
+			std::string matched = line.substr(s, e - s);
+
+			bool isBareDomain = (*m)[4].matched && !(*m)[1].matched && !(*m)[2].matched && !(*m)[3].matched;
+			if (isBareDomain) {
+				size_t dot = matched.find_last_of('.');
+				std::string tld = (dot == std::string::npos) ? std::string() : matched.substr(dot + 1);
+				std::transform(tld.begin(), tld.end(), tld.begin(),
+					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				if (!knownTlds().count(tld)) continue; // e.g. "report.docx" -- not a TLD, skip
+			}
+
+			LinkInfo link;
+			link.external = true;
+			if (matched.find('@') != std::string::npos && matched.find("://") == std::string::npos) {
+				link.uri = "mailto:" + matched;
+			} else if (_strnicmp(matched.c_str(), "http://", 7) != 0 &&
+			           _strnicmp(matched.c_str(), "https://", 8) != 0) {
+				link.uri = "http://" + matched; // www.-prefixed or bare domain
+			} else {
+				link.uri = matched;
+			}
+
+			// Union the matched glyphs' quads into the link's clickable rect.
+			PageRectPt r{ 1e9f, 1e9f, -1e9f, -1e9f };
+			for (size_t k = s; k < e; ++k) {
+				const auto& q = chars[map[k]].quad;
+				r.x0 = std::min(r.x0, q.x0); r.y0 = std::min(r.y0, q.y0);
+				r.x1 = std::max(r.x1, q.x1); r.y1 = std::max(r.y1, q.y1);
+			}
+			link.rect = r;
+			out.push_back(std::move(link));
+		}
+	}
+	return out;
+}
+
+const LinkInfo* CanvasView::linkAt(int page, float px, float py)
+{
+	for (const auto& l : linksForPage(page))
+		if (px >= l.rect.x0 && px <= l.rect.x1 && py >= l.rect.y0 && py <= l.rect.y1)
+			return &l;
+	return nullptr;
+}
+
+void CanvasView::activateLink(const LinkInfo& link)
+{
+	if (!link.external) {
+		// Internal jump to another page in the same document.
+		if (link.targetPage >= 0) goToPage(link.targetPage);
+		return;
+	}
+	// External URL / mailto: hand off to the OS default handler. Only allow a
+	// safe scheme so a crafted PDF can't launch arbitrary local programs.
+	int n = MultiByteToWideChar(CP_UTF8, 0, link.uri.c_str(), -1, nullptr, 0);
+	if (n <= 0) return;
+	std::wstring uri(static_cast<size_t>(n - 1), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, link.uri.c_str(), -1, uri.data(), n);
+	auto starts = [&](const wchar_t* s) { return _wcsnicmp(uri.c_str(), s, wcslen(s)) == 0; };
+	if (!(starts(L"http://") || starts(L"https://") || starts(L"mailto:"))) return;
+	ShellExecuteW(hwnd_, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 void CanvasView::beginTextSelection(int page, float px, float py)
 {
 	selPage_ = page;
@@ -1702,6 +1870,9 @@ HCURSOR CanvasView::cursorForSelectAt(int mx, int my)
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return nullptr;
 
+	// A hyperlink takes priority: hand cursor, like every browser/PDF viewer.
+	if (linkAt(page, px, py)) return LoadCursor(nullptr, IDC_HAND);
+
 	for (const auto& a : annotsForPage(page)) {
 		if (a.kind != AnnotKind::FreeText) continue;
 		if (px >= a.rect.x0 && px <= a.rect.x1 && py >= a.rect.y0 && py <= a.rect.y1)
@@ -1724,6 +1895,25 @@ HCURSOR CanvasView::cursorForSelectAt(int mx, int my)
 			return LoadCursor(nullptr, IDC_IBEAM);
 	}
 	return nullptr;
+}
+
+void CanvasView::updateLinkHover(int mx, int my)
+{
+	int page; float px, py;
+	std::string text;
+	if (hitTestPage(mx, my, page, px, py)) {
+		if (const LinkInfo* lk = linkAt(page, px, py)) {
+			if (!lk->external) {
+				text = "Go to page " + std::to_string(lk->targetPage + 1);
+			} else {
+				text = lk->uri;
+			}
+		}
+	}
+	if (text != hoveredLinkText_) {
+		hoveredLinkText_ = std::move(text);
+		updateStatus();
+	}
 }
 
 void CanvasView::copySelectionToClipboard()
@@ -2593,6 +2783,13 @@ void CanvasView::onWheel(short delta, bool ctrl, bool horiz)
 void CanvasView::updateStatus()
 {
 	if (!status_) return;
+	// Hovering a link takes over the status bar, browser-style (bottom-left
+	// URL preview) -- restored to the normal page/zoom text once it clears.
+	if (!hoveredLinkText_.empty()) {
+		std::wstring w = Utf8ToWide(hoveredLinkText_);
+		SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(w.c_str()));
+		return;
+	}
 	wchar_t buf[128];
 	if (doc_ && doc_->isOpen()) {
 		int cur = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
@@ -2623,6 +2820,10 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_SIZE: self->onSize(); return 0;
 	case WM_VSCROLL: self->onVScroll(wp); return 0;
 	case WM_HSCROLL: self->onHScroll(wp); return 0;
+	case WM_MOUSELEAVE:
+		self->trackingMouseLeave_ = false;
+		if (!self->hoveredLinkText_.empty()) { self->hoveredLinkText_.clear(); self->updateStatus(); }
+		return 0;
 	case WM_TIMER:
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
 		break;

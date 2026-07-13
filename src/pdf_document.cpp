@@ -505,6 +505,41 @@ std::vector<PageChar> PdfDocument::pageChars(int page)
 	return out;
 }
 
+std::vector<LinkInfo> PdfDocument::pageLinks(int page)
+{
+	std::vector<LinkInfo> out;
+	if (!ctx_ || !doc_ || !authed_) return out;
+	if (page < 0 || page >= pageCount_) return out;
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_page* pg = nullptr;
+	fz_link* links = nullptr;
+	fz_try(ctx_) {
+		pg = fz_load_page(ctx_, doc_, page);
+		links = fz_load_links(ctx_, pg);
+		for (fz_link* l = links; l; l = l->next) {
+			if (!l->uri || !*l->uri) continue;
+			LinkInfo info;
+			info.rect = { l->rect.x0, l->rect.y0, l->rect.x1, l->rect.y1 };
+			info.uri = l->uri;
+			info.external = fz_is_external_link(ctx_, l->uri) != 0;
+			if (!info.external) {
+				fz_location loc = fz_resolve_link(ctx_, doc_, l->uri, nullptr, nullptr);
+				info.targetPage = fz_page_number_from_location(ctx_, doc_, loc);
+			}
+			out.push_back(std::move(info));
+		}
+	}
+	fz_always(ctx_) {
+		if (links) fz_drop_link(ctx_, links);
+		if (pg) fz_drop_page(ctx_, pg);
+	}
+	fz_catch(ctx_) {
+		out.clear();
+	}
+	return out;
+}
+
 bool PdfDocument::addHighlight(int page, const std::vector<PageRectPt>& quads,
 	unsigned long color, float opacity, std::string& err)
 {
