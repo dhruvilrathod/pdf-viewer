@@ -412,6 +412,10 @@ public:
 	// so the frame can drop back to the Select tool/cursor -- Add Text is a
 	// one-shot action per activation, matching how other viewers behave.
 	void setOnExitTextTool(std::function<void()> f) { onExitTextTool_ = std::move(f); }
+	// Fired when a tile in the empty-state tools grid (shown when no document
+	// is open) is clicked; the int is the IDM_* command id to run, so the
+	// frame just forwards it straight into its existing onCommand().
+	void setOnEmptyStateAction(std::function<void(int)> f) { onEmptyStateAction_ = std::move(f); }
 	// After Save, PdfDocument reopens its underlying fz_document internally
 	// (same PdfDocument object, new handle) -- drop caches keyed to the old
 	// handle without resetting scroll/zoom/page position like setDocument().
@@ -518,6 +522,13 @@ private:
 	void doFormFill(int page, float px, float py);
 	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); }
 	void drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY);
+	// Tools-grid empty state (shown instead of the plain "drag a file here"
+	// hint when no document is open). Defined after the icons:: namespace so
+	// it can draw the same vector glyphs the toolbar uses. hitTestEmptyState
+	// recomputes the same tile layout purely for hit-testing -- the tile list
+	// is tiny (~8), so there's no need to cache it between paint and click.
+	void drawEmptyState(HDC dc, const RECT& rc);
+	bool hitTestEmptyState(int mx, int my, int& cmdId) const;
 	const std::vector<WidgetInfo>& widgetsForPage(int page);
 
 	// Inline (no-dialog) text editing for form fields and free-text annots.
@@ -675,6 +686,7 @@ private:
 	std::function<void()> onChanged_;
 	std::function<void()> onExitTextTool_;
 	std::function<void()> onViewChanged_;
+	std::function<void(int)> onEmptyStateAction_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1349,7 +1361,11 @@ void CanvasView::onLButtonDown(int mx, int my)
 		if (onExitTextTool_) onExitTextTool_();
 		return;
 	}
-	if (!doc_ || !doc_->isOpen()) return;
+	if (!doc_ || !doc_->isOpen()) {
+		int cmdId;
+		if (hitTestEmptyState(mx, my, cmdId) && onEmptyStateAction_) onEmptyStateAction_(cmdId);
+		return;
+	}
 
 	// Manual multi-click tracking (not WM_LBUTTONDBLCLK / CS_DBLCLKS): Windows
 	// has no native triple-click message, so double- and triple-click are
@@ -2636,10 +2652,7 @@ void CanvasView::onPaint()
 		}
 		DeleteDC(src);
 	} else {
-		SetBkMode(mem, TRANSPARENT);
-		SetTextColor(mem, RGB(200, 200, 200));
-		const wchar_t* msg = L"Open a PDF  (File → Open, or drag a file here)";
-		DrawTextW(mem, msg, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+		drawEmptyState(mem, rc);
 	}
 
 	// Live overlay for the in-progress annotation drag.
@@ -2846,6 +2859,13 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
 				HCURSOR c = self->cursorForSelectAt(pt.x, pt.y);
 				if (c) { SetCursor(c); return TRUE; }
+			} else if (!self->doc_ || !self->doc_->isOpen()) {
+				POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+				int cmdId;
+				if (self->hitTestEmptyState(pt.x, pt.y, cmdId)) {
+					SetCursor(LoadCursor(nullptr, IDC_HAND));
+					return TRUE;
+				}
 			}
 		}
 		break;
@@ -3560,7 +3580,172 @@ void DrawToolsMenu(Gdiplus::Graphics& g, float s)
 	p.line(0.14f, 0.60f, 0.86f, 0.60f);
 }
 
+// Two overlapping page rects (offset diagonally) -- reads as "combine".
+void DrawMergeTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.14f, 0.30f, 0.48f, 0.56f);
+	p.rect(0.38f, 0.14f, 0.48f, 0.56f);
+}
+
+// A single page cut by a dashed line into two halves with a small gap --
+// reads as "split apart".
+void DrawSplitTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.16f, 0.14f, 0.68f, 0.32f);
+	p.rect(0.16f, 0.54f, 0.68f, 0.32f);
+	Gdiplus::Pen dash(Gdiplus::Color(kInk), s * kStroke);
+	dash.SetDashStyle(Gdiplus::DashStyleDash);
+	g.DrawLine(&dash, s * 0.10f, s * 0.48f, s * 0.90f, s * 0.48f);
+}
+
+// A classic padlock: rounded body + shackle arc -- reads as "protect".
+void DrawLockTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.20f, 0.44f, 0.60f, 0.42f);
+	Gdiplus::RectF arc(s * 0.28f, s * 0.14f, s * 0.44f, s * 0.44f);
+	g.DrawArc(&p.pen, arc, 180, 180);
+	Gdiplus::SolidBrush dot{ Gdiplus::Color(kInk) }; // brace-init avoids a most-vexing-parse with a single identifier arg
+	g.FillEllipse(&dot, s * 0.44f, s * 0.58f, s * 0.12f, s * 0.12f);
+}
+
 } // namespace icons
+
+// ---------------------------------------------------------------------------
+// Empty-state "tools grid" (shown instead of the plain drag-and-drop hint
+// when a tab has no document open) -- a quick visual index of what the app
+// can do. Every tile funnels into IDM_FILE_OPEN except Merge, which (like
+// the toolbar's own Merge command) can start straight from a picked file
+// list with no document open yet.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct EmptyTile { icons::DrawFn icon; const wchar_t* label; int cmdId; };
+
+const std::vector<EmptyTile>& emptyStateTiles()
+{
+	static const std::vector<EmptyTile> tiles = {
+		{ icons::DrawOpen,          L"Open a PDF",       IDM_FILE_OPEN },
+		{ icons::DrawHighlightTool, L"Annotate",          IDM_FILE_OPEN },
+		{ icons::DrawTextTool,      L"Fill Forms",        IDM_FILE_OPEN },
+		{ icons::DrawThumbs,        L"Organize Pages",    IDM_FILE_OPEN },
+		{ icons::DrawMergeTool,     L"Merge PDFs",        IDM_TOOLS_MERGE },
+		{ icons::DrawSplitTool,     L"Split PDF",         IDM_FILE_OPEN },
+		{ icons::DrawRedactTool,    L"Redact Content",    IDM_FILE_OPEN },
+		{ icons::DrawLockTool,      L"Password Protect",  IDM_FILE_OPEN },
+	};
+	return tiles;
+}
+
+// Shared tile-rect math for both painting and hit-testing, so they can never
+// drift out of sync with each other.
+std::vector<RECT> layoutEmptyStateTiles(const RECT& rc, UINT dpi)
+{
+	const auto& tiles = emptyStateTiles();
+	const int cols = 4;
+	const int rows = (static_cast<int>(tiles.size()) + cols - 1) / cols;
+	const int tileW = Scale(132, dpi), tileH = Scale(96, dpi);
+	const int gapX = Scale(16, dpi), gapY = Scale(16, dpi);
+	const int gridW = cols * tileW + (cols - 1) * gapX;
+	const int gridH = rows * tileH + (rows - 1) * gapY;
+	const int headerH = Scale(84, dpi); // reserved space for the heading/subtitle above the grid
+	const int totalH = headerH + gridH;
+	const int left = rc.left + ((rc.right - rc.left) - gridW) / 2;
+	const int top = rc.top + std::max(0, static_cast<int>((rc.bottom - rc.top) - totalH) / 2) + headerH;
+
+	std::vector<RECT> out;
+	out.reserve(tiles.size());
+	for (size_t i = 0; i < tiles.size(); ++i) {
+		int col = static_cast<int>(i) % cols, row = static_cast<int>(i) / cols;
+		int x = left + col * (tileW + gapX);
+		int y = top + row * (tileH + gapY);
+		out.push_back(RECT{ x, y, x + tileW, y + tileH });
+	}
+	return out;
+}
+
+} // namespace
+
+void CanvasView::drawEmptyState(HDC dc, const RECT& rc)
+{
+	auto tileRects = layoutEmptyStateTiles(rc, dpi_);
+	const auto& tiles = emptyStateTiles();
+	if (tileRects.empty()) return;
+
+	HFONT headingFont = CreateFontW(-Scale(20, dpi_), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+	HFONT subFont = CreateFontW(-Scale(12, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+	HFONT labelFont = CreateFontW(-Scale(12, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+	SetBkMode(dc, TRANSPARENT);
+
+	// Heading + subtitle, right above the grid's top row.
+	int gridTop = tileRects.front().top;
+	for (auto& r : tileRects) gridTop = std::min(gridTop, static_cast<int>(r.top));
+	int headerBottom = gridTop - Scale(16, dpi_);
+	RECT headRc = { rc.left, headerBottom - Scale(56, dpi_), rc.right, headerBottom - Scale(24, dpi_) };
+	RECT subRc = { rc.left, headerBottom - Scale(24, dpi_), rc.right, headerBottom };
+	HGDIOBJ oldFont = SelectObject(dc, headingFont);
+	SetTextColor(dc, RGB(60, 60, 60));
+	DrawTextW(dc, L"Open a PDF to get started", -1, &headRc, DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
+	SelectObject(dc, subFont);
+	SetTextColor(dc, RGB(150, 150, 150));
+	DrawTextW(dc, L"Drag a file here, or pick a tool below", -1, &subRc, DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
+
+	Gdiplus::Graphics g(dc);
+	g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+	for (size_t i = 0; i < tiles.size() && i < tileRects.size(); ++i) {
+		const RECT& r = tileRects[i];
+		int rad = Scale(10, dpi_);
+		HPEN pen = CreatePen(PS_SOLID, 1, RGB(226, 226, 226));
+		HBRUSH fill = CreateSolidBrush(RGB(249, 249, 249));
+		HGDIOBJ oldPen = SelectObject(dc, pen);
+		HGDIOBJ oldBr = SelectObject(dc, fill);
+		RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+		SelectObject(dc, oldPen); SelectObject(dc, oldBr);
+		DeleteObject(pen); DeleteObject(fill);
+
+		float iconSize = static_cast<float>(Scale(28, dpi_));
+		float iconX = r.left + ((r.right - r.left) - iconSize) / 2.0f;
+		float iconY = r.top + Scale(14, dpi_);
+		Gdiplus::GraphicsState st = g.Save();
+		g.TranslateTransform(iconX, iconY);
+		tiles[i].icon(g, iconSize);
+		g.Restore(st);
+
+		RECT labelRc = { r.left + Scale(4, dpi_), r.top + Scale(14, dpi_) + static_cast<int>(iconSize) + Scale(8, dpi_),
+			r.right - Scale(4, dpi_), r.bottom - Scale(6, dpi_) };
+		SelectObject(dc, labelFont);
+		SetTextColor(dc, RGB(70, 70, 70));
+		DrawTextW(dc, tiles[i].label, -1, &labelRc, DT_CENTER | DT_TOP | DT_WORDBREAK);
+	}
+
+	SelectObject(dc, oldFont);
+	DeleteObject(headingFont);
+	DeleteObject(subFont);
+	DeleteObject(labelFont);
+}
+
+bool CanvasView::hitTestEmptyState(int mx, int my, int& cmdId) const
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	auto tileRects = layoutEmptyStateTiles(rc, dpi_);
+	const auto& tiles = emptyStateTiles();
+	for (size_t i = 0; i < tileRects.size() && i < tiles.size(); ++i) {
+		const RECT& r = tileRects[i];
+		if (mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) {
+			cmdId = tiles[i].cmdId;
+			return true;
+		}
+	}
+	return false;
+}
 
 // ===========================================================================
 // FrameWindow implementation
@@ -4657,6 +4842,7 @@ int FrameWindow::newTab()
 	tab->canvas->setOnChanged([this] { updateTitle(); updateRedactBar(); });
 	tab->canvas->setOnExitTextTool([this] { selectTool(IDM_TOOL_SELECT); });
 	tab->canvas->setOnViewChanged([this] { updateZoomLabel(); updatePageEditBox(); });
+	tab->canvas->setOnEmptyStateAction([this](int cmdId) { onCommand(cmdId); });
 	// Both start hidden; switchToTab() shows whichever becomes active.
 	ShowWindow(tab->canvas->hwnd(), SW_HIDE);
 	ShowWindow(tab->thumbs->hwnd(), SW_HIDE);
@@ -4737,9 +4923,12 @@ void FrameWindow::closeTab(int idx)
 	tabs_.erase(tabs_.begin() + idx);
 
 	if (tabs_.empty()) {
-		activeTab_ = -1;
-		doc_ = nullptr; canvas_ = nullptr; thumbs_ = nullptr;
-		switchToTab(newTab());
+		// Closing the last tab closes the app (browser-tab convention would
+		// leave a blank tab behind; a single-purpose document app instead
+		// quits, like closing the last document in Acrobat/Preview). The
+		// closed tab was already prompted-for-save above, so there's nothing
+		// left to check -- just tear the window down directly.
+		DestroyWindow(hwnd_);
 		return;
 	}
 	activeTab_ = -1; // force switchToTab to treat this as a real switch
