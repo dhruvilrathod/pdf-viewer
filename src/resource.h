@@ -101,6 +101,7 @@
 #define IDM_TOOLS_RESIZE_A4    1214
 #define IDM_TOOLS_FLATTEN      1215
 #define IDM_TOOLS_COMPRESS     1216
+#define IDM_VIEW_TOGGLETHEME   1217  // toolbar-only: flips light/dark and persists the choice
 
 // Toolbar button command IDs reuse the menu IDs above.
 

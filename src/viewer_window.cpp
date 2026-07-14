@@ -84,12 +84,18 @@ bool SystemUsesDarkTheme()
 }
 
 // Apply Win11 native window chrome: rounded corners + Mica backdrop + a title
-// bar tinted to match the current app theme. Each call fails harmlessly on
-// pre-Win11 builds. Safe to call again after a theme change.
-void ApplyModernWindowChrome(HWND hwnd)
+// bar tinted `dark`. Each call fails harmlessly on pre-Win11 builds. Safe to
+// call again -- ApplyTitleBarDarkMode() re-invokes just the title-bar part
+// whenever the app theme toggles (rounded corners/Mica don't need reapplying).
+void ApplyTitleBarDarkMode(HWND hwnd, bool dark)
 {
-	BOOL dark = SystemUsesDarkTheme() ? TRUE : FALSE;
-	DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+	BOOL v = dark ? TRUE : FALSE;
+	DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &v, sizeof(v));
+}
+
+void ApplyModernWindowChrome(HWND hwnd, bool dark)
+{
+	ApplyTitleBarDarkMode(hwnd, dark);
 
 	int corner = DWMWCP_ROUND;
 	DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
@@ -98,7 +104,80 @@ void ApplyModernWindowChrome(HWND hwnd)
 	DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
 }
 
-} // anonymous namespace for DWM chrome helpers
+// ---------------------------------------------------------------------------
+// App-wide light/dark palette for all the custom-drawn chrome (toolbar, tab
+// strip, canvas surround, thumbnail panel, empty-state grid) plus the handful
+// of native controls (status bar, secondary-bar STATIC/EDIT children) we
+// explicitly recolor. Every kLightTheme value matches what was previously a
+// hardcoded literal at its use site, so switching this in is a no-op for the
+// existing light appearance; kDarkTheme targets Edge's dark PDF viewer look.
+// ---------------------------------------------------------------------------
+struct ThemeColors {
+	COLORREF toolbarBg, toolbarText, toolbarHoverPill, toolbarPressedPill, toolbarActivePill;
+	Gdiplus::ARGB iconInk;
+	COLORREF tabActiveBg, tabInactiveBg, tabBorder, tabText, tabAccent;
+	COLORREF canvasSurround;
+	COLORREF emptyHeading, emptySubtitle, tileBg, tileBorder, tileText;
+	COLORREF thumbBg, thumbText, thumbCurrentText, thumbSelFill, thumbSelBorder;
+	COLORREF ctrlBg, ctrlText, frameBg;
+	COLORREF statusBg, statusText;
+};
+
+constexpr ThemeColors kLightTheme = {
+	RGB(255, 255, 255), RGB(0x30, 0x30, 0x30), RGB(0xF2, 0xF2, 0xF2), RGB(0xDE, 0xDE, 0xDE), RGB(0xE8, 0xE8, 0xE8),
+	0xFF424242,
+	RGB(255, 255, 255), RGB(238, 238, 238), RGB(210, 210, 210), RGB(40, 40, 40), RGB(0, 120, 215),
+	RGB(236, 236, 236),
+	RGB(60, 60, 60), RGB(150, 150, 150), RGB(249, 249, 249), RGB(226, 226, 226), RGB(70, 70, 70),
+	RGB(243, 243, 243), RGB(90, 90, 90), RGB(0, 90, 180), RGB(204, 228, 247), RGB(0, 120, 215),
+	RGB(255, 255, 255), RGB(0, 0, 0), RGB(255, 255, 255),
+	RGB(255, 255, 255), RGB(0, 0, 0),
+};
+
+constexpr ThemeColors kDarkTheme = {
+	RGB(50, 50, 50), RGB(225, 225, 225), RGB(70, 70, 70), RGB(90, 90, 90), RGB(80, 80, 80),
+	0xFFE0E0E0,
+	RGB(50, 50, 50), RGB(32, 32, 32), RGB(70, 70, 70), RGB(225, 225, 225), RGB(28, 130, 225),
+	RGB(32, 32, 32),
+	RGB(225, 225, 225), RGB(160, 160, 160), RGB(45, 45, 45), RGB(75, 75, 75), RGB(210, 210, 210),
+	RGB(30, 30, 30), RGB(170, 170, 170), RGB(90, 165, 250), RGB(35, 65, 100), RGB(28, 130, 225),
+	RGB(45, 45, 45), RGB(220, 220, 220), RGB(32, 32, 32),
+	RGB(50, 50, 50), RGB(225, 225, 225),
+};
+
+inline const ThemeColors& Theme(bool dark) { return dark ? kDarkTheme : kLightTheme; }
+
+// Persisted user theme override: HKCU\Software\PDFast\ThemeMode = "light" |
+// "dark" (any other value, or absent, means "follow the system theme").
+constexpr wchar_t kThemeRegKey[] = L"Software\\PDFast";
+constexpr wchar_t kThemeRegValue[] = L"ThemeMode";
+
+// Returns the mode to start in: the user's saved explicit choice if any,
+// otherwise whatever the OS is currently set to.
+bool InitialDarkMode()
+{
+	wchar_t buf[16] = {};
+	DWORD size = sizeof(buf);
+	if (RegGetValueW(HKEY_CURRENT_USER, kThemeRegKey, kThemeRegValue, RRF_RT_REG_SZ,
+			nullptr, buf, &size) == ERROR_SUCCESS) {
+		if (_wcsicmp(buf, L"dark") == 0) return true;
+		if (_wcsicmp(buf, L"light") == 0) return false;
+	}
+	return SystemUsesDarkTheme();
+}
+
+void SaveThemeOverride(bool dark)
+{
+	HKEY key;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, kThemeRegKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+		const wchar_t* v = dark ? L"dark" : L"light";
+		RegSetValueExW(key, kThemeRegValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(v),
+			static_cast<DWORD>((wcslen(v) + 1) * sizeof(wchar_t)));
+		RegCloseKey(key);
+	}
+}
+
+} // anonymous namespace for DWM chrome + theme helpers
 
 namespace {
 
@@ -402,6 +481,12 @@ public:
 	void setDocument(PdfDocument* doc);
 	void setThumbPanel(ThumbPanel* tp) { thumbs_ = tp; }
 	void setStatusBar(HWND sb) { status_ = sb; }
+	// Light/dark theme, driven by FrameWindow::applyTheme(). Only affects the
+	// page surround/empty-state chrome -- rendered page content (always white
+	// PDF pixels) is untouched, so a plain repaint is enough, no re-render.
+	void setDarkMode(bool dark) { dark_ = dark; updateStatus(); invalidate(); }
+	// The text updateStatus() last sent to the status bar -- see statusText_.
+	const std::wstring& currentStatusText() const { return statusText_; }
 	void setOnChanged(std::function<void()> f) { onChanged_ = std::move(f); }
 	// Fired whenever the visible page/zoom changes (scroll, wheel-zoom,
 	// fit mode, ...) -- lets the frame keep a toolbar zoom-% readout in sync
@@ -590,6 +675,7 @@ private:
 	PdfDocument* doc_ = nullptr;
 	ThumbPanel* thumbs_ = nullptr;
 	HWND status_ = nullptr;
+	bool dark_ = false;
 
 	float zoom_ = 1.0f;
 	UINT dpi_ = 96;
@@ -659,6 +745,12 @@ private:
 	std::unordered_map<int, std::vector<AnnotInfo>> annotCache_;
 	std::unordered_map<int, std::vector<LinkInfo>> linksCache_;
 	std::string hoveredLinkText_; // non-empty while the cursor sits over a link
+	// Mirrors whatever updateStatus() last sent to the status bar. Needed
+	// because SB_SETTEXTW's SBT_OWNERDRAW flag (dark mode) repurposes the
+	// part's text slot as opaque app data -- SB_GETTEXTW can't read the
+	// string back afterward, so FrameWindow::drawStatusBarItem reads this
+	// member (via currentStatusText()) instead.
+	std::wstring statusText_;
 	bool trackingMouseLeave_ = false; // TrackMouseEvent armed, so WM_MOUSELEAVE fires
 
 	// Tool state -- each tool keeps its own last-used color.
@@ -701,6 +793,7 @@ public:
 	void setCanvas(CanvasView* c) { canvas_ = c; }
 	void setCurrent(int page);
 	void refreshAfterSave() { cache_.clear(); relayout(); InvalidateRect(hwnd_, nullptr, FALSE); }
+	void setDarkMode(bool dark) { dark_ = dark; InvalidateRect(hwnd_, nullptr, FALSE); }
 	static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
 
 	// --- Organize mode: an interactive reorder/rotate/delete/insert session
@@ -752,6 +845,7 @@ private:
 	std::vector<PdfDocument::PagePlanEntry> order_;
 	bool organizeDragArmed_ = false;
 	int organizeDragIndex_ = -1;
+	bool dark_ = false;
 };
 
 // One open document = one PdfDocument + its own CanvasView/ThumbPanel child
@@ -781,6 +875,7 @@ public:
 
 private:
 	void createChildren();
+	void rebuildToolbarIcons(); // re-rasterizes every toolbar icon at the current ink color
 	void layout();
 	void onCommand(int id);
 	void syncMenuChecks();
@@ -803,6 +898,15 @@ private:
 	void updateTitle();
 	bool promptSaveIfDirty(); // returns false if user cancelled
 	void updateZoomLabel();
+
+	// Theme (light/dark). isDark_ starts from InitialDarkMode() (saved user
+	// override, else the system theme) and only changes via the toolbar
+	// toggle button -- the app never re-polls the system after launch.
+	// applyTheme() re-skins everything already on screen: DWM title bar,
+	// toolbar icon ImageList (colors are pre-rasterized, so this rebuilds
+	// it), and every open tab's canvas/thumbnail panel.
+	void applyTheme();
+	void toggleTheme();
 
 	// Finishes wiring up a just-opened (and, if needed, authenticated)
 	// document into the active tab -- shared by the direct-open and
@@ -864,6 +968,7 @@ private:
 	static LRESULT CALLBACK TabStripSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	RECT tabCloseRect(int idx) const; // hit-test rect for a tab's close "x", also used to draw it
 	void drawTabItem(const DRAWITEMSTRUCT* dis);
+	void drawStatusBarItem(const DRAWITEMSTRUCT* dis);
 
 	HINSTANCE hInst_;
 	HWND hwnd_ = nullptr;
@@ -882,6 +987,11 @@ private:
 	ThumbPanel* thumbs_ = nullptr;
 	PdfDocument* doc_ = nullptr;
 	bool showThumbs_ = false; // page-preview pane hidden by default
+	bool isDark_ = false;     // set from InitialDarkMode() in create(); see applyTheme()
+	// Cached background brush for WM_CTLCOLORSTATIC/EDIT in dark mode -- these
+	// fire on every keystroke/caret blink, so the brush is created once and
+	// reused (recreated only on an actual theme change), not per-message.
+	HBRUSH ctrlBgBrush_ = nullptr;
 
 	// Organize side panel's bottom action strip (Insert Pages/Done/Cancel).
 	// The interactive reorder/rotate/delete state itself lives in the
@@ -2605,7 +2715,7 @@ void CanvasView::onPaint()
 	HBITMAP back = CreateCompatibleBitmap(hdc, cw, ch);
 	HBITMAP oldBack = static_cast<HBITMAP>(SelectObject(mem, back));
 
-	HBRUSH bg = CreateSolidBrush(RGB(236, 236, 236)); // light gray surround, matches Edge's PDF viewer
+	HBRUSH bg = CreateSolidBrush(Theme(dark_).canvasSurround); // matches Edge's PDF viewer surround
 	FillRect(mem, &rc, bg);
 	DeleteObject(bg);
 
@@ -2796,11 +2906,15 @@ void CanvasView::onWheel(short delta, bool ctrl, bool horiz)
 void CanvasView::updateStatus()
 {
 	if (!status_) return;
+	// Dark mode draws this part itself (FrameWindow::drawStatusBarItem) --
+	// status bars don't reliably support NM_CUSTOMDRAW, so SBT_OWNERDRAW is
+	// the documented way to recolor its text. Light mode stays fully native.
+	WPARAM part = dark_ ? SBT_OWNERDRAW : 0;
 	// Hovering a link takes over the status bar, browser-style (bottom-left
 	// URL preview) -- restored to the normal page/zoom text once it clears.
 	if (!hoveredLinkText_.empty()) {
-		std::wstring w = Utf8ToWide(hoveredLinkText_);
-		SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(w.c_str()));
+		statusText_ = Utf8ToWide(hoveredLinkText_);
+		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 		return;
 	}
 	wchar_t buf[128];
@@ -2812,7 +2926,8 @@ void CanvasView::updateStatus()
 	} else {
 		swprintf(buf, 128, L"No document");
 	}
-	SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(buf));
+	statusText_ = buf;
+	SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 	if (onViewChanged_) onViewChanged_();
 }
 
@@ -3051,7 +3166,8 @@ void ThumbPanel::onPaint()
 	HDC mem = CreateCompatibleDC(hdc);
 	HBITMAP back = CreateCompatibleBitmap(hdc, cw, ch);
 	HBITMAP oldBack = static_cast<HBITMAP>(SelectObject(mem, back));
-	HBRUSH bg = CreateSolidBrush(RGB(243, 243, 243));
+	const ThemeColors& th = Theme(dark_);
+	HBRUSH bg = CreateSolidBrush(th.thumbBg);
 	FillRect(mem, &rc, bg); DeleteObject(bg);
 
 	// Same isOpen() exemption as relayout(): organize mode can be active on
@@ -3082,9 +3198,9 @@ void ThumbPanel::onPaint()
 				// row-swap-as-you-drag already gives positional feedback).
 				if (!organizeMode_ && i == current_) {
 					RECT hl = { tx - 3, top - 3, tx + w + 3, top + h + 3 };
-					HBRUSH sel = CreateSolidBrush(RGB(204, 228, 247));
+					HBRUSH sel = CreateSolidBrush(th.thumbSelFill);
 					FillRect(mem, &hl, sel); DeleteObject(sel);
-					HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 120, 215));
+					HPEN pen = CreatePen(PS_SOLID, 1, th.thumbSelBorder);
 					HGDIOBJ oldPen = SelectObject(mem, pen);
 					HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
 					Rectangle(mem, hl.left, hl.top, hl.right, hl.bottom);
@@ -3115,7 +3231,7 @@ void ThumbPanel::onPaint()
 				// draw them a couple points larger with the glyph font, then
 				// restore the number font.
 				HGDIOBJ prevF = SelectObject(mem, glyphFont);
-				SetTextColor(mem, RGB(70, 70, 70));
+				SetTextColor(mem, th.thumbText);
 				DrawTextW(mem, L"↺", -1, &ir.ccw, DT_CENTER | DT_VCENTER | DT_SINGLELINE); // rotate CCW
 				DrawTextW(mem, L"↻", -1, &ir.cw, DT_CENTER | DT_VCENTER | DT_SINGLELINE);  // rotate CW
 				SetTextColor(mem, RGB(180, 40, 40));
@@ -3123,12 +3239,12 @@ void ThumbPanel::onPaint()
 				SelectObject(mem, prevF);
 				wchar_t num[16]; swprintf(num, 16, L"%d", i + 1);
 				RECT nr = { ir.ccw.right, ir.ccw.top, ir.cw.left, ir.ccw.bottom };
-				SetTextColor(mem, RGB(90, 90, 90));
+				SetTextColor(mem, th.thumbText);
 				DrawTextW(mem, num, -1, &nr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 			} else {
 				wchar_t num[16]; swprintf(num, 16, L"%d", i + 1);
 				RECT lr = { 0, top + h, cw, top + h + rowH };
-				SetTextColor(mem, i == current_ ? RGB(0, 90, 180) : RGB(90, 90, 90));
+				SetTextColor(mem, i == current_ ? th.thumbCurrentText : th.thumbText);
 				DrawTextW(mem, num, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 			}
 		}
@@ -3334,8 +3450,12 @@ LRESULT CALLBACK ThumbPanel::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 namespace icons {
 
 // Crisper Fluent neutral (was 0xFF505050, which read washed-out). Dark enough
-// to feel modern/legible, not a harsh pure black.
-constexpr Gdiplus::ARGB kInk = 0xFF424242;
+// to feel modern/legible, not a harsh pure black. Mutable (not constexpr) so
+// SetInkColor() can retint every icon -- both the on-demand Gdiplus draws
+// (empty-state grid, organize-mode glyphs) and, after a rebuild, the
+// pre-rasterized toolbar ImageList -- when the app theme toggles.
+Gdiplus::ARGB kInk = 0xFF424242;
+void SetInkColor(Gdiplus::ARGB ink) { kInk = ink; }
 // Single shared stroke weight so every glyph reads at a consistent thickness
 // (~1.25px at the 20px icon size -- a lighter, more modern Fluent line; the
 // earlier 0.08 read too heavy). Icons that intentionally deviate (Width's
@@ -3611,6 +3731,22 @@ void DrawLockTool(Gdiplus::Graphics& g, float s)
 	g.FillEllipse(&dot, s * 0.44f, s * 0.58f, s * 0.12f, s * 0.12f);
 }
 
+// A minimal sun (core + 8 rays) for the light/dark theme toggle button --
+// one fixed glyph regardless of which mode is active, like most apps' theme
+// toggles.
+void DrawThemeToggle(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.ellipse(0.32f, 0.32f, 0.36f, 0.36f);
+	constexpr float kCx = 0.5f, kCy = 0.5f, kR1 = 0.32f, kR2 = 0.46f;
+	for (int i = 0; i < 8; ++i) {
+		float a = i * 3.14159265f / 4.0f;
+		float x1 = kCx + kR1 * std::cos(a), y1 = kCy + kR1 * std::sin(a);
+		float x2 = kCx + kR2 * std::cos(a), y2 = kCy + kR2 * std::sin(a);
+		p.line(x1, y1, x2, y2);
+	}
+}
+
 } // namespace icons
 
 // ---------------------------------------------------------------------------
@@ -3684,6 +3820,7 @@ void CanvasView::drawEmptyState(HDC dc, const RECT& rc)
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 	SetBkMode(dc, TRANSPARENT);
+	const ThemeColors& th = Theme(dark_);
 
 	// Heading + subtitle, right above the grid's top row.
 	int gridTop = tileRects.front().top;
@@ -3692,10 +3829,10 @@ void CanvasView::drawEmptyState(HDC dc, const RECT& rc)
 	RECT headRc = { rc.left, headerBottom - Scale(56, dpi_), rc.right, headerBottom - Scale(24, dpi_) };
 	RECT subRc = { rc.left, headerBottom - Scale(24, dpi_), rc.right, headerBottom };
 	HGDIOBJ oldFont = SelectObject(dc, headingFont);
-	SetTextColor(dc, RGB(60, 60, 60));
+	SetTextColor(dc, th.emptyHeading);
 	DrawTextW(dc, L"Open a PDF to get started", -1, &headRc, DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
 	SelectObject(dc, subFont);
-	SetTextColor(dc, RGB(150, 150, 150));
+	SetTextColor(dc, th.emptySubtitle);
 	DrawTextW(dc, L"Drag a file here, or pick a tool below", -1, &subRc, DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
 
 	Gdiplus::Graphics g(dc);
@@ -3703,8 +3840,8 @@ void CanvasView::drawEmptyState(HDC dc, const RECT& rc)
 	for (size_t i = 0; i < tiles.size() && i < tileRects.size(); ++i) {
 		const RECT& r = tileRects[i];
 		int rad = Scale(10, dpi_);
-		HPEN pen = CreatePen(PS_SOLID, 1, RGB(226, 226, 226));
-		HBRUSH fill = CreateSolidBrush(RGB(249, 249, 249));
+		HPEN pen = CreatePen(PS_SOLID, 1, th.tileBorder);
+		HBRUSH fill = CreateSolidBrush(th.tileBg);
 		HGDIOBJ oldPen = SelectObject(dc, pen);
 		HGDIOBJ oldBr = SelectObject(dc, fill);
 		RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
@@ -3722,7 +3859,7 @@ void CanvasView::drawEmptyState(HDC dc, const RECT& rc)
 		RECT labelRc = { r.left + Scale(4, dpi_), r.top + Scale(14, dpi_) + static_cast<int>(iconSize) + Scale(8, dpi_),
 			r.right - Scale(4, dpi_), r.bottom - Scale(6, dpi_) };
 		SelectObject(dc, labelFont);
-		SetTextColor(dc, RGB(70, 70, 70));
+		SetTextColor(dc, th.tileText);
 		DrawTextW(dc, tiles[i].label, -1, &labelRc, DT_CENTER | DT_TOP | DT_WORDBREAK);
 	}
 
@@ -3752,6 +3889,14 @@ bool CanvasView::hitTestEmptyState(int mx, int my, int& cmdId) const
 // ===========================================================================
 HWND FrameWindow::create(int nCmdShow)
 {
+	// Resolve the starting theme (saved override, else the system's) before
+	// the window is created -- WM_CREATE (fired synchronously inside
+	// CreateWindowExW below) calls createChildren(), which rasterizes the
+	// toolbar icons using whatever ink color icons::kInk holds right now.
+	isDark_ = InitialDarkMode();
+	icons::SetInkColor(Theme(isDark_).iconInk);
+	ctrlBgBrush_ = CreateSolidBrush(Theme(isDark_).ctrlBg);
+
 	// No classic File/Edit/View menu bar -- the toolbar plus accelerators
 	// (Ctrl+O, Ctrl+S, Ctrl+F, ...) cover everything, matching Edge's PDF
 	// viewer chrome. IDR_MAINMENU is left in the .rc file unused rather than
@@ -3763,7 +3908,7 @@ HWND FrameWindow::create(int nCmdShow)
 	// Windows 11 native chrome: rounded corners, Mica backdrop, themed title
 	// bar. No-op on older Windows. Applied before ShowWindow so the first
 	// paint already has the correct frame.
-	ApplyModernWindowChrome(hwnd_);
+	ApplyModernWindowChrome(hwnd_, isDark_);
 	// Open maximized by default (fills the screen, keeping the title bar and
 	// taskbar -- what users mean by "full screen" for a document app). Still
 	// honor an explicit minimized/hidden launch (e.g. a shortcut set to run
@@ -3779,6 +3924,75 @@ HWND FrameWindow::create(int nCmdShow)
 	updater::CleanupAfterUpdate();
 	startUpdateCheck(/*manual=*/false);
 	return hwnd_;
+}
+
+void FrameWindow::toggleTheme()
+{
+	isDark_ = !isDark_;
+	SaveThemeOverride(isDark_);
+	applyTheme();
+}
+
+void FrameWindow::applyTheme()
+{
+	icons::SetInkColor(Theme(isDark_).iconInk);
+	rebuildToolbarIcons();
+	ApplyTitleBarDarkMode(hwnd_, isDark_);
+
+	const ThemeColors& t = Theme(isDark_);
+	if (ctrlBgBrush_) DeleteObject(ctrlBgBrush_);
+	ctrlBgBrush_ = CreateSolidBrush(t.ctrlBg);
+	// Status bar is fully custom-drawn (background + text) in its
+	// NM_CUSTOMDRAW handler when isDark_ -- nothing to do here.
+
+	for (auto& tab : tabs_) {
+		if (tab->canvas) tab->canvas->setDarkMode(isDark_);
+		if (tab->thumbs) tab->thumbs->setDarkMode(isDark_);
+	}
+
+	// Plain InvalidateRect on the frame only repaints the frame's OWN client
+	// area -- it does not cascade to child HWNDs (EDIT/STATIC/the tab strip/
+	// status bar/canvas/thumbnail panel), which is why they'd otherwise keep
+	// showing stale colors until something else happened to repaint them.
+	// RDW_ALLCHILDREN forces every descendant to repaint too, so every
+	// WM_CTLCOLORSTATIC/EDIT, WM_ERASEBKGND, and custom WM_PAINT along the
+	// way picks up the new theme immediately.
+	RedrawWindow(hwnd_, nullptr, nullptr,
+		RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+}
+
+namespace {
+// Ordered list of every toolbar icon glyph. createChildren() adds these to
+// toolbarImages_ once at startup (each TBBUTTON's iBitmap is that position,
+// baked in below via the named iXxx indices); rebuildToolbarIcons() replays
+// the exact same order into a cleared ImageList when the theme toggles, so
+// every existing TBBUTTON's index stays valid without touching the button
+// list itself -- only the pixels (and therefore the ink color) change.
+const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
+{
+	static const std::vector<icons::DrawFn> fns = {
+		icons::DrawOpen, icons::DrawSave, icons::DrawSaveAs, icons::DrawPrint, icons::DrawFind,
+		icons::DrawSelectTool, icons::DrawHighlightTool, icons::DrawDrawTool, icons::DrawTextTool,
+		icons::DrawRedactTool, icons::DrawColorTool, icons::DrawWidthTool, icons::DrawOpacityTool,
+		icons::DrawZoomOut, icons::DrawZoomIn, icons::DrawFitWidth, icons::DrawFitPage,
+		icons::DrawToolsMenu, icons::DrawThemeToggle,
+	};
+	return fns;
+}
+} // namespace
+
+void FrameWindow::rebuildToolbarIcons()
+{
+	if (!toolbarImages_ || !toolbar_) return;
+	UINT dpi = GetDpiForWindow(hwnd_);
+	int iconPx = Scale(20, dpi);
+	ImageList_RemoveAll(toolbarImages_);
+	for (auto& fn : ToolbarIconDrawFns()) {
+		HBITMAP hb = icons::MakeIcon(iconPx, fn);
+		ImageList_Add(toolbarImages_, hb, nullptr);
+		DeleteObject(hb);
+	}
+	InvalidateRect(toolbar_, nullptr, TRUE);
 }
 
 void FrameWindow::createChildren()
@@ -3808,30 +4022,17 @@ void FrameWindow::createChildren()
 	// icon this yields ~36px-tall square-ish buttons and consistent gaps,
 	// giving the rounded hover pills room to breathe.
 	SendMessageW(toolbar_, TB_SETPADDING, 0, MAKELPARAM(Scale(10, dpi), Scale(8, dpi)));
-	auto addIcon = [&](const icons::DrawFn& draw) -> int {
-		HBITMAP hb = icons::MakeIcon(iconPx, draw);
-		int idx = ImageList_Add(toolbarImages_, hb, nullptr);
+	// Build every icon from the single shared ordered list (ToolbarIconDrawFns)
+	// so rebuildToolbarIcons() can later replay the exact same order into a
+	// cleared ImageList -- these named indices are just that list's positions.
+	for (auto& fn : ToolbarIconDrawFns()) {
+		HBITMAP hb = icons::MakeIcon(iconPx, fn);
+		ImageList_Add(toolbarImages_, hb, nullptr);
 		DeleteObject(hb);
-		return idx;
-	};
-	int iOpen = addIcon(icons::DrawOpen);
-	int iSave = addIcon(icons::DrawSave);
-	int iSaveAs = addIcon(icons::DrawSaveAs);
-	int iPrint = addIcon(icons::DrawPrint);
-	int iFind = addIcon(icons::DrawFind);
-	int iSelect = addIcon(icons::DrawSelectTool);
-	int iHighlight = addIcon(icons::DrawHighlightTool);
-	int iDraw = addIcon(icons::DrawDrawTool);
-	int iText = addIcon(icons::DrawTextTool);
-	int iRedact = addIcon(icons::DrawRedactTool);
-	int iColor = addIcon(icons::DrawColorTool);
-	int iWidth = addIcon(icons::DrawWidthTool);
-	int iOpacity = addIcon(icons::DrawOpacityTool);
-	int iZoomOut = addIcon(icons::DrawZoomOut);
-	int iZoomIn = addIcon(icons::DrawZoomIn);
-	int iFitWidth = addIcon(icons::DrawFitWidth);
-	int iFitPage = addIcon(icons::DrawFitPage);
-	int iTools = addIcon(icons::DrawToolsMenu);
+	}
+	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
+		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
+		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -3907,6 +4108,8 @@ void FrameWindow::createChildren()
 	btn(IDM_FILE_OPEN, iOpen, L"Open");
 	sep();
 	btn(IDM_TOOLS_MENU, iTools, L"Tools (Merge, Split, Organize, Resize, Flatten, Compress)");
+	sep();
+	btn(IDM_VIEW_TOGGLETHEME, iThemeToggle, L"Toggle Light/Dark Theme");
 	// Continuous/Single-page and Thumbnails toggles removed from the UI by
 	// request; Continuous stays the only (default) scroll mode and the
 	// thumbnail panel stays hidden (see showThumbs_'s default).
@@ -4843,6 +5046,8 @@ int FrameWindow::newTab()
 	tab->canvas->setOnExitTextTool([this] { selectTool(IDM_TOOL_SELECT); });
 	tab->canvas->setOnViewChanged([this] { updateZoomLabel(); updatePageEditBox(); });
 	tab->canvas->setOnEmptyStateAction([this](int cmdId) { onCommand(cmdId); });
+	tab->canvas->setDarkMode(isDark_);
+	tab->thumbs->setDarkMode(isDark_);
 	// Both start hidden; switchToTab() shows whichever becomes active.
 	ShowWindow(tab->canvas->hwnd(), SW_HIDE);
 	ShowWindow(tab->thumbs->hwnd(), SW_HIDE);
@@ -5012,6 +5217,17 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 	UINT_PTR, DWORD_PTR ref)
 {
 	auto* self = reinterpret_cast<FrameWindow*>(ref);
+	// The trailing area past the last tab (and, in dark mode, the momentary
+	// flash before an owner-drawn item repaints) is the control's own
+	// background -- WM_DRAWITEM only covers actual tab items, not that gap.
+	if (msg == WM_ERASEBKGND && self->isDark_) {
+		HDC dc = reinterpret_cast<HDC>(wp);
+		RECT rc; GetClientRect(hwnd, &rc);
+		HBRUSH b = CreateSolidBrush(kDarkTheme.tabInactiveBg);
+		FillRect(dc, &rc, b);
+		DeleteObject(b);
+		return 1;
+	}
 	if (msg == WM_LBUTTONDOWN) {
 		POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
 		TCHITTESTINFO hit = {}; hit.pt = pt;
@@ -5090,17 +5306,18 @@ void FrameWindow::drawTabItem(const DRAWITEMSTRUCT* dis)
 	HDC dc = dis->hDC;
 	RECT rc = dis->rcItem;
 	bool selected = (dis->itemState & ODS_SELECTED) != 0;
+	const ThemeColors& th = Theme(isDark_);
 
-	HBRUSH bg = CreateSolidBrush(selected ? RGB(255, 255, 255) : RGB(238, 238, 238));
+	HBRUSH bg = CreateSolidBrush(selected ? th.tabActiveBg : th.tabInactiveBg);
 	FillRect(dc, &rc, bg);
 	DeleteObject(bg);
 	if (selected) {
-		HBRUSH accent = CreateSolidBrush(RGB(0, 120, 215));
+		HBRUSH accent = CreateSolidBrush(th.tabAccent);
 		RECT under = { rc.left, rc.bottom - Scale(2, GetDpiForWindow(hwnd_)), rc.right, rc.bottom };
 		FillRect(dc, &under, accent);
 		DeleteObject(accent);
 	}
-	HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(210, 210, 210));
+	HPEN gridPen = CreatePen(PS_SOLID, 1, th.tabBorder);
 	HGDIOBJ oldPen = SelectObject(dc, gridPen);
 	MoveToEx(dc, rc.right - 1, rc.top + 4, nullptr);
 	LineTo(dc, rc.right - 1, rc.bottom - 4);
@@ -5120,13 +5337,14 @@ void FrameWindow::drawTabItem(const DRAWITEMSTRUCT* dis)
 	textRc.left += Scale(10, dpi);
 	textRc.right = closeRc.left - Scale(4, dpi);
 	SetBkMode(dc, TRANSPARENT);
-	SetTextColor(dc, RGB(40, 40, 40));
+	SetTextColor(dc, th.tabText);
 	HFONT oldFont = uiFont_ ? static_cast<HFONT>(SelectObject(dc, uiFont_)) : nullptr;
 	DrawTextW(dc, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 	if (oldFont) SelectObject(dc, oldFont);
 
-	// Close "x", drawn as a plain glyph (no hover state tracked).
-	HPEN xpen = CreatePen(PS_SOLID, Scale(1, dpi), RGB(100, 100, 100));
+	// Close "x", drawn as a plain glyph (no hover state tracked) -- deliberately
+	// more muted than the tab's own label text, in both themes.
+	HPEN xpen = CreatePen(PS_SOLID, Scale(1, dpi), isDark_ ? RGB(150, 150, 150) : RGB(100, 100, 100));
 	HGDIOBJ oldXPen = SelectObject(dc, xpen);
 	MoveToEx(dc, closeRc.left, closeRc.top, nullptr);
 	LineTo(dc, closeRc.right, closeRc.bottom);
@@ -5134,6 +5352,32 @@ void FrameWindow::drawTabItem(const DRAWITEMSTRUCT* dis)
 	LineTo(dc, closeRc.left, closeRc.bottom);
 	SelectObject(dc, oldXPen);
 	DeleteObject(xpen);
+}
+
+// Only reached for a part that was set with the SBT_OWNERDRAW flag (see
+// CanvasView::updateStatus) -- i.e. only in dark mode. Status bar controls
+// don't reliably send NM_CUSTOMDRAW like other common controls do, so
+// SBT_OWNERDRAW + WM_DRAWITEM (the same mechanism the tab strip already
+// uses) is the documented, reliable way to recolor its text. The sizegrip
+// corner is drawn separately by the control itself, unaffected by this.
+void FrameWindow::drawStatusBarItem(const DRAWITEMSTRUCT* dis)
+{
+	const ThemeColors& th = Theme(isDark_);
+	HBRUSH bg = CreateSolidBrush(th.statusBg);
+	FillRect(dis->hDC, &dis->rcItem, bg);
+	DeleteObject(bg);
+
+	// SB_GETTEXTW can't be used here: once a part is marked SBT_OWNERDRAW,
+	// its text slot holds opaque app data, not a retrievable string (see
+	// CanvasView::statusText_'s comment) -- read the mirrored text instead.
+	if (canvas_) {
+		RECT tr = dis->rcItem;
+		tr.left += Scale(6, GetDpiForWindow(status_));
+		SetTextColor(dis->hDC, th.statusText);
+		SetBkMode(dis->hDC, TRANSPARENT);
+		DrawTextW(dis->hDC, canvas_->currentStatusText().c_str(), -1, &tr,
+			DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+	}
 }
 
 void FrameWindow::openDocument(const wchar_t* path)
@@ -5261,6 +5505,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOLS_RESIZE_A4: doResizeToA4(); break;
 	case IDM_TOOLS_FLATTEN: doFlatten(); break;
 	case IDM_TOOLS_COMPRESS: doCompress(); break;
+	case IDM_VIEW_TOGGLETHEME: toggleTheme(); break;
 	case IDM_HELP_CHECKUPDATE: startUpdateCheck(/*manual=*/true); break;
 	case IDC_ORGANIZE_INSERT: organizeInsertPages(); break;
 	case IDC_ORGANIZE_DONE: organizeDone(); break;
@@ -5518,6 +5763,31 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	switch (msg) {
 	case WM_CREATE: self->createChildren(); return 0;
 	case WM_SIZE: self->layout(); return 0;
+	case WM_ERASEBKGND: {
+		// Only intervene in dark mode -- in light mode, fall through (break)
+		// to the default handling, which uses the class brush exactly as
+		// before this feature existed, so light mode is pixel-identical.
+		if (!self->isDark_) break;
+		HDC dc = reinterpret_cast<HDC>(wp);
+		RECT rc; GetClientRect(hwnd, &rc);
+		HBRUSH b = CreateSolidBrush(kDarkTheme.frameBg);
+		FillRect(dc, &rc, b);
+		DeleteObject(b);
+		return 1;
+	}
+	case WM_CTLCOLORSTATIC:
+	case WM_CTLCOLOREDIT: {
+		// Recolors every STATIC label and EDIT box that sits directly on the
+		// frame -- the secondary bars (search/password/protection/split) plus
+		// the always-visible zoom-%/page-number controls -- in dark mode.
+		// Native BUTTON children are left themed/light (no supported API to
+		// recolor a themed push-button face without private uxtheme calls).
+		if (!self->isDark_) break;
+		HDC dc = reinterpret_cast<HDC>(wp);
+		SetTextColor(dc, kDarkTheme.ctrlText);
+		SetBkMode(dc, TRANSPARENT);
+		return reinterpret_cast<LRESULT>(self->ctrlBgBrush_);
+	}
 	case WM_COMMAND:
 		// Search-as-you-type: debounce edit changes so large docs stay smooth.
 		if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == IDC_SEARCH_EDIT) {
@@ -5545,6 +5815,9 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				di->lpszText = const_cast<LPWSTR>(it->second.c_str());
 			return 0;
 		}
+		// Status bar dark-mode recoloring is done via SBT_OWNERDRAW + WM_DRAWITEM
+		// (see drawStatusBarItem) -- status bar controls don't reliably send
+		// NM_CUSTOMDRAW the way toolbar/tab controls do.
 		if (nm->hwndFrom == self->toolbar_ && nm->code == NM_CUSTOMDRAW) {
 			// Recolor the toolbar to a flat white/near-white look (Edge's PDF
 			// viewer chrome) instead of the default themed gray button face.
@@ -5552,10 +5825,11 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			// toolbar's background/hover without switching every button to
 			// full owner-draw.
 			auto* cd = reinterpret_cast<LPNMTBCUSTOMDRAW>(lp);
+			const ThemeColors& th = Theme(self->isDark_);
 			switch (cd->nmcd.dwDrawStage) {
 			case CDDS_PREPAINT: {
 				RECT rc; GetClientRect(self->toolbar_, &rc);
-				HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
+				HBRUSH bg = CreateSolidBrush(th.toolbarBg);
 				FillRect(cd->nmcd.hdc, &rc, bg);
 				DeleteObject(bg);
 				// This is a normal WNDPROC, so the custom-draw result must be the
@@ -5586,11 +5860,10 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				UINT st = cd->nmcd.uItemState;
 				COLORREF fill = 0;
 				bool paint = true;
-				if (st & CDIS_SELECTED)        fill = RGB(0xDE, 0xDE, 0xDE); // pressed
+				if (st & CDIS_SELECTED)        fill = th.toolbarPressedPill;
 				else if (st & CDIS_CHECKED)
-					fill = (st & CDIS_HOT) ? RGB(0xDE, 0xDE, 0xDE)          // active + hover
-					                       : RGB(0xE8, 0xE8, 0xE8);          // active tool
-				else if (st & CDIS_HOT)        fill = RGB(0xF2, 0xF2, 0xF2); // hover
+					fill = (st & CDIS_HOT) ? th.toolbarPressedPill : th.toolbarActivePill;
+				else if (st & CDIS_HOT)        fill = th.toolbarHoverPill;
 				else paint = false;
 
 				RECT r = cd->nmcd.rc;
@@ -5623,6 +5896,10 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
 		if (dis->CtlType == ODT_TAB && dis->hwndItem == self->tabStrip_) {
 			self->drawTabItem(dis);
+			return TRUE;
+		}
+		if (dis->hwndItem == self->status_) {
+			self->drawStatusBarItem(dis);
 			return TRUE;
 		}
 		break;
@@ -5671,6 +5948,7 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_DESTROY:
 		if (self->uiFont_) { DeleteObject(self->uiFont_); self->uiFont_ = nullptr; }
 		if (self->toolbarImages_) { ImageList_Destroy(self->toolbarImages_); self->toolbarImages_ = nullptr; }
+		if (self->ctrlBgBrush_) { DeleteObject(self->ctrlBgBrush_); self->ctrlBgBrush_ = nullptr; }
 		PostQuitMessage(0);
 		return 0;
 	}
