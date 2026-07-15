@@ -14,6 +14,7 @@
 #define IDM_VIEW_SINGLEPAGE  1016
 #define IDM_VIEW_THUMBS      1017
 #define IDM_VIEW_ZOOMLABEL   1018  // toolbar-only: shows current zoom %, click resets to 100%
+#define IDM_VIEW_PAGELABEL   1019  // toolbar-only: reserves width for the page-number jump box (pageEdit_/pageOfLabel_ overlay it)
 
 #define IDM_GO_PREV          1020
 #define IDM_GO_NEXT          1021
@@ -21,6 +22,7 @@
 #define IDM_TAB_NEXT         1022  // Ctrl+Tab
 #define IDM_TAB_PREV         1023  // Ctrl+Shift+Tab
 #define IDM_TAB_CLOSE        1024  // Ctrl+W
+#define IDM_TAB_OPEN_NEW_WINDOW 1025  // tab right-click menu: detach into its own top-level window
 
 #define IDM_EDIT_FIND        1040
 #define IDM_EDIT_FINDNEXT    1041
@@ -92,6 +94,12 @@
 #define IDC_ORGANIZE_DONE    1128
 #define IDC_ORGANIZE_CANCEL  1129
 
+// Set-password bar (Tools > Set Password...)
+#define IDC_SETPWD_LABEL   1130
+#define IDC_SETPWD_EDIT    1131
+#define IDC_SETPWD_BUTTON  1132
+#define IDC_SETPWD_CLOSE   1133
+
 // Redact tool + Tools popup menu items
 #define IDM_TOOL_REDACT        1209
 #define IDM_TOOLS_MENU         1210  // toolbar button that opens the popup below
@@ -102,6 +110,20 @@
 #define IDM_TOOLS_FLATTEN      1215
 #define IDM_TOOLS_COMPRESS     1216
 #define IDM_VIEW_TOGGLETHEME   1217  // toolbar-only: flips light/dark and persists the choice
+#define IDM_TOOLS_SET_PASSWORD 1218
+#define IDM_EMPTY_SET_PASSWORD 1219  // empty-state "Set Password" tile: Open, then auto-show the set-password bar
+#define IDM_TOOLS_CONVERT      1220  // Tools menu + empty-state tile: images/text/markdown/docx/pdf to PDF
+#define IDM_TOOLS_WEBPDF       1221  // Tools menu + empty-state tile: web page to PDF
+#define IDM_TOOLS_FLATTEN_EDITS 1222 // Tools menu: bake annotations/form fields into content, keep page text selectable
+#define IDM_TOOL_ERASE         1223 // toolbar radio tool: deletes a whole ink stroke on touch (joins Select/Highlight/Draw/AddText/Redact)
+#define IDM_EMPTY_FLATTEN_IMAGE 1226 // empty-state "Flatten to Image" tile: Open, then auto-flatten-to-image
+#define IDM_EMPTY_FLATTEN_EDITS 1227 // empty-state "Flatten Edits Only" tile: Open, then auto-flatten-edits-only
+
+// Web-to-PDF bar (URL text box + Convert button)
+#define IDC_WEBPDF_LABEL   1134
+#define IDC_WEBPDF_EDIT    1135
+#define IDC_WEBPDF_BUTTON  1136
+#define IDC_WEBPDF_CLOSE   1137
 
 // Toolbar button command IDs reuse the menu IDs above.
 

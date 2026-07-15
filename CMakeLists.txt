@@ -16,16 +16,28 @@ cmake_policy(SET CMP0091 NEW)
 
 include(cmake/MuPDF.cmake)
 
+# WebView2 SDK, vendored from the microsoft.web.webview2 NuGet package
+# (headers + the statically-linkable loader lib, no separate DLL to ship --
+# keeps the single-exe property). Only the SDK is vendored; the much larger
+# WebView2 Runtime itself is NOT bundled -- it ships with Edge and is
+# expected to already be present system-wide (see webview_convert.h).
+set(WEBVIEW2_DIR ${CMAKE_SOURCE_DIR}/third_party/webview2)
+
 # Console proof-of-concept (kept for quick render sanity checks).
 add_executable(pdfviewer_poc src/poc_main.cpp)
 target_link_libraries(pdfviewer_poc PRIVATE mupdf)
 
 # Console diagnostic tool for the edit+save code path (no GUI/window
 # involved) -- lets us isolate save-corruption bugs from Win32 input issues.
-add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp)
+add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp src/word_convert.cpp src/webview_convert.cpp)
 # gdi32/user32: pdf_document.cpp now loads installed Windows fonts (CreateFontW/
 # GetFontData) so MuPDF can substitute real fonts for non-embedded references.
-target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32)
+# ole32/oleaut32: word_convert.cpp's Word COM automation (Convert to PDF's
+# .docx support). WebView2LoaderStatic: webview_convert.cpp (Convert to PDF's
+# web-page support).
+target_include_directories(pdfviewer_savetest PRIVATE ${WEBVIEW2_DIR}/include)
+target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32 ole32 oleaut32
+	${WEBVIEW2_DIR}/lib/x64/WebView2LoaderStatic.lib)
 target_compile_definitions(pdfviewer_savetest PRIVATE NOMINMAX UNICODE _UNICODE)
 
 # Console harness for the auto-updater's network + parse path (no GUI). Point
@@ -41,11 +53,17 @@ add_executable(pdfviewer WIN32
 	src/pdf_document.cpp
 	src/print_document.cpp
 	src/updater.cpp
+	src/word_convert.cpp
+	src/webview_convert.cpp
 	resources/app.rc
 )
 # winhttp: GitHub-releases update check + download (stock Windows system DLL,
-# keeps the single-exe/no-redist property). See src/updater.cpp.
-target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 uxtheme dwmapi winhttp)
+# keeps the single-exe/no-redist property). See src/updater.cpp. oleaut32:
+# word_convert.cpp's Word COM automation (Convert to PDF's .docx support).
+# WebView2LoaderStatic: webview_convert.cpp (Convert to PDF's web-page support).
+target_include_directories(pdfviewer PRIVATE ${WEBVIEW2_DIR}/include)
+target_link_libraries(pdfviewer PRIVATE mupdf comctl32 shell32 gdi32 user32 comdlg32 msimg32 gdiplus ole32 oleaut32 uxtheme dwmapi winhttp
+	${WEBVIEW2_DIR}/lib/x64/WebView2LoaderStatic.lib)
 target_compile_definitions(pdfviewer PRIVATE NOMINMAX UNICODE _UNICODE)
 # App/taskbar/Explorer icon, if resources/app.ico has been generated (see
 # icon.png at the repo root -- not committed as .ico directly since it's

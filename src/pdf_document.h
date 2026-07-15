@@ -106,6 +106,15 @@ public:
 	// knowing the original owner password, so this one operation backs both
 	// "remove password" and "remove restrictions" in the UI.
 	bool removeProtection(const wchar_t* path, std::string& err);
+	// Encrypts the PDF with `password`, used as both the user (open) and
+	// owner password -- a same-password model, the mirror image of
+	// removeProtection() clearing both together (there's no way to keep an
+	// open-password requirement while only changing owner restrictions
+	// without knowing the original owner password). AES-256, full
+	// permissions once opened with this password. Same atomic
+	// write-verify-replace-reopen safety as save(). Fails if password is
+	// empty.
+	bool setPassword(const wchar_t* path, const char* password, std::string& err);
 	// Finalize: read page count and sizes. Call after a successful open/auth.
 	void loadInfo();
 	void close();
@@ -204,6 +213,30 @@ public:
 	// document's in-memory state. Backs Split.
 	bool exportPages(const std::vector<int>& pageIndices, const wchar_t* path, std::string& err);
 
+	// Builds a brand-new standalone PDF at `outPath` from a list of source
+	// files -- images (one page each, embedded at native resolution/quality,
+	// no re-encoding), plain text/markdown files (paginated onto A4 pages
+	// with a monospace font; markdown gets basic heading/bullet formatting
+	// only, no inline emphasis/link parsing), .docx (via ConvertDocxToPdf --
+	// see word_convert.h; requires Word installed), and .pdf (its pages are
+	// grafted straight in, same as Merge, so an existing PDF can be folded
+	// into the combined output too). Each source file starts on a fresh
+	// page. Static: doesn't touch any existing PdfDocument's state -- owns
+	// its own throwaway fz_context, like verifyPdfFile(). Text content
+	// outside the WinAnsi (Latin-1-ish) range renders as '?' -- there's no
+	// embedded Unicode font, by design (keeps this a zero-dependency, small,
+	// fast path rather than bundling a CJK/Unicode-capable font). Skips
+	// individual files that fail (unreadable/corrupt/unsupported image
+	// codec/unrecognized extension/Word not installed) and appends them to
+	// `skipped` if given, rather than aborting the whole batch -- unless
+	// EVERY file fails, in which case it returns false (via `err`) with no
+	// output written. .docx conversion runs Word synchronously on the
+	// calling thread and can take a while on a large/complex document --
+	// there's no progress UI or cancellation, by design (matches this app's
+	// other one-shot document operations).
+	static bool ConvertFilesToPdf(const std::vector<std::wstring>& paths, const wchar_t* outPath,
+		std::string& err, std::vector<std::wstring>* skipped = nullptr);
+
 	// Rewraps every page's content in a scale/translate matrix and rewrites
 	// its MediaBox to A4 (landscape if the source page is wider than tall),
 	// fitting the original content fully inside, centered. Best-effort: also
@@ -217,6 +250,17 @@ public:
 	// and the document's /AcroForm -- text is no longer selectable/
 	// searchable and forms are no longer fillable.
 	bool flattenToImages(std::string& err);
+
+	// Bakes every annotation's (and form widget's) appearance stream directly
+	// into its page's own content stream -- like flattenToImages, edits become
+	// permanent and non-interactive, but the ORIGINAL page content is only
+	// appended to, never replaced/rasterized, so pre-existing page text stays
+	// selectable/searchable (matches "Microsoft Print to PDF" printing an
+	// already-filled form: the fill becomes part of the page, the underlying
+	// text doesn't turn into an image). Link and Popup annotations are left
+	// alone (no visible appearance / not meant to print). Drops /AcroForm and
+	// every baked annotation afterward, same as flattenToImages.
+	bool flattenAnnotationsToContent(std::string& err);
 
 	// Recompresses images stored at a resolution well beyond their on-page
 	// display size (approximated as image-pixel-width vs. host-page-width;
@@ -280,10 +324,20 @@ private:
 
 	// Re-opens openedPath_ into doc_/ctx_, restoring authed_/pageCount_/etc.
 	// Used after replacing the on-disk file out from under a live document.
-	bool reopenCurrentPath(std::string& err);
-	// Shared atomic write-verify-replace-reopen path behind save() and
-	// removeProtection() (see save()'s comment for why it's never a direct
-	// overwrite). stripEncryption forces the output to PDF_ENCRYPT_NONE
-	// regardless of what the source was encrypted with.
-	bool writeAndReplace(const wchar_t* path, bool incremental, bool stripEncryption, std::string& err);
+	// authPassword, if non-null, authenticates before loadInfo() runs --
+	// required when the just-written file uses compressed object streams
+	// (this app's own non-incremental writes always do) AND is newly
+	// encrypted: the page tree itself lives inside an encrypted object
+	// stream, so counting/loading pages before authenticating throws
+	// "corrupt object stream" and silently leaves pageCount_ at 0.
+	bool reopenCurrentPath(std::string& err, const char* authPassword = nullptr);
+	// Shared atomic write-verify-replace-reopen path behind save(),
+	// removeProtection(), and setPassword() (see save()'s comment for why
+	// it's never a direct overwrite). stripEncryption forces the output to
+	// PDF_ENCRYPT_NONE regardless of what the source was encrypted with.
+	// newPassword, if non-null, encrypts the output with that password
+	// (AES-256, full permissions) instead; mutually exclusive with
+	// stripEncryption in practice (callers only ever pass one).
+	bool writeAndReplace(const wchar_t* path, bool incremental, bool stripEncryption, std::string& err,
+		const char* newPassword = nullptr);
 };

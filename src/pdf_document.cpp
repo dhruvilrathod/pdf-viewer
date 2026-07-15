@@ -1,4 +1,5 @@
 #include "pdf_document.h"
+#include "word_convert.h"
 
 #include <windows.h>
 
@@ -225,8 +226,19 @@ bool PdfDocument::open(const wchar_t* path, std::string& error, bool& needsPassw
 	close();
 	std::string upath = toUtf8(path);
 
+	// Read the whole file into an in-memory buffer and open from that,
+	// rather than fz_open_document(path) -- the latter keeps a FILE* open
+	// via _wfopen for the document's entire lifetime, and the CRT's default
+	// share mode doesn't include FILE_SHARE_DELETE, so Explorer can't
+	// rename/move/cut-paste the file while it's open in a tab. Reading it
+	// once up front means no handle lingers at all once open() returns.
 	fz_try(ctx_) {
-		doc_ = fz_open_document(ctx_, upath.c_str());
+		fz_buffer* buf = fz_read_file(ctx_, upath.c_str());
+		fz_try(ctx_) {
+			doc_ = fz_open_document_with_buffer(ctx_, "application/pdf", buf);
+		}
+		fz_always(ctx_) { fz_drop_buffer(ctx_, buf); }
+		fz_catch(ctx_) { fz_rethrow(ctx_); }
 	}
 	fz_catch(ctx_) {
 		doc_ = nullptr;
@@ -248,13 +260,21 @@ bool PdfDocument::open(const wchar_t* path, std::string& error, bool& needsPassw
 	return true;
 }
 
-bool PdfDocument::reopenCurrentPath(std::string& err)
+bool PdfDocument::reopenCurrentPath(std::string& err, const char* authPassword)
 {
 	if (!ctx_ || openedPath_.empty()) { err = "no path to reopen"; return false; }
 	std::string upath = toUtf8(openedPath_.c_str());
 	if (doc_) { fz_drop_document(ctx_, doc_); doc_ = nullptr; }
+	// Same in-memory-buffer approach as open() -- see its comment. Keeps this
+	// reopen-after-save step from re-pinning a share-mode-limited handle to
+	// the file, which would undo the whole point of fixing open().
 	fz_try(ctx_) {
-		doc_ = fz_open_document(ctx_, upath.c_str());
+		fz_buffer* buf = fz_read_file(ctx_, upath.c_str());
+		fz_try(ctx_) {
+			doc_ = fz_open_document_with_buffer(ctx_, "application/pdf", buf);
+		}
+		fz_always(ctx_) { fz_drop_buffer(ctx_, buf); }
+		fz_catch(ctx_) { fz_rethrow(ctx_); }
 	}
 	fz_catch(ctx_) {
 		doc_ = nullptr;
@@ -262,6 +282,8 @@ bool PdfDocument::reopenCurrentPath(std::string& err)
 		authed_ = false;
 		return false;
 	}
+	if (authPassword && fz_needs_password(ctx_, doc_))
+		fz_authenticate_password(ctx_, doc_, authPassword);
 	authed_ = true; // editing requires we were already authenticated before
 	loadInfo();
 	return true;
@@ -1231,8 +1253,12 @@ namespace {
 // Opens `utf8path` in a brand-new, independent fz_context (not sharing any
 // cache/state with the live document) and confirms it actually parses and
 // renders. Used to verify a just-written PDF before it's allowed to replace
-// the user's original file.
-bool verifyPdfFile(const std::string& utf8path, int expectedPageCount)
+// the user's original file. `password`, if non-null, authenticates the
+// freshly-opened document first -- needed when the write just encrypted the
+// output (fz_count_pages/fz_load_page on an unauthenticated encrypted PDF
+// otherwise fail, which would misreport a perfectly good encrypted write as
+// a broken one).
+bool verifyPdfFile(const std::string& utf8path, int expectedPageCount, const char* password = nullptr)
 {
 	fz_context* vctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
 	if (!vctx) return false;
@@ -1242,6 +1268,8 @@ bool verifyPdfFile(const std::string& utf8path, int expectedPageCount)
 		fz_register_document_handlers(vctx);
 		fz_document* vdoc = fz_open_document(vctx, utf8path.c_str());
 		fz_try(vctx) {
+			if (password && fz_needs_password(vctx, vdoc))
+				fz_authenticate_password(vctx, vdoc, password);
 			int n = fz_count_pages(vctx, vdoc);
 			if (n == expectedPageCount && n > 0) {
 				fz_page* page = fz_load_page(vctx, vdoc, 0);
@@ -1279,7 +1307,21 @@ bool PdfDocument::removeProtection(const wchar_t* path, std::string& err)
 	return ok;
 }
 
-bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool stripEncryption, std::string& err)
+bool PdfDocument::setPassword(const wchar_t* path, const char* password, std::string& err)
+{
+	if (!ctx_ || !doc_) { err = "no document"; return false; }
+	if (!password || !password[0]) { err = "password is empty"; return false; }
+	// writeAndReplace() passes `password` through to its internal
+	// reopenCurrentPath() so the live document gets authenticated as part of
+	// the reopen -- see reopenCurrentPath()'s comment for why that has to
+	// happen before loadInfo() runs, not after.
+	bool ok = writeAndReplace(path, /*incremental=*/false, /*stripEncryption=*/false, err, password);
+	if (ok) neededPassword_ = true; // reopening this file will now require a password
+	return ok;
+}
+
+bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool stripEncryption, std::string& err,
+	const char* newPassword)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
@@ -1308,6 +1350,12 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 			opts.compression_effort = 100;
 		}
 		if (stripEncryption) opts.do_encrypt = PDF_ENCRYPT_NONE;
+		if (newPassword) {
+			opts.do_encrypt = PDF_ENCRYPT_AES_256;
+			opts.permissions = ~0; // full access once opened with this password
+			strncpy_s(opts.opwd_utf8, sizeof(opts.opwd_utf8), newPassword, _TRUNCATE);
+			strncpy_s(opts.upwd_utf8, sizeof(opts.upwd_utf8), newPassword, _TRUNCATE);
+		}
 		pdf_save_document(ctx_, pdf, utemp.c_str(), &opts);
 		wrote = true;
 	}
@@ -1320,7 +1368,7 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 		return false;
 	}
 
-	if (!verifyPdfFile(utemp, pageCount_)) {
+	if (!verifyPdfFile(utemp, pageCount_, newPassword)) {
 		err = "save produced an invalid file; the original was left untouched";
 		DeleteFileW(wtemp.c_str());
 		return false;
@@ -1340,7 +1388,7 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 
 	openedPath_ = wtarget;
 	std::string reopenErr;
-	if (!reopenCurrentPath(reopenErr)) {
+	if (!reopenCurrentPath(reopenErr, newPassword)) {
 		err = "saved, but failed to reopen the result: " + reopenErr;
 		return false; // the file on disk is fine; in-memory state is broken
 	}
@@ -1398,6 +1446,378 @@ bool PdfDocument::exportPages(const std::vector<int>& pageIndices, const wchar_t
 		DeleteFileW(wtemp.c_str());
 		return false;
 	}
+	if (!MoveFileExW(wtemp.c_str(), wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+		err = "could not write the output file (it may be open elsewhere)";
+		DeleteFileW(wtemp.c_str());
+		return false;
+	}
+	return true;
+}
+
+// --- Convert-to-PDF (images / text / markdown) ------------------------------
+namespace {
+
+enum class ConvertKind { Image, Text, Markdown, Docx, Pdf, Unsupported };
+
+ConvertKind classifyForConvert(const std::wstring& path)
+{
+	size_t dot = path.find_last_of(L'.');
+	if (dot == std::wstring::npos) return ConvertKind::Unsupported;
+	std::wstring ext = path.substr(dot + 1);
+	for (auto& c : ext) if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+	static const wchar_t* kImageExts[] = { L"jpg", L"jpeg", L"png", L"bmp", L"gif", L"tif", L"tiff" };
+	for (auto* e : kImageExts) if (ext == e) return ConvertKind::Image;
+	if (ext == L"txt") return ConvertKind::Text;
+	if (ext == L"md" || ext == L"markdown") return ConvertKind::Markdown;
+	if (ext == L"docx") return ConvertKind::Docx;
+	if (ext == L"pdf") return ConvertKind::Pdf; // lets a plain PDF's pages be folded into the combined output too
+	return ConvertKind::Unsupported;
+}
+
+// Grafts every page of `src` (a plain PDF, or the one Word just produced
+// from a .docx) onto the end of `dst`, same graftPageWithAnnots() used by
+// Merge/Organize. `src` is opened and dropped here -- caller doesn't keep it.
+bool graftAllPagesFrom(fz_context* ctx, pdf_document* dst, const char* srcUtf8Path)
+{
+	fz_document* srcDoc = nullptr;
+	bool ok = false;
+	fz_try(ctx) {
+		srcDoc = fz_open_document(ctx, srcUtf8Path);
+		if (fz_needs_password(ctx, srcDoc)) fz_throw(ctx, FZ_ERROR_GENERIC, "password-protected");
+		pdf_document* srcPdf = pdf_document_from_fz_document(ctx, srcDoc);
+		if (!srcPdf) fz_throw(ctx, FZ_ERROR_GENERIC, "not a PDF");
+		int n = fz_count_pages(ctx, srcDoc);
+		pdf_graft_map* map = pdf_new_graft_map(ctx, dst);
+		fz_try(ctx) {
+			for (int i = 0; i < n; ++i) graftPageWithAnnots(ctx, map, dst, -1, srcPdf, i, 0);
+		}
+		fz_always(ctx) { pdf_drop_graft_map(ctx, map); }
+		fz_catch(ctx) { fz_rethrow(ctx); }
+		ok = true;
+	}
+	fz_always(ctx) { if (srcDoc) fz_drop_document(ctx, srcDoc); }
+	fz_catch(ctx) { ok = false; }
+	return ok;
+}
+
+// Reads a text file into UTF-16, handling the common Windows text encodings:
+// UTF-16LE (Notepad's default, BOM FF FE), UTF-8 with or without a BOM, and
+// legacy ANSI (system codepage) as a last-resort fallback for older files.
+std::wstring readTextFileWide(const wchar_t* path)
+{
+	HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return {};
+	LARGE_INTEGER sz{};
+	GetFileSizeEx(h, &sz);
+	std::vector<char> buf(static_cast<size_t>(sz.QuadPart));
+	DWORD readN = 0;
+	if (!buf.empty()) ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &readN, nullptr);
+	CloseHandle(h);
+	buf.resize(readN);
+
+	if (buf.size() >= 2 && static_cast<unsigned char>(buf[0]) == 0xFF && static_cast<unsigned char>(buf[1]) == 0xFE) {
+		size_t n = (buf.size() - 2) / 2;
+		std::wstring w(n, L'\0');
+		std::memcpy(w.data(), buf.data() + 2, n * 2);
+		return w;
+	}
+	size_t bomOffset = (buf.size() >= 3 && static_cast<unsigned char>(buf[0]) == 0xEF &&
+		static_cast<unsigned char>(buf[1]) == 0xBB && static_cast<unsigned char>(buf[2]) == 0xBF) ? 3 : 0;
+	const char* textStart = buf.data() + bomOffset;
+	int textLen = static_cast<int>(buf.size() - bomOffset);
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textStart, textLen, nullptr, 0);
+	if (wn > 0) {
+		std::wstring w(static_cast<size_t>(wn), L'\0');
+		MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textStart, textLen, w.data(), wn);
+		return w;
+	}
+	wn = MultiByteToWideChar(CP_ACP, 0, textStart, textLen, nullptr, 0); // not valid UTF-8 -- assume legacy ANSI
+	if (wn <= 0) return {};
+	std::wstring w(static_cast<size_t>(wn), L'\0');
+	MultiByteToWideChar(CP_ACP, 0, textStart, textLen, w.data(), wn);
+	return w;
+}
+
+// Splits on '\n' (CRLF-safe: a trailing '\r' is dropped), tabs expanded to 4
+// spaces since the raw content stream below has no tab-stop math.
+std::vector<std::wstring> splitLinesExpandTabs(const std::wstring& text)
+{
+	std::vector<std::wstring> lines;
+	std::wstring cur;
+	for (wchar_t c : text) {
+		if (c == L'\n') { lines.push_back(cur); cur.clear(); }
+		else if (c == L'\r') { /* CRLF: the '\n' above already ends the line */ }
+		else if (c == L'\t') cur += L"    ";
+		else cur += c;
+	}
+	lines.push_back(cur);
+	return lines;
+}
+
+// Converts a wide line to Windows-1252 bytes for a PDF simple-font content
+// stream and escapes '(' ')' '\' for a PDF literal string. Characters
+// outside Windows-1252 become '?' -- see ConvertFilesToPdf's header comment
+// for why there's no embedded Unicode font to avoid this.
+std::string toPdfLiteralWinAnsi(const std::wstring& line)
+{
+	std::string bytes;
+	if (!line.empty()) {
+		int n = WideCharToMultiByte(1252, 0, line.data(), static_cast<int>(line.size()), nullptr, 0, nullptr, nullptr);
+		if (n > 0) {
+			bytes.resize(static_cast<size_t>(n));
+			WideCharToMultiByte(1252, 0, line.data(), static_cast<int>(line.size()), bytes.data(), n, "?", nullptr);
+		}
+	}
+	std::string escaped;
+	escaped.reserve(bytes.size() + 8);
+	for (char c : bytes) {
+		if (c == '(' || c == ')' || c == '\\') escaped += '\\';
+		escaped += c;
+	}
+	return escaped;
+}
+
+// Greedy word-wrap for a monospace font -- `maxChars` is exact since every
+// glyph has the same advance width, no per-character measurement needed.
+std::vector<std::wstring> wrapMonospace(const std::wstring& line, int maxChars)
+{
+	std::vector<std::wstring> out;
+	if (line.empty()) { out.push_back(L""); return out; }
+	if (maxChars <= 0) { out.push_back(line); return out; }
+	size_t pos = 0;
+	while (pos < line.size()) {
+		size_t remaining = line.size() - pos;
+		if (remaining <= static_cast<size_t>(maxChars)) { out.push_back(line.substr(pos)); break; }
+		size_t breakAt = pos + maxChars;
+		size_t lastSpace = line.find_last_of(L' ', breakAt);
+		if (lastSpace != std::wstring::npos && lastSpace > pos) {
+			out.push_back(line.substr(pos, lastSpace - pos));
+			pos = lastSpace + 1;
+		} else {
+			out.push_back(line.substr(pos, static_cast<size_t>(maxChars))); // one long "word" -- hard break
+			pos += static_cast<size_t>(maxChars);
+		}
+	}
+	return out;
+}
+
+// Accumulates wrapped lines onto A4 pages, paginating automatically. Each
+// finished page gets its own /Contents stream (re-issuing BT/Tf per line
+// rather than tracking a running text-matrix offset -- simpler and safer to
+// get right than cumulative Td math, and the byte overhead is irrelevant at
+// the sizes a text/markdown file produces).
+struct ConvertPageBuilder {
+	fz_context* ctx;
+	pdf_document* pdf;
+	pdf_obj* fontRegular;
+	pdf_obj* fontBold;
+	float pageW, pageH, marginX, marginTop, marginBottom;
+	float y = 0;
+	fz_buffer* content = nullptr;
+	bool pageOpen = false;
+
+	void finishPage()
+	{
+		if (!pageOpen) return;
+		pdf_obj* res = pdf_new_dict(ctx, pdf, 1);
+		pdf_obj* fontDict = pdf_dict_put_dict(ctx, res, PDF_NAME(Font), 2);
+		pdf_dict_puts(ctx, fontDict, "F0", fontRegular);
+		pdf_dict_puts(ctx, fontDict, "F1", fontBold);
+		pdf_obj* page = pdf_add_page(ctx, pdf, fz_make_rect(0, 0, pageW, pageH), 0, res, content);
+		pdf_drop_obj(ctx, res);
+		pdf_insert_page(ctx, pdf, -1, page);
+		pdf_drop_obj(ctx, page);
+		fz_drop_buffer(ctx, content);
+		content = nullptr;
+		pageOpen = false;
+	}
+
+	void newPage()
+	{
+		finishPage();
+		content = fz_new_buffer(ctx, 4096);
+		y = pageH - marginTop;
+		pageOpen = true;
+	}
+
+	void emitLine(const std::wstring& text, bool bold, float size, float extraIndent)
+	{
+		float lineHeight = size * 1.35f;
+		if (!pageOpen || y - lineHeight < marginBottom) newPage();
+		std::string lit = toPdfLiteralWinAnsi(text);
+		fz_append_printf(ctx, content, "BT /%s %g Tf %g %g Td (%s) Tj ET\n",
+			bold ? "F1" : "F0", size, marginX + extraIndent, y - size, lit.c_str());
+		y -= lineHeight;
+	}
+};
+
+} // namespace
+
+bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, const wchar_t* outPath,
+	std::string& err, std::vector<std::wstring>* skipped)
+{
+	if (paths.empty()) { err = "no files selected"; return false; }
+
+	fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+	if (!ctx) { err = "MuPDF context not initialized"; return false; }
+	installSystemFontHook(ctx);
+	fz_try(ctx) { fz_register_document_handlers(ctx); }
+	fz_catch(ctx) { /* best-effort, mirrors PdfDocument's own constructor */ }
+
+	pdf_document* pdf = nullptr;
+	fz_try(ctx) { pdf = pdf_create_document(ctx); }
+	fz_catch(ctx) {
+		err = fz_caught_message(ctx);
+		fz_drop_context(ctx);
+		return false;
+	}
+
+	constexpr float kPageW = 595.0f, kPageH = 842.0f; // A4, matches resizeToA4()'s own target size
+	constexpr float kMargin = 54.0f; // 0.75in
+	constexpr float kBodySize = 11.0f;
+
+	fz_font* fRegular = nullptr;
+	fz_font* fBold = nullptr;
+	pdf_obj* fontRegular = nullptr;
+	pdf_obj* fontBold = nullptr;
+	fz_try(ctx) {
+		fRegular = fz_new_base14_font(ctx, "Courier");
+		fontRegular = pdf_add_simple_font(ctx, pdf, fRegular, PDF_SIMPLE_ENCODING_LATIN);
+		fBold = fz_new_base14_font(ctx, "Courier-Bold");
+		fontBold = pdf_add_simple_font(ctx, pdf, fBold, PDF_SIMPLE_ENCODING_LATIN);
+	}
+	fz_always(ctx) {
+		if (fRegular) fz_drop_font(ctx, fRegular);
+		if (fBold) fz_drop_font(ctx, fBold);
+	}
+	fz_catch(ctx) {
+		err = fz_caught_message(ctx);
+		pdf_drop_document(ctx, pdf);
+		fz_drop_context(ctx);
+		return false;
+	}
+
+	ConvertPageBuilder pb{ ctx, pdf, fontRegular, fontBold, kPageW, kPageH, kMargin, kMargin, kMargin };
+	bool anyOk = false;
+
+	for (const auto& path : paths) {
+		ConvertKind kind = classifyForConvert(path);
+		std::string upath = toUtf8(path.c_str());
+		if (kind == ConvertKind::Image) {
+			fz_image* img = nullptr;
+			fz_try(ctx) {
+				img = fz_new_image_from_file(ctx, upath.c_str());
+				int xres = 0, yres = 0;
+				fz_image_resolution(img, &xres, &yres);
+				if (xres <= 0) xres = 96;
+				if (yres <= 0) yres = 96;
+				float w = img->w * 72.0f / static_cast<float>(xres);
+				float h = img->h * 72.0f / static_cast<float>(yres);
+				pdf_obj* imgRef = pdf_add_image(ctx, pdf, img);
+				pdf_obj* res = pdf_new_dict(ctx, pdf, 1);
+				pdf_obj* xobj = pdf_dict_put_dict(ctx, res, PDF_NAME(XObject), 1);
+				pdf_dict_puts(ctx, xobj, "Im0", imgRef);
+				pdf_drop_obj(ctx, imgRef);
+				fz_buffer* content = fz_new_buffer(ctx, 128);
+				fz_append_printf(ctx, content, "q %g 0 0 %g 0 0 cm /Im0 Do Q", w, h);
+				pdf_obj* page = pdf_add_page(ctx, pdf, fz_make_rect(0, 0, w, h), 0, res, content);
+				fz_drop_buffer(ctx, content);
+				pdf_drop_obj(ctx, res);
+				pdf_insert_page(ctx, pdf, -1, page);
+				pdf_drop_obj(ctx, page);
+				anyOk = true;
+			}
+			fz_always(ctx) { if (img) fz_drop_image(ctx, img); }
+			fz_catch(ctx) { if (skipped) skipped->push_back(path); }
+		} else if (kind == ConvertKind::Text || kind == ConvertKind::Markdown) {
+			bool markdown = (kind == ConvertKind::Markdown);
+			std::wstring text = readTextFileWide(path.c_str());
+			fz_try(ctx) {
+				pb.newPage();
+				for (auto& raw : splitLinesExpandTabs(text)) {
+					bool bold = false; float size = kBodySize; float indent = 0; std::wstring line = raw;
+					if (markdown) {
+						if (line.rfind(L"### ", 0) == 0) { bold = true; size = 13; line = line.substr(4); }
+						else if (line.rfind(L"## ", 0) == 0) { bold = true; size = 14; line = line.substr(3); }
+						else if (line.rfind(L"# ", 0) == 0) { bold = true; size = 16; line = line.substr(2); }
+						else if (line.rfind(L"- ", 0) == 0 || line.rfind(L"* ", 0) == 0) {
+							line = L"- " + line.substr(2); // plain hyphen: base-14 Courier's bullet glyph at cp1252 0x95 renders as .notdef
+							indent = 12;
+						}
+					}
+					int lineMaxChars = std::max(1, static_cast<int>((kPageW - 2 * kMargin - indent) / (size * 0.6f)));
+					for (auto& wrapped : wrapMonospace(line, lineMaxChars))
+						pb.emitLine(wrapped, bold, size, indent);
+				}
+				anyOk = true;
+			}
+			fz_catch(ctx) { if (skipped) skipped->push_back(path); }
+		} else if (kind == ConvertKind::Pdf) {
+			pb.finishPage(); // keep page order = file order: close any open text page first
+			if (graftAllPagesFrom(ctx, pdf, upath.c_str())) anyOk = true;
+			else if (skipped) skipped->push_back(path);
+		} else if (kind == ConvertKind::Docx) {
+			pb.finishPage();
+			wchar_t tempPdf[MAX_PATH];
+			wchar_t tempDir[MAX_PATH];
+			GetTempPathW(MAX_PATH, tempDir);
+			GetTempFileNameW(tempDir, L"pfd", 0, tempPdf); // creates a 0-byte placeholder; Word overwrites it
+			std::string wordErr;
+			bool converted = ConvertDocxToPdf(path.c_str(), tempPdf, wordErr);
+			if (converted) {
+				std::string tempUtf8 = toUtf8(tempPdf);
+				if (graftAllPagesFrom(ctx, pdf, tempUtf8.c_str())) anyOk = true;
+				else if (skipped) skipped->push_back(path);
+			} else if (skipped) {
+				skipped->push_back(path);
+			}
+			DeleteFileW(tempPdf);
+		} else {
+			if (skipped) skipped->push_back(path);
+		}
+	}
+	pb.finishPage();
+
+	if (!anyOk) {
+		err = "no files could be converted";
+		pdf_drop_document(ctx, pdf);
+		fz_drop_context(ctx);
+		return false;
+	}
+
+	// Same write-to-temp-verify-move discipline as exportPages() -- this
+	// isn't a live document, so no in-memory state to worry about either way.
+	std::wstring wtarget(outPath);
+	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
+	std::string utemp = toUtf8(wtemp.c_str());
+	int pageCount = 0;
+	fz_try(ctx) { pageCount = pdf_count_pages(ctx, pdf); }
+	fz_catch(ctx) { pageCount = 0; }
+
+	bool wrote = false;
+	fz_try(ctx) {
+		pdf_write_options opts = pdf_default_write_options;
+		opts.do_garbage = 1;
+		opts.do_compress = 1;
+		opts.do_compress_images = 1;
+		opts.do_compress_fonts = 1;
+		pdf_save_document(ctx, pdf, utemp.c_str(), &opts);
+		wrote = true;
+	}
+	fz_catch(ctx) { err = fz_caught_message(ctx); }
+	pdf_drop_document(ctx, pdf);
+	if (!wrote) {
+		DeleteFileW(wtemp.c_str());
+		fz_drop_context(ctx);
+		return false;
+	}
+	if (!verifyPdfFile(utemp, pageCount)) {
+		err = "conversion produced an invalid file";
+		DeleteFileW(wtemp.c_str());
+		fz_drop_context(ctx);
+		return false;
+	}
+	fz_drop_context(ctx);
 	if (!MoveFileExW(wtemp.c_str(), wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		err = "could not write the output file (it may be open elsewhere)";
 		DeleteFileW(wtemp.c_str());
@@ -1599,6 +2019,124 @@ bool PdfDocument::flattenToImages(std::string& err)
 				if (pix) fz_drop_pixmap(ctx_, pix);
 				fz_drop_page(ctx_, page);
 			}
+			fz_catch(ctx_) { fz_rethrow(ctx_); }
+		}
+		pdf_obj* root = pdf_dict_get(ctx_, pdf_trailer(ctx_, pdf), PDF_NAME(Root));
+		if (root) pdf_dict_del(ctx_, root, PDF_NAME(AcroForm));
+	}
+	fz_catch(ctx_) {
+		err = fz_caught_message(ctx_);
+		return false;
+	}
+	loadInfo();
+	dirty_ = true;
+	return true;
+}
+
+bool PdfDocument::flattenAnnotationsToContent(std::string& err)
+{
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+	fz_try(ctx_) {
+		int n = fz_count_pages(ctx_, doc_);
+		for (int i = 0; i < n; ++i) {
+			pdf_page* pg = pdf_load_page(ctx_, pdf, i);
+			fz_try(ctx_) {
+				pdf_obj* page_ref = pdf_lookup_page_obj(ctx_, pdf, i);
+				fz_buffer* extra = fz_new_buffer(ctx_, 256);
+				fz_try(ctx_) {
+					pdf_obj* xobjDict = nullptr;
+					int counter = 0;
+					// pdf_annot_transform() is the exact placement matrix MuPDF's
+					// own renderer uses to draw an annotation's appearance stream
+					// (see pdf_process_annot in pdf-interpret.c: "q <matrix> cm
+					// /AP Do Q") -- reusing it here means a baked annotation lands
+					// pixel-for-pixel where it used to render live.
+					auto bake = [&](pdf_annot* a) {
+						enum pdf_annot_type type = pdf_annot_type(ctx_, a);
+						if (type == PDF_ANNOT_LINK || type == PDF_ANNOT_POPUP) return;
+						pdf_obj* ap = pdf_annot_ap(ctx_, a);
+						if (!ap) return; // no visible appearance (e.g. a pending redaction mark, or an unfilled field) -- nothing to bake
+						if (!xobjDict) {
+							pdf_obj* res = pdf_dict_get(ctx_, page_ref, PDF_NAME(Resources));
+							if (!res) res = pdf_dict_put_dict(ctx_, page_ref, PDF_NAME(Resources), 2);
+							xobjDict = pdf_dict_get(ctx_, res, PDF_NAME(XObject));
+							if (!xobjDict) xobjDict = pdf_dict_put_dict(ctx_, res, PDF_NAME(XObject), 4);
+						}
+						fz_matrix m = pdf_annot_transform(ctx_, a);
+						char name[32];
+						snprintf(name, sizeof(name), "FlatAnnot%d", counter++);
+						pdf_dict_puts(ctx_, xobjDict, name, ap);
+						fz_append_printf(ctx_, extra, "q %g %g %g %g %g %g cm /%s Do Q\n",
+							m.a, m.b, m.c, m.d, m.e, m.f, name);
+					};
+					// page->annots (markup: FreeText/Highlight/Ink/...) and
+					// page->widgets (AcroForm fields: text/checkbox/radio/...)
+					// are two SEPARATE linked lists in MuPDF -- pdf_first_annot
+					// only walks the former, so form fields need their own walk
+					// via pdf_first_widget or their filled-in values silently
+					// never get baked in (confirmed bug: text box annotations
+					// flattened fine, but fillable form field text didn't).
+					for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) bake(a);
+					for (pdf_annot* w = pdf_first_widget(ctx_, pg); w; w = pdf_next_widget(ctx_, w)) bake(w);
+					if (counter > 0) {
+						// Append a new content stream rather than replacing the
+						// existing one(s) -- the page's original text/vector
+						// content is untouched and stays selectable/searchable.
+						pdf_obj* contentsRef = pdf_add_stream(ctx_, pdf, extra, nullptr, 0);
+						pdf_obj* oldContents = pdf_dict_get(ctx_, page_ref, PDF_NAME(Contents));
+						pdf_obj* newContents;
+						if (pdf_is_array(ctx_, oldContents)) {
+							newContents = pdf_copy_array(ctx_, oldContents);
+							pdf_array_push(ctx_, newContents, contentsRef);
+						} else {
+							newContents = pdf_new_array(ctx_, pdf, 2);
+							if (oldContents) pdf_array_push(ctx_, newContents, oldContents);
+							pdf_array_push(ctx_, newContents, contentsRef);
+						}
+						pdf_drop_obj(ctx_, contentsRef);
+						pdf_dict_put_drop(ctx_, page_ref, PDF_NAME(Contents), newContents);
+
+						// Now that every appearance is baked into page content,
+						// the live annotation objects themselves are just dead
+						// weight -- delete them. Restart the walk after each
+						// delete rather than trying to safely advance past a
+						// just-freed node (same pattern as
+						// clearPendingRedactions); per-page annotation counts
+						// are always small so the O(n^2) worst case is fine.
+						auto shouldDelete = [&](pdf_annot* a) {
+							enum pdf_annot_type type = pdf_annot_type(ctx_, a);
+							if (type == PDF_ANNOT_LINK || type == PDF_ANNOT_POPUP) return false;
+							return pdf_annot_ap(ctx_, a) != nullptr;
+						};
+						bool foundOne = true;
+						while (foundOne) {
+							foundOne = false;
+							for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) {
+								if (!shouldDelete(a)) continue;
+								pdf_delete_annot(ctx_, pg, a);
+								foundOne = true;
+								break;
+							}
+						}
+						foundOne = true;
+						while (foundOne) {
+							foundOne = false;
+							for (pdf_annot* w = pdf_first_widget(ctx_, pg); w; w = pdf_next_widget(ctx_, w)) {
+								if (!shouldDelete(w)) continue;
+								pdf_delete_annot(ctx_, pg, w);
+								foundOne = true;
+								break;
+							}
+						}
+					}
+				}
+				fz_always(ctx_) { fz_drop_buffer(ctx_, extra); }
+				fz_catch(ctx_) { fz_rethrow(ctx_); }
+			}
+			fz_always(ctx_) { fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg)); }
 			fz_catch(ctx_) { fz_rethrow(ctx_); }
 		}
 		pdf_obj* root = pdf_dict_get(ctx_, pdf_trailer(ctx_, pdf), PDF_NAME(Root));

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "pdf_document.h"
+#include "webview_convert.h"
 
 namespace {
 std::string ToUtf8(const wchar_t* w)
@@ -239,6 +240,55 @@ int wmain(int argc, wchar_t** argv)
 			}
 		}
 
+		// --- flattenAnnotationsToContent ---------------------------------------
+		{
+			std::printf("[flattenAnnotationsToContent]\n");
+			PdfDocument doc;
+			if (!openFresh(doc)) return 1;
+			auto charsBefore = doc.pageChars(0);
+			auto annotsBefore = doc.pageAnnots(0);
+			std::string e;
+			if (!doc.flattenAnnotationsToContent(e)) {
+				std::printf("  FAIL: flattenAnnotationsToContent: %s\n", e.c_str());
+				++failures;
+			} else {
+				auto charsAfter = doc.pageChars(0);
+				auto annotsAfter = doc.pageAnnots(0);
+				// pageChars() extracts from the page's own content stream only
+				// (fz_run_page_contents, not fz_run_page -- see its comment), so
+				// it never included annotation text before flattening even
+				// though the annotation was visibly rendered. Baking a FreeText
+				// annotation's appearance into page content is expected to make
+				// its text newly extractable, so the count can legitimately
+				// grow; it must never shrink (that would mean original page
+				// text got clobbered instead of appended-to).
+				std::printf("  flattenAnnotationsToContent OK: pageChars(0) %d -> %d (expect >=), annots %d -> %d (expect 0)\n",
+					static_cast<int>(charsBefore.size()), static_cast<int>(charsAfter.size()),
+					static_cast<int>(annotsBefore.size()), static_cast<int>(annotsAfter.size()));
+				if (charsAfter.size() < charsBefore.size()) ++failures;
+				if (!annotsAfter.empty()) ++failures;
+				std::wstring flatPath = outPath(L"_flatannot.pdf");
+				if (!doc.save(flatPath.c_str(), false, e)) {
+					std::printf("  FAIL: save flatannot: %s\n", e.c_str());
+					++failures;
+				} else {
+					PdfDocument doc2;
+					std::string e2; bool npw2 = false;
+					if (!doc2.open(flatPath.c_str(), e2, npw2)) {
+						std::printf("  FAIL: reopen flatannot: %s\n", e2.c_str());
+						++failures;
+					} else {
+						for (int p = 0; p < doc2.pageCount(); ++p) {
+							PageBitmap b = doc2.renderPage(p, 1.0f);
+							if (!b.hbmp) { std::printf("  RENDER FAILED on flatannot page %d\n", p); ++failures; }
+						}
+						std::printf("  reopened flatannot OK: pageCount=%d, pageChars(0)=%d\n",
+							doc2.pageCount(), static_cast<int>(doc2.pageChars(0).size()));
+					}
+				}
+			}
+		}
+
 		// --- compress -----------------------------------------------------
 		{
 			std::printf("[compress]\n");
@@ -373,6 +423,102 @@ int wmain(int argc, wchar_t** argv)
 		}
 		std::printf("all pages re-rendered OK from unprotected output\n");
 		return (ok2 && !needsPw2 && !doc2.isEncrypted()) ? 0 : 5;
+	}
+
+	// --setpwtest mode: exercises setPassword() on an unencrypted input --
+	// confirms the output requires the given password to reopen, rejects a
+	// wrong password, and accepts the right one.
+	if (argc > 3 && wcscmp(argv[3], L"--setpwtest") == 0) {
+		const wchar_t* pw = argc > 4 ? argv[4] : L"secret";
+		std::string upw = ToUtf8(pw);
+		PdfDocument doc;
+		std::string err; bool needsPw = false;
+		if (!doc.open(input, err, needsPw)) {
+			std::printf("open FAILED: %s\n", err.c_str());
+			return 1;
+		}
+		if (!doc.setPassword(output, upw.c_str(), err)) {
+			std::printf("setPassword FAILED: %s\n", err.c_str());
+			return 2;
+		}
+		std::printf("setPassword OK -- isEncrypted=%d neededPassword=%d pageCount=%d isOpen=%d\n",
+			doc.isEncrypted(), doc.neededPassword(), doc.pageCount(), doc.isOpen());
+		if (doc.pageCount() == 0 || !doc.isOpen()) {
+			std::printf("LIVE DOCUMENT STATE BROKEN after setPassword (pageCount=0/not open)\n");
+			return 7;
+		}
+		// The live in-memory doc should still render right after setPassword,
+		// without needing to close/reopen the tab.
+		for (int p = 0; p < doc.pageCount(); ++p) {
+			PageBitmap b = doc.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("LIVE RENDER FAILED on page %d right after setPassword\n", p); return 8; }
+		}
+		std::printf("live document still renders OK right after setPassword\n");
+
+		PdfDocument doc2;
+		std::string err2; bool needsPw2 = false;
+		bool ok2 = doc2.open(output, err2, needsPw2);
+		std::printf("reopen output: ok=%d needsPw=%d\n", ok2, needsPw2);
+		if (ok2 || !needsPw2) { std::printf("EXPECTED the output to require a password\n"); return 3; }
+		if (doc2.authenticate("definitely-wrong-password")) {
+			std::printf("WRONG PASSWORD WAS ACCEPTED\n"); return 4;
+		}
+		if (!doc2.authenticate(upw.c_str())) {
+			std::printf("CORRECT PASSWORD WAS REJECTED\n"); return 5;
+		}
+		std::printf("authenticated OK -- pageCount=%d\n", doc2.pageCount());
+		for (int p = 0; p < doc2.pageCount(); ++p) {
+			PageBitmap b = doc2.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("RENDER FAILED on page %d\n", p); return 6; }
+		}
+		std::printf("all pages rendered OK after authenticating with the new password\n");
+		return 0;
+	}
+
+	// --converttest mode: exercises PdfDocument::ConvertFilesToPdf() headlessly.
+	// `input` is unused (ConvertFilesToPdf is static -- no PdfDocument needed);
+	// `output` is the PDF to build; argv[5..] are the source files to convert
+	// (images/.txt/.md). Reopens+renders the result to confirm validity.
+	if (argc > 4 && wcscmp(argv[3], L"--converttest") == 0) {
+		std::vector<std::wstring> sources;
+		for (int i = 4; i < argc; ++i) sources.push_back(argv[i]);
+		std::string err;
+		std::vector<std::wstring> skipped;
+		bool ok = PdfDocument::ConvertFilesToPdf(sources, output, err, &skipped);
+		std::printf("ConvertFilesToPdf: ok=%d err=%s skipped=%zu\n", ok, err.c_str(), skipped.size());
+		for (auto& s : skipped) std::wprintf(L"  skipped: %s\n", s.c_str());
+		if (!ok) return 1;
+
+		PdfDocument doc;
+		std::string e2; bool npw = false;
+		if (!doc.open(output, e2, npw)) { std::printf("REOPEN FAILED: %s\n", e2.c_str()); return 2; }
+		std::printf("reopened: %d pages\n", doc.pageCount());
+		for (int p = 0; p < doc.pageCount(); ++p) {
+			PageBitmap b = doc.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("RENDER FAILED on page %d\n", p); return 3; }
+		}
+		std::printf("all pages rendered OK\n");
+		return 0;
+	}
+
+	// --webtest mode: exercises ConvertWebPageToPdf() headlessly. `input` is
+	// the URL to convert (unused otherwise); `output` is the PDF to write.
+	if (argc > 3 && wcscmp(argv[3], L"--webtest") == 0) {
+		std::string err;
+		bool ok = ConvertWebPageToPdf(input, output, err);
+		std::printf("ConvertWebPageToPdf: ok=%d err=%s\n", ok, err.c_str());
+		if (!ok) return 1;
+
+		PdfDocument doc;
+		std::string e2; bool npw = false;
+		if (!doc.open(output, e2, npw)) { std::printf("REOPEN FAILED: %s\n", e2.c_str()); return 2; }
+		std::printf("reopened: %d pages\n", doc.pageCount());
+		for (int p = 0; p < doc.pageCount(); ++p) {
+			PageBitmap b = doc.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("RENDER FAILED on page %d\n", p); return 3; }
+		}
+		std::printf("all pages rendered OK\n");
+		return 0;
 	}
 
 	// --compresstest mode: opens `input`, runs compress(), saves to `output`,

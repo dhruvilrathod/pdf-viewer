@@ -7,6 +7,7 @@
 #include "resource.h"
 #include "updater.h"
 #include "version.h"
+#include "webview_convert.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -185,6 +186,13 @@ constexpr wchar_t kFrameClass[] = L"PdfViewerFrame";
 constexpr wchar_t kCanvasClass[] = L"PdfViewerCanvas";
 constexpr wchar_t kThumbClass[] = L"PdfViewerThumbs";
 
+// Count of live top-level FrameWindow instances (normally 1, but dragging a
+// tab out or "Open in New Window" can create more) -- PostQuitMessage only
+// fires once the LAST one is destroyed, not just the one closed first. Every
+// FrameWindow is heap-allocated and self-deletes on its own WM_NCDESTROY
+// (see FrameWindow::Proc), so nothing else needs to own or free it.
+int g_liveFrameCount = 0;
+
 // Single-instance plumbing: a second launch (e.g. double-clicking another PDF
 // while PDFast is the default handler) hands its path to the already-running
 // instance via WM_COPYDATA and exits, so everything lives in one window as
@@ -241,6 +249,16 @@ bool ConsumeCtrlBackspaceWordDelete(HWND hwnd, WPARAM wp)
 	while (i > 0 && !std::iswspace(text[i - 1])) i--;
 	SendMessageW(hwnd, EM_SETSEL, i, selStart);
 	SendMessageW(hwnd, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+	return true;
+}
+
+// A stock Win32 EDIT control has no built-in Ctrl+A -- unlike Ctrl+C/X/V/Z,
+// "select all" was never wired into the base control (that only came with
+// RichEdit). Call from a WM_KEYDOWN handler; returns true if it handled it.
+bool ConsumeCtrlSelectAll(HWND hwnd, WPARAM wp)
+{
+	if (wp != 'A' || !(GetKeyState(VK_CONTROL) & 0x8000)) return false;
+	SendMessageW(hwnd, EM_SETSEL, 0, -1);
 	return true;
 }
 
@@ -426,40 +444,94 @@ std::wstring OpenFileDialog(HWND owner)
 	return L"";
 }
 
-// Multi-select variant used by Merge/"Insert Pages...". Classic multi-select
-// buffer convention: nMaxFile bytes containing either a single full path
-// (double-null terminated), or a directory followed by each selected file
-// name, all double-null terminated at the very end.
-std::vector<std::wstring> OpenFileDialogMulti(HWND owner)
+// Multi-select variant used by Merge/"Insert Pages..." (default filter/title)
+// and Convert to PDF (its own filter/title). Uses the modern IFileOpenDialog
+// (COM) rather than the classic GetOpenFileNameW -- the classic dialog's
+// multi-select buffer convention (one shared directory + a list of names)
+// can only represent files from a single folder, and outright refuses a
+// selection spanning more than one ("You can choose multiple items only if
+// they are all located in the same folder"), including within an aggregating
+// view like Explorer's own Search Results. IFileOpenDialog's GetResults()
+// returns an IShellItemArray of independent shell items, each carrying its
+// own full path, so a multi-select spanning several real folders (via search
+// results, "Recent", a library, etc.) works with no extra looping needed.
+std::vector<std::wstring> OpenFileDialogMulti(HWND owner,
+	const wchar_t* filter = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0",
+	const wchar_t* title = L"Select PDF Files")
 {
 	std::vector<std::wstring> out;
-	std::vector<wchar_t> buf(32768, L'\0'); // generous: many files can be selected at once
-	OPENFILENAMEW ofn = {};
-	ofn.lStructSize = sizeof(ofn);
-	ofn.hwndOwner = owner;
-	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
-	ofn.lpstrFile = buf.data();
-	ofn.nMaxFile = static_cast<DWORD>(buf.size());
-	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_ALLOWMULTISELECT;
-	ofn.lpstrTitle = L"Select PDF Files";
-	if (!GetOpenFileNameW(&ofn)) return out;
 
-	const wchar_t* p = buf.data();
-	std::wstring first = p;
-	p += first.size() + 1;
-	if (*p == L'\0') {
-		// Only one file was picked: `first` is already the full path.
-		out.push_back(first);
-		return out;
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	bool comOwned = SUCCEEDED(hrInit);
+	if (!(comOwned || hrInit == RPC_E_CHANGED_MODE)) return out;
+
+	// Parse the legacy double-null-terminated "Name\0*.ext\0..." filter
+	// string (kept as-is so every call site stays unchanged) into the
+	// COMDLG_FILTERSPEC pairs IFileOpenDialog wants.
+	std::vector<std::wstring> specStorage;
+	const wchar_t* fp = filter;
+	while (*fp) {
+		std::wstring name = fp; fp += name.size() + 1;
+		if (!*fp) break;
+		std::wstring pattern = fp; fp += pattern.size() + 1;
+		specStorage.push_back(std::move(name));
+		specStorage.push_back(std::move(pattern));
 	}
-	// `first` is the shared directory; every string after it up to the
-	// final extra null is one file name within it.
-	while (*p) {
-		std::wstring name = p;
-		p += name.size() + 1;
-		out.push_back(first + L"\\" + name);
+	std::vector<COMDLG_FILTERSPEC> specs;
+	for (size_t i = 0; i + 1 < specStorage.size(); i += 2)
+		specs.push_back({ specStorage[i].c_str(), specStorage[i + 1].c_str() });
+
+	IFileOpenDialog* dlg = nullptr;
+	if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) && dlg) {
+		DWORD opts = 0;
+		dlg->GetOptions(&opts);
+		dlg->SetOptions(opts | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+		if (!specs.empty()) dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+		dlg->SetTitle(title);
+		if (SUCCEEDED(dlg->Show(owner))) {
+			IShellItemArray* items = nullptr;
+			if (SUCCEEDED(dlg->GetResults(&items)) && items) {
+				DWORD count = 0;
+				items->GetCount(&count);
+				for (DWORD i = 0; i < count; ++i) {
+					IShellItem* item = nullptr;
+					if (SUCCEEDED(items->GetItemAt(i, &item)) && item) {
+						PWSTR path = nullptr;
+						if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+							out.push_back(path);
+							CoTaskMemFree(path);
+						}
+						item->Release();
+					}
+				}
+				items->Release();
+			}
+		}
+		dlg->Release();
 	}
+	if (comOwned) CoUninitialize();
 	return out;
+}
+
+// Even with IFileOpenDialog removing the same-folder restriction, users may
+// still want to build a set across separate picker sessions (e.g. picking
+// from two different drives' search results). Loop the picker with a plain
+// Yes/No "add more?" prompt (same category as this app's other merge/convert
+// workflow confirms) after each non-empty batch. Cancelling the very first
+// round returns empty, same as a single OpenFileDialogMulti call always did.
+std::vector<std::wstring> PickFilesAcrossFolders(HWND owner, const wchar_t* filter, const wchar_t* title)
+{
+	std::vector<std::wstring> all;
+	for (;;) {
+		auto batch = OpenFileDialogMulti(owner, filter, title);
+		if (batch.empty()) break;
+		all.insert(all.end(), batch.begin(), batch.end());
+		wchar_t msg[192];
+		swprintf(msg, 192, L"%d file(s) added (%d total).\n\nAdd more files from another folder?",
+			static_cast<int>(batch.size()), static_cast<int>(all.size()));
+		if (MessageBoxW(owner, msg, title, MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+	}
+	return all;
 }
 
 } // namespace
@@ -516,7 +588,7 @@ public:
 	Mode mode() const { return mode_; }
 
 	// Annotation tools
-	enum class Tool { Select, Highlight, Draw, Text, Redact };
+	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact };
 	void setTool(Tool t) {
 		if (inlineEdit_) commitInlineEdit(true);
 		tool_ = t;
@@ -577,6 +649,7 @@ private:
 	void relayout();
 	void applyFit();
 	void setZoom(float z);
+	void setZoomAnchored(float z, int anchorClientX, int anchorClientY);
 	void clampScroll();
 	void updateScrollbars();
 	int clampedScrollY(int y) const;
@@ -591,7 +664,7 @@ private:
 	void onSize();
 	void onVScroll(WPARAM);
 	void onHScroll(WPARAM);
-	void onWheel(short delta, bool ctrl, bool horiz);
+	void onWheel(short delta, bool ctrl, bool horiz, POINT screenPt);
 	void updateStatus();
 	int firstVisiblePage() const;
 	void stepHit(int dir);
@@ -604,6 +677,7 @@ private:
 	void onLButtonDown(int mx, int my);
 	void onMouseMove(int mx, int my);
 	void onLButtonUp(int mx, int my);
+	void eraseAt(int mx, int my);
 	void doFormFill(int page, float px, float py);
 	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); }
 	void drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY);
@@ -848,6 +922,18 @@ private:
 	bool dark_ = false;
 };
 
+class FrameWindow;
+// Creates a brand-new top-level window (its own FrameWindow, own tab strip)
+// and opens each of `paths` as its own tab (first one lands in the window's
+// initial empty tab, same as FrameWindow::openDocument()'s usual reuse
+// logic). Used by "drag a tab out" and the tab context menu's "Open in New
+// Window" -- for a multi-tab-selection detach, every selected tab's file
+// lands together in the SAME new window. Defined near RunViewer() since it
+// mirrors that function's own window-creation dance. The returned pointer is
+// never owned by the caller: every FrameWindow self-deletes on its own
+// WM_NCDESTROY (see g_liveFrameCount's comment).
+FrameWindow* SpawnNewWindow(HINSTANCE hInst, const std::vector<std::wstring>& paths);
+
 // One open document = one PdfDocument + its own CanvasView/ThumbPanel child
 // windows (so each tab keeps its own scroll/zoom/tool/search/selection state
 // completely independently -- only the toolbar/status bar/search bar are
@@ -868,7 +954,7 @@ struct DocTab {
 class FrameWindow {
 public:
 	FrameWindow(HINSTANCE hInst) : hInst_(hInst) {}
-	HWND create(int nCmdShow);
+	HWND create(int nCmdShow, bool checkForUpdates = true);
 	HWND hwnd() const { return hwnd_; }
 	void openDocument(const wchar_t* path);
 	static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
@@ -887,6 +973,8 @@ private:
 	static LRESULT CALLBACK EditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK PageEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK SplitEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+	static LRESULT CALLBACK SetPwdEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+	static LRESULT CALLBACK WebPdfEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	void jumpToPageEditValue();
 	void updatePageEditBox();
 	void selectTool(int id);
@@ -896,6 +984,8 @@ private:
 	void chooseOpacity();
 	void saveDocument(bool saveAs);
 	void updateTitle();
+	void updateStatusPath();          // right-hand status bar part: current tab's full file path
+	void layoutStatusParts();         // recomputes the two status bar part boundaries for the current width
 	bool promptSaveIfDirty(); // returns false if user cancelled
 	void updateZoomLabel();
 
@@ -923,6 +1013,14 @@ private:
 	void updateProtectionBar();
 	void removeProtection();
 
+	// Set-password bar (see setPwdVisible_'s comment).
+	void showSetPasswordBar(bool show);
+	void runSetPassword();
+
+	// Web-to-PDF bar (see webPdfVisible_'s comment).
+	void showWebPdfBar(bool show);
+	void runWebToPdf();
+
 	// Auto-update (see updater.h). startUpdateCheck spawns a background thread
 	// that posts WM_APP_UPDATE_RESULT back here; onUpdateResult handles the
 	// prompt/download/relaunch on the UI thread. `manual` distinguishes the
@@ -939,8 +1037,10 @@ private:
 	void showToolsMenu();
 	void doResizeToA4();
 	void doFlatten();
+	void doFlattenEdits();
 	void doCompress();
 	void doMerge();
+	void doConvertToPdf();
 
 	// Split bar (see splitVisible_'s comment).
 	void showSplitBar(bool show);
@@ -961,10 +1061,18 @@ private:
 	int newTab();                            // creates + appends an empty tab, returns its index
 	void switchToTab(int idx);                // makes idx active (repoints doc_/canvas_/thumbs_, shows/hides views)
 	void closeTab(int idx);                   // prompts save-if-dirty, then removes the tab
+	void detachTabToNewWindow(int idx);       // closes the tab here, reopens its file in a brand-new window
+	void detachTabsToNewWindow(std::vector<int> indices); // same, for a whole multi-selected group at once
 	void cycleTab(int dir);                   // +1 = Ctrl+Tab, -1 = Ctrl+Shift+Tab
 	void updateTabLabel(int idx);
 	void reorderTab(int from, int to);        // drag-to-reorder: moves the DocTab and mirrors it in tabStrip_
+	void reorderTabGroup(std::vector<int> indices, int to); // same, moving a multi-selected block together
 	void updateTabWidths(int barW);           // shrinks tab item width so all tabs fit barW (down to a floor)
+	// Multi-tab selection (see multiSelectedTabs_'s comment).
+	bool isTabMultiSelected(int idx) const;
+	void toggleTabMultiSelect(int idx);
+	void selectTabRange(int fromIdx, int toIdx);
+	void clearTabMultiSelect();
 	static LRESULT CALLBACK TabStripSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	RECT tabCloseRect(int idx) const; // hit-test rect for a tab's close "x", also used to draw it
 	void drawTabItem(const DRAWITEMSTRUCT* dis);
@@ -981,6 +1089,15 @@ private:
 	// Drag-to-reorder state for the tab strip (see TabStripSubclass).
 	int tabDragIndex_ = -1;
 	bool tabDragArmed_ = false;
+	// Multi-tab selection (Ctrl+click toggles, Shift+click ranges) -- lets
+	// several tabs be dragged/reordered or torn off into a new window
+	// together. Always either empty (no multi-selection active -- normal
+	// single-tab behavior) or holds >=2 sorted indices; `activeTab_` is
+	// still the one tab whose document is actually shown, independent of
+	// this. `tabSelectAnchor_` is the last plain-clicked tab, for Shift+click
+	// range selection.
+	std::vector<int> multiSelectedTabs_;
+	int tabSelectAnchor_ = -1;
 	// Non-owning: always point at tabs_[activeTab_]'s members (or null when
 	// there are no tabs, which in practice is only ever transiently true).
 	CanvasView* canvas_ = nullptr;
@@ -1022,6 +1139,15 @@ private:
 	bool pwdVisible_ = false;
 	int pwdBarH_ = 0;
 	std::wstring pendingPwdPath_; // path being unlocked; committed once authenticate() succeeds
+	// Set when the empty-state "Set Password" tile triggers the Open dialog
+	// (see IDM_EMPTY_SET_PASSWORD) -- finishOpenDocument() checks this to
+	// chain straight into the set-password bar for a freshly opened,
+	// not-yet-encrypted PDF, so picking a file is the only extra click.
+	bool pendingSetPasswordAfterOpen_ = false;
+	// Same chaining pattern for the empty-state "Flatten to Image"/"Flatten
+	// Edits Only" tiles (see IDM_EMPTY_FLATTEN_IMAGE/IDM_EMPTY_FLATTEN_EDITS):
+	// 0 = none pending, 1 = flatten to image, 2 = flatten edits only.
+	int pendingFlattenAfterOpen_ = 0;
 
 	// Protection info bar -- offers to strip password/restrictions from an
 	// encrypted PDF that's currently open. Both buttons call the same
@@ -1053,6 +1179,28 @@ private:
 	HWND splitResult_ = nullptr;
 	bool splitVisible_ = false;
 	int splitBarH_ = 0;
+
+	// Set-password bar (Tools > Set Password...). One password field is used
+	// as both the open (user) password and the owner password -- see
+	// PdfDocument::setPassword's comment for why (mirrors removeProtection()
+	// clearing both together). Directly encrypts and writes to disk on
+	// submit, same as removeProtection() -- no separate save step.
+	HWND setPwdLabel_ = nullptr;
+	HWND setPwdEdit_ = nullptr;
+	HWND setPwdButton_ = nullptr;
+	HWND setPwdClose_ = nullptr;
+	bool setPwdVisible_ = false;
+	int setPwdBarH_ = 0;
+
+	// Web-to-PDF bar (Tools > Web Page to PDF...). Runs ConvertWebPageToPdf()
+	// synchronously on submit (see its header comment on why there's no
+	// progress UI) and opens the result in a fresh tab on success.
+	HWND webPdfLabel_ = nullptr;
+	HWND webPdfEdit_ = nullptr;
+	HWND webPdfButton_ = nullptr;
+	HWND webPdfClose_ = nullptr;
+	bool webPdfVisible_ = false;
+	int webPdfBarH_ = 0;
 
 	// Redact bar -- shown whenever the active tool is Redact.
 	HWND redactLabel_ = nullptr;
@@ -1506,6 +1654,16 @@ void CanvasView::onLButtonDown(int mx, int my)
 		beginTextSelection(page, px, py);
 		return;
 	}
+	if (tool_ == Tool::Erase) {
+		// Whole-stroke eraser: touching an ink stroke deletes that entire
+		// annotation (no partial/pixel erasing -- ink annotations aren't
+		// easily split). Erase immediately on click, then continuously as
+		// the drag passes over more strokes (see onMouseMove).
+		dragging_ = true;
+		SetCapture(hwnd_);
+		eraseAt(mx, my);
+		return;
+	}
 	// Begin a drag for Highlight / Draw / Text.
 	dragging_ = true;
 	dragPage_ = page;
@@ -1538,6 +1696,7 @@ void CanvasView::onMouseMove(int mx, int my)
 		if (tool_ == Tool::Select) updateLinkHover(mx, my);
 		return;
 	}
+	if (tool_ == Tool::Erase) { eraseAt(mx, my); return; }
 	dragCurX_ = mx; dragCurY_ = my;
 	if (tool_ == Tool::Draw) {
 		float px = dragBound_.x0 + (mx - pageOrgX_) / dragScale_;
@@ -1630,6 +1789,25 @@ void CanvasView::onLButtonUp(int mx, int my)
 		if (onChanged_) onChanged_();
 	} else {
 		invalidate(); // clear any rubber-band overlay
+	}
+}
+
+void CanvasView::eraseAt(int mx, int my)
+{
+	if (!doc_ || !doc_->isPdf()) return;
+	int page; float px, py;
+	if (!hitTestPage(mx, my, page, px, py)) return;
+	// annotAt() picks whichever non-Other annotation is topmost at this
+	// point (bbox hit test) -- only delete if that's actually an ink
+	// stroke, so the eraser doesn't also eat highlights/text boxes it
+	// happens to pass over.
+	AnnotInfo ai = doc_->annotAt(page, { px, py });
+	if (ai.kind != AnnotKind::Ink) return;
+	std::string err;
+	if (doc_->deleteAnnot(page, ai.index, err)) {
+		invalidatePage(page);
+		invalidate();
+		if (onChanged_) onChanged_();
 	}
 }
 
@@ -2482,6 +2660,7 @@ LRESULT CALLBACK CanvasView::InlineEditSubclass(HWND hwnd, UINT msg, WPARAM wp, 
 		if (wp == VK_RETURN && !multiline) { self->commitInlineEdit(true); return 0; }
 		if (wp == VK_ESCAPE) { self->commitInlineEdit(false); return 0; }
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
 	if (msg == WM_CHAR && wp == 0x7F) return 0; // see ConsumeCtrlBackspaceWordDelete
 	if (msg == WM_KILLFOCUS) {
@@ -2581,6 +2760,26 @@ void CanvasView::setZoom(float z)
 	zoom_ = z;
 	relayout();
 	scrollY_ = static_cast<int>(anchor * canvasH_ - ch * 0.5f);
+	clampScroll();
+	updateScrollbars();
+	invalidate();
+	updateStatus();
+}
+
+// Like setZoom(), but preserves the content point under (anchorClientX,
+// anchorClientY) instead of the viewport's vertical center -- used for
+// Ctrl+wheel zoom so the page zooms from the mouse pointer (like every other
+// viewer), not always from a fixed origin toward the top-left.
+void CanvasView::setZoomAnchored(float z, int anchorClientX, int anchorClientY)
+{
+	z = std::clamp(z, kMinZoom, kMaxZoom);
+	if (std::abs(z - zoom_) < 1e-4f) return;
+	float fracX = canvasW_ > 0 ? (scrollX_ + anchorClientX) / static_cast<float>(canvasW_) : 0.0f;
+	float fracY = canvasH_ > 0 ? (scrollY_ + anchorClientY) / static_cast<float>(canvasH_) : 0.0f;
+	zoom_ = z;
+	relayout();
+	scrollX_ = static_cast<int>(fracX * canvasW_ - anchorClientX);
+	scrollY_ = static_cast<int>(fracY * canvasH_ - anchorClientY);
 	clampScroll();
 	updateScrollbars();
 	invalidate();
@@ -2867,10 +3066,12 @@ void CanvasView::onHScroll(WPARAM wp)
 	}
 }
 
-void CanvasView::onWheel(short delta, bool ctrl, bool horiz)
+void CanvasView::onWheel(short delta, bool ctrl, bool horiz, POINT screenPt)
 {
 	if (ctrl) {
-		setZoom(delta > 0 ? zoom_ * kZoomStep : zoom_ / kZoomStep);
+		POINT pt = screenPt;
+		ScreenToClient(hwnd_, &pt);
+		setZoomAnchored(delta > 0 ? zoom_ * kZoomStep : zoom_ / kZoomStep, pt.x, pt.y);
 		fit_ = Fit::None;
 		return;
 	}
@@ -2956,10 +3157,15 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
 		break;
 	case WM_MOUSEWHEEL:
-		self->onWheel(GET_WHEEL_DELTA_WPARAM(wp), (LOWORD(wp) & MK_CONTROL) != 0, false);
+		// WM_(H)MOUSEWHEEL's lParam is in SCREEN coordinates (unlike almost
+		// every other mouse message), needed so Ctrl+wheel zoom can anchor on
+		// the actual pointer position instead of the viewport center.
+		self->onWheel(GET_WHEEL_DELTA_WPARAM(wp), (LOWORD(wp) & MK_CONTROL) != 0, false,
+			POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
 		return 0;
 	case WM_MOUSEHWHEEL:
-		self->onWheel(GET_WHEEL_DELTA_WPARAM(wp), false, true);
+		self->onWheel(GET_WHEEL_DELTA_WPARAM(wp), false, true,
+			POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
 		return 0;
 	case WM_LBUTTONDOWN: self->onLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_MOUSEMOVE: self->onMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
@@ -2999,6 +3205,8 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		case VK_RIGHT: self->onHScroll(SB_LINERIGHT); return 0;
 		case VK_PRIOR: self->onVScroll(SB_PAGEUP); return 0;
 		case VK_NEXT:  self->onVScroll(SB_PAGEDOWN); return 0;
+		case VK_HOME:  self->onVScroll(SB_TOP); return 0;
+		case VK_END:   self->onVScroll(SB_BOTTOM); return 0;
 		}
 		break;
 	case WM_CTLCOLOREDIT:
@@ -3627,6 +3835,19 @@ void DrawDrawTool(Gdiplus::Graphics& g, float s)
 	p.line(0.16f, 0.84f, 0.24f, 0.84f);
 }
 
+void DrawEraseTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	// A tilted eraser block outline with a diagonal seam band cutting across
+	// the interior (the classic two-tone eraser split) -- reads as "eraser"
+	// at toolbar size without needing a second color. The seam's endpoints
+	// are deliberately off the outline's own edges (not just a corner clip)
+	// so it renders as a distinct interior line instead of silently
+	// overlapping an outline segment.
+	p.polyline({ {0.22f,0.62f}, {0.52f,0.22f}, {0.86f,0.46f}, {0.56f,0.86f}, {0.22f,0.62f} });
+	p.line(0.38f, 0.48f, 0.68f, 0.74f);
+}
+
 void DrawTextTool(Gdiplus::Graphics& g, float s)
 {
 	Gdiplus::FontFamily fam(L"Segoe UI");
@@ -3731,6 +3952,59 @@ void DrawLockTool(Gdiplus::Graphics& g, float s)
 	g.FillEllipse(&dot, s * 0.44f, s * 0.58f, s * 0.12f, s * 0.12f);
 }
 
+// The same padlock as DrawLockTool, shrunk into the top-left with a "+"
+// badge bottom-right (same technique as DrawSaveAs's badge on DrawSave) --
+// reads as "add a new password" vs. DrawLockTool's plain "protected".
+void DrawSetPasswordTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.14f, 0.40f, 0.46f, 0.34f);
+	Gdiplus::RectF arc(s * 0.20f, s * 0.12f, s * 0.34f, s * 0.34f);
+	g.DrawArc(&p.pen, arc, 180, 180);
+	Gdiplus::SolidBrush dot{ Gdiplus::Color(kInk) };
+	g.FillEllipse(&dot, s * 0.32f, s * 0.50f, s * 0.10f, s * 0.10f);
+	IconPen p2(g, s, 0.10f);
+	p2.line(0.74f, 0.60f, 0.74f, 0.86f);
+	p2.line(0.61f, 0.73f, 0.87f, 0.73f);
+}
+
+// A generic source page, an arrow, and a destination page -- reads as
+// "turn this file into a PDF page" (plain page rects like DrawMergeTool's,
+// just side by side with an arrow instead of overlapping).
+void DrawConvertTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.06f, 0.20f, 0.34f, 0.60f);
+	p.rect(0.60f, 0.20f, 0.34f, 0.60f);
+	p.line(0.44f, 0.50f, 0.56f, 0.50f);
+	p.line(0.50f, 0.44f, 0.56f, 0.50f);
+	p.line(0.50f, 0.56f, 0.56f, 0.50f);
+}
+
+// A simple globe (circle + one vertical + two horizontal "latitude" arcs) --
+// reads as "web page" for the web-to-PDF tool.
+void DrawWebPageTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.ellipse(0.14f, 0.14f, 0.72f, 0.72f);
+	p.ellipse(0.365f, 0.14f, 0.27f, 0.72f);
+	p.line(0.14f, 0.34f, 0.86f, 0.34f);
+	p.line(0.14f, 0.56f, 0.86f, 0.56f);
+}
+
+// Two stacked page rects with a downward arrow between them -- reads as
+// "flatten/merge layers down into one", the same visual language as a
+// layers panel's "flatten" action in most graphics apps.
+void DrawFlattenTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.18f, 0.10f, 0.64f, 0.30f);
+	p.rect(0.18f, 0.58f, 0.64f, 0.30f);
+	p.line(0.50f, 0.42f, 0.50f, 0.56f);
+	p.line(0.38f, 0.46f, 0.50f, 0.58f);
+	p.line(0.62f, 0.46f, 0.50f, 0.58f);
+}
+
 // A minimal sun (core + 8 rays) for the light/dark theme toggle button --
 // one fixed glyph regardless of which mode is active, like most apps' theme
 // toggles.
@@ -3770,7 +4044,12 @@ const std::vector<EmptyTile>& emptyStateTiles()
 		{ icons::DrawMergeTool,     L"Merge PDFs",        IDM_TOOLS_MERGE },
 		{ icons::DrawSplitTool,     L"Split PDF",         IDM_FILE_OPEN },
 		{ icons::DrawRedactTool,    L"Redact Content",    IDM_FILE_OPEN },
-		{ icons::DrawLockTool,      L"Password Protect",  IDM_FILE_OPEN },
+		{ icons::DrawLockTool,      L"Remove Password",   IDM_FILE_OPEN },
+		{ icons::DrawSetPasswordTool, L"Set Password",    IDM_EMPTY_SET_PASSWORD },
+		{ icons::DrawConvertTool,   L"Convert to PDF",    IDM_TOOLS_CONVERT },
+		{ icons::DrawWebPageTool,   L"Web Page to PDF",   IDM_TOOLS_WEBPDF },
+		{ icons::DrawFlattenTool,   L"Flatten to Image",  IDM_EMPTY_FLATTEN_IMAGE },
+		{ icons::DrawFlattenTool,   L"Flatten Edits Only", IDM_EMPTY_FLATTEN_EDITS },
 	};
 	return tiles;
 }
@@ -3887,7 +4166,7 @@ bool CanvasView::hitTestEmptyState(int mx, int my, int& cmdId) const
 // ===========================================================================
 // FrameWindow implementation
 // ===========================================================================
-HWND FrameWindow::create(int nCmdShow)
+HWND FrameWindow::create(int nCmdShow, bool checkForUpdates)
 {
 	// Resolve the starting theme (saved override, else the system's) before
 	// the window is created -- WM_CREATE (fired synchronously inside
@@ -3905,6 +4184,7 @@ HWND FrameWindow::create(int nCmdShow)
 		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
 		Scale(1100, 96), Scale(800, 96), nullptr, nullptr, hInst_, this);
 	if (!hwnd_) return nullptr;
+	++g_liveFrameCount;
 	// Windows 11 native chrome: rounded corners, Mica backdrop, themed title
 	// bar. No-op on older Windows. Applied before ShowWindow so the first
 	// paint already has the correct frame.
@@ -3921,8 +4201,13 @@ HWND FrameWindow::create(int nCmdShow)
 	// Auto-update: sweep away any leftover from a prior self-replace, then
 	// kick off a silent background check for a newer GitHub release. The
 	// result comes back via WM_APP_UPDATE_RESULT once the message loop runs.
-	updater::CleanupAfterUpdate();
-	startUpdateCheck(/*manual=*/false);
+	// Skipped for extra windows (drag-a-tab-out / "Open in New Window") --
+	// one check per process launch is enough, and a second window shouldn't
+	// pop its own redundant "update available" prompt.
+	if (checkForUpdates) {
+		updater::CleanupAfterUpdate();
+		startUpdateCheck(/*manual=*/false);
+	}
 	return hwnd_;
 }
 
@@ -3975,7 +4260,7 @@ const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
 		icons::DrawSelectTool, icons::DrawHighlightTool, icons::DrawDrawTool, icons::DrawTextTool,
 		icons::DrawRedactTool, icons::DrawColorTool, icons::DrawWidthTool, icons::DrawOpacityTool,
 		icons::DrawZoomOut, icons::DrawZoomIn, icons::DrawFitWidth, icons::DrawFitPage,
-		icons::DrawToolsMenu, icons::DrawThemeToggle,
+		icons::DrawToolsMenu, icons::DrawThemeToggle, icons::DrawEraseTool,
 	};
 	return fns;
 }
@@ -3999,12 +4284,18 @@ void FrameWindow::createChildren()
 {
 	// Icon-only flat toolbar with tooltips, grouped like Edge's PDF viewer
 	// chrome: File actions, Find, annotation Tools (+ their color/width/
-	// opacity), Zoom/Fit, then Layout toggles. Left with its default
-	// auto-docks-to-top-of-parent behavior (no CCS_NORESIZE/CCS_NOPARENTALIGN)
-	// -- fighting that with an explicit MoveWindow collapsed it to 0 height
-	// the one time this was tried, so the tab strip goes below it instead.
+	// opacity), Zoom/Fit, then Layout toggles. CCS_NOPARENTALIGN|CCS_NORESIZE
+	// hand full position/size control to layout() -- the tab strip sits above
+	// this row now (Edge-style: tabs right under the title bar, toolbar
+	// below), which needs the toolbar OFF its default auto-dock-to-(0,0)
+	// behavior. An earlier attempt at exactly this (CCS_NORESIZE alone, no
+	// CCS_NOPARENTALIGN, and calling TB_AUTOSIZE before ever giving the
+	// control a real width via MoveWindow) collapsed it to 0 height -- giving
+	// it a real width first, THEN calling TB_AUTOSIZE (see layout()), avoids
+	// that.
 	toolbar_ = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
-		WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE | CCS_NODIVIDER,
+		WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE |
+		CCS_NODIVIDER | CCS_NOPARENTALIGN | CCS_NORESIZE,
 		0, 0, 0, 0, hwnd_, nullptr, hInst_, nullptr);
 	SendMessageW(toolbar_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
 	// TBSTYLE_EX_MIXEDBUTTONS is needed for the text-only zoom-% button (see
@@ -4032,7 +4323,8 @@ void FrameWindow::createChildren()
 	}
 	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
 		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
-		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18;
+		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18,
+		iErase = 19;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -4085,6 +4377,7 @@ void FrameWindow::createChildren()
 	radioBtn(IDM_TOOL_SELECT, iSelect, L"Select");
 	radioBtn(IDM_TOOL_HIGHLIGHT, iHighlight, L"Highlight");
 	radioBtn(IDM_TOOL_DRAW, iDraw, L"Draw");
+	radioBtn(IDM_TOOL_ERASE, iErase, L"Erase");
 	radioBtn(IDM_TOOL_TEXT, iText, L"Add Text");
 	radioBtn(IDM_TOOL_REDACT, iRedact, L"Redact");
 	btn(IDM_TOOL_COLOR, iColor, L"Color");
@@ -4101,13 +4394,20 @@ void FrameWindow::createChildren()
 	btn(IDM_VIEW_FITWIDTH, iFitWidth, L"Fit Width");
 	btn(IDM_VIEW_FITPAGE, iFitPage, L"Fit Page");
 	sep();
+	// "9999 of 9999" purely to reserve enough width for a realistically huge
+	// page count -- pageEdit_/pageOfLabel_ (real EDIT/STATIC controls layered
+	// on top, see their layout() positioning) are what actually render this;
+	// this button's own caption is never shown. Moved here from the tab-strip
+	// row per user request, to sit inline in the toolbar like Edge's.
+	textBtn(IDM_VIEW_PAGELABEL, L"9999 of 9999");
+	sep();
 	btn(IDM_EDIT_FIND, iFind, L"Find");
 	btn(IDM_FILE_PRINT, iPrint, L"Print");
 	btn(IDM_FILE_SAVE, iSave, L"Save");
 	btn(IDM_FILE_SAVEAS, iSaveAs, L"Save As");
 	btn(IDM_FILE_OPEN, iOpen, L"Open");
 	sep();
-	btn(IDM_TOOLS_MENU, iTools, L"Tools (Merge, Split, Organize, Resize, Flatten, Compress)");
+	btn(IDM_TOOLS_MENU, iTools, L"Tools (Merge, Split, Organize, Resize, Flatten, Compress, Set Password, Convert to PDF, Web Page to PDF)");
 	sep();
 	btn(IDM_VIEW_TOGGLETHEME, iThemeToggle, L"Toggle Light/Dark Theme");
 	// Continuous/Single-page and Thumbnails toggles removed from the UI by
@@ -4235,6 +4535,42 @@ void FrameWindow::createChildren()
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 	SetWindowSubclass(splitEdit_, SplitEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
 	splitBarH_ = Scale(34, GetDpiForWindow(hwnd_));
+
+	// Set-password bar (hidden until Tools > Set Password...).
+	setPwdLabel_ = CreateWindowExW(0, L"STATIC", L"New password to open this PDF:",
+		WS_CHILD | SS_CENTERIMAGE, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SETPWD_LABEL), hInst_, nullptr);
+	setPwdEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+		WS_CHILD | ES_AUTOHSCROLL | ES_PASSWORD, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SETPWD_EDIT), hInst_, nullptr);
+	setPwdButton_ = CreateWindowExW(0, L"BUTTON", L"Set Password",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SETPWD_BUTTON), hInst_, nullptr);
+	setPwdClose_ = CreateWindowExW(0, L"BUTTON", L"Cancel",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SETPWD_CLOSE), hInst_, nullptr);
+	for (HWND h : { setPwdLabel_, setPwdEdit_, setPwdButton_, setPwdClose_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+	SetWindowSubclass(setPwdEdit_, SetPwdEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+	setPwdBarH_ = Scale(34, GetDpiForWindow(hwnd_));
+
+	// Web-to-PDF bar (hidden until Tools > Web Page to PDF...).
+	webPdfLabel_ = CreateWindowExW(0, L"STATIC", L"Web page URL:",
+		WS_CHILD | SS_CENTERIMAGE, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_WEBPDF_LABEL), hInst_, nullptr);
+	webPdfEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+		WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_WEBPDF_EDIT), hInst_, nullptr);
+	webPdfButton_ = CreateWindowExW(0, L"BUTTON", L"Convert",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_WEBPDF_BUTTON), hInst_, nullptr);
+	webPdfClose_ = CreateWindowExW(0, L"BUTTON", L"Cancel",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_WEBPDF_CLOSE), hInst_, nullptr);
+	for (HWND h : { webPdfLabel_, webPdfEdit_, webPdfButton_, webPdfClose_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+	SetWindowSubclass(webPdfEdit_, WebPdfEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+	webPdfBarH_ = Scale(34, GetDpiForWindow(hwnd_));
 
 	// Redact bar (hidden unless the active tool is Redact).
 	redactLabel_ = CreateWindowExW(0, L"STATIC", L"",
@@ -4382,6 +4718,7 @@ void FrameWindow::submitPassword()
 
 void FrameWindow::cancelPasswordPrompt()
 {
+	pendingSetPasswordAfterOpen_ = false;
 	showPasswordBar(false);
 	// The tab was created (or reused) for this open attempt but never got a
 	// document -- closeTab() is safe to call here since dirty()/isOpen() are
@@ -4423,6 +4760,53 @@ void FrameWindow::removeProtection()
 		return;
 	}
 	at->protDismissed = true;
+	updateProtectionBar();
+}
+
+void FrameWindow::showSetPasswordBar(bool show)
+{
+	if (show && (!doc_ || !doc_->isOpen() || !doc_->isPdf())) return;
+	setPwdVisible_ = show;
+	int sw = show ? SW_SHOW : SW_HIDE;
+	for (HWND h : { setPwdLabel_, setPwdEdit_, setPwdButton_, setPwdClose_ })
+		ShowWindow(h, sw);
+	if (show) {
+		SetWindowTextW(setPwdLabel_, L"New password to open this PDF:");
+		SetWindowTextW(setPwdEdit_, L"");
+	}
+	layout();
+	if (show) SetFocus(setPwdEdit_);
+}
+
+void FrameWindow::runSetPassword()
+{
+	if (!doc_ || !doc_->isOpen() || !doc_->isPdf()) return;
+	DocTab* at = tabs_[activeTab_].get();
+	if (at->path.empty()) {
+		SetWindowTextW(setPwdLabel_, L"Save this document first, then set a password.");
+		return;
+	}
+	wchar_t buf[128] = {};
+	GetWindowTextW(setPwdEdit_, buf, 128);
+	if (!buf[0]) {
+		SetWindowTextW(setPwdLabel_, L"Enter a password:");
+		MessageBeep(MB_ICONWARNING);
+		return;
+	}
+	std::string pw = WideToUtf8(buf);
+	if (canvas_) canvas_->flushPendingEdit();
+	std::string err;
+	if (!doc_->setPassword(at->path.c_str(), pw.c_str(), err)) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to set password." : wmsg.c_str(),
+			L"Set Password", MB_OK | MB_ICONERROR);
+		return;
+	}
+	showSetPasswordBar(false);
+	// Confirms success and offers the matching undo -- the protection bar's
+	// existing "Remove Password"/"Remove Restrictions" now apply to the
+	// password we just set.
+	at->protDismissed = false;
 	updateProtectionBar();
 }
 
@@ -4665,7 +5049,7 @@ void FrameWindow::enterOrganizeMode(std::vector<PdfDocument::PagePlanEntry> seed
 void FrameWindow::organizeInsertPages()
 {
 	if (!doc_ || !thumbs_ || !thumbs_->organizeMode()) return;
-	auto files = OpenFileDialogMulti(hwnd_);
+	auto files = PickFilesAcrossFolders(hwnd_, L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0", L"Insert Pages");
 	int skipped = 0;
 	for (auto& f : files) {
 		std::string err;
@@ -4726,7 +5110,7 @@ void FrameWindow::organizeCancel()
 
 void FrameWindow::doMerge()
 {
-	auto files = OpenFileDialogMulti(hwnd_);
+	auto files = PickFilesAcrossFolders(hwnd_, L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0", L"Select PDF Files");
 	if (files.empty()) return;
 	// Like openDocument(): never disturb an already-open document -- merge
 	// always lands in a fresh tab (or reuses the current one if it's
@@ -4762,6 +5146,127 @@ void FrameWindow::doMerge()
 	layout();
 }
 
+void FrameWindow::doConvertToPdf()
+{
+	static const wchar_t kFilter[] =
+		L"Convertible Files (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf)\0"
+		L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf\0"
+		L"Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff)\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff\0"
+		L"Text/Markdown (*.txt;*.md)\0*.txt;*.md\0"
+		L"Word Documents (*.docx)\0*.docx\0"
+		L"PDF Documents (*.pdf)\0*.pdf\0"
+		L"All Files (*.*)\0*.*\0";
+	auto files = PickFilesAcrossFolders(hwnd_, kFilter, L"Select Files to Convert to PDF");
+	if (files.empty()) return;
+
+	// Output lands next to the first picked file, named after its stem --
+	// never silently overwrites an unrelated existing file of that name.
+	const std::wstring& first = files[0];
+	size_t slash = first.find_last_of(L'\\');
+	std::wstring folder = (slash == std::wstring::npos) ? L"." : first.substr(0, slash);
+	std::wstring base = (slash == std::wstring::npos) ? first : first.substr(slash + 1);
+	size_t dot = base.find_last_of(L'.');
+	if (dot != std::wstring::npos) base = base.substr(0, dot);
+	std::wstring outPath = folder + L"\\" + base + L".pdf";
+	for (int n = 1; GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES && n <= 20; ++n) {
+		wchar_t suffix[32];
+		swprintf(suffix, 32, n == 1 ? L"_converted.pdf" : L"_converted%d.pdf", n);
+		outPath = folder + L"\\" + base + suffix;
+	}
+
+	std::string err;
+	std::vector<std::wstring> skipped;
+	bool ok = PdfDocument::ConvertFilesToPdf(files, outPath.c_str(), err, &skipped);
+	if (!ok) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to convert the selected file(s)." : wmsg.c_str(),
+			L"Convert to PDF", MB_OK | MB_ICONERROR);
+		return;
+	}
+	if (!skipped.empty()) {
+		wchar_t msg[160];
+		swprintf(msg, 160, L"%d file(s) could not be converted and were skipped (unsupported type or unreadable).",
+			static_cast<int>(skipped.size()));
+		MessageBoxW(hwnd_, msg, L"Convert to PDF", MB_OK | MB_ICONWARNING);
+	}
+	openDocument(outPath.c_str());
+}
+
+void FrameWindow::showWebPdfBar(bool show)
+{
+	webPdfVisible_ = show;
+	int sw = show ? SW_SHOW : SW_HIDE;
+	for (HWND h : { webPdfLabel_, webPdfEdit_, webPdfButton_, webPdfClose_ })
+		ShowWindow(h, sw);
+	if (show) SetWindowTextW(webPdfEdit_, L"");
+	layout();
+	if (show) SetFocus(webPdfEdit_);
+}
+
+void FrameWindow::runWebToPdf()
+{
+	wchar_t buf[2048] = {};
+	GetWindowTextW(webPdfEdit_, buf, 2048);
+	std::wstring url = buf;
+	size_t a = url.find_first_not_of(L" \t");
+	if (a == std::wstring::npos) { MessageBeep(MB_ICONWARNING); return; }
+	size_t b = url.find_last_not_of(L" \t");
+	url = url.substr(a, b - a + 1);
+	if (url.find(L"://") == std::wstring::npos) url = L"https://" + url; // bare "example.com" -> a real URL
+
+	// Default filename from the URL's host (e.g. "https://example.com/x" ->
+	// "example.com.pdf"), falling back to something generic if that parse
+	// comes up empty (e.g. a bare "https://").
+	std::wstring host = url;
+	size_t schemeEnd = host.find(L"://");
+	if (schemeEnd != std::wstring::npos) host = host.substr(schemeEnd + 3);
+	size_t slash = host.find_first_of(L"/?#");
+	if (slash != std::wstring::npos) host = host.substr(0, slash);
+	for (wchar_t c : std::wstring(L"\\/:*?\"<>|")) std::replace(host.begin(), host.end(), c, L'_');
+	if (host.empty()) host = L"webpage";
+
+	// host (e.g. "example.com") contains a dot, so the Save dialog would
+	// treat ".com" as an already-given extension and skip appending
+	// lpstrDefExt -- append ".pdf" explicitly instead of relying on that.
+	wchar_t file[MAX_PATH] = L"";
+	wcscpy_s(file, (host + L".pdf").c_str());
+	OPENFILENAMEW ofn = {};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd_;
+	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrDefExt = L"pdf";
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+	ofn.lpstrTitle = L"Save Web Page as PDF";
+	if (!GetSaveFileNameW(&ofn)) return; // bar stays open -- user can retry or Cancel
+
+	// This blocks the UI thread for as long as the page takes to load and
+	// print (see ConvertWebPageToPdf's header comment) -- flip the button to
+	// a busy state so it's clear something is happening, since there's no
+	// real progress to report.
+	EnableWindow(webPdfEdit_, FALSE);
+	EnableWindow(webPdfButton_, FALSE);
+	SetWindowTextW(webPdfButton_, L"Converting...");
+	UpdateWindow(hwnd_);
+
+	std::string err;
+	bool ok = ConvertWebPageToPdf(url.c_str(), file, err);
+
+	SetWindowTextW(webPdfButton_, L"Convert");
+	EnableWindow(webPdfEdit_, TRUE);
+	EnableWindow(webPdfButton_, TRUE);
+
+	if (!ok) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to convert the page." : wmsg.c_str(),
+			L"Web Page to PDF", MB_OK | MB_ICONERROR);
+		return;
+	}
+	showWebPdfBar(false);
+	openDocument(file);
+}
+
 LRESULT CALLBACK FrameWindow::EditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 	UINT_PTR, DWORD_PTR ref)
 {
@@ -4782,6 +5287,7 @@ LRESULT CALLBACK FrameWindow::EditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARA
 		// search-as-you-type debounce timer -- no need to call liveSearch()
 		// here directly.
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
 	// The stock edit proc turns the WM_KEYDOWN(Ctrl+VK_BACK) handled above
 	// into a WM_CHAR(0x7F) right after -- swallow it too, or it re-inserts
@@ -4798,6 +5304,7 @@ LRESULT CALLBACK FrameWindow::PwdEditSubclass(HWND hwnd, UINT msg, WPARAM wp, LP
 		if (wp == VK_RETURN) { self->submitPassword(); return 0; }
 		if (wp == VK_ESCAPE) { self->cancelPasswordPrompt(); return 0; }
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
 	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
 	return DefSubclassProc(hwnd, msg, wp, lp);
@@ -4811,6 +5318,35 @@ LRESULT CALLBACK FrameWindow::SplitEditSubclass(HWND hwnd, UINT msg, WPARAM wp, 
 		if (wp == VK_RETURN) { self->runSplit(); return 0; }
 		if (wp == VK_ESCAPE) { self->showSplitBar(false); return 0; }
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
+	}
+	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK FrameWindow::SetPwdEditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+	UINT_PTR, DWORD_PTR ref)
+{
+	auto* self = reinterpret_cast<FrameWindow*>(ref);
+	if (msg == WM_KEYDOWN) {
+		if (wp == VK_RETURN) { self->runSetPassword(); return 0; }
+		if (wp == VK_ESCAPE) { self->showSetPasswordBar(false); return 0; }
+		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
+	}
+	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK FrameWindow::WebPdfEditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+	UINT_PTR, DWORD_PTR ref)
+{
+	auto* self = reinterpret_cast<FrameWindow*>(ref);
+	if (msg == WM_KEYDOWN) {
+		if (wp == VK_RETURN) { self->runWebToPdf(); return 0; }
+		if (wp == VK_ESCAPE) { self->showWebPdfBar(false); return 0; }
+		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
 	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
 	return DefSubclassProc(hwnd, msg, wp, lp);
@@ -4826,6 +5362,7 @@ LRESULT CALLBACK FrameWindow::PageEditSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 		return 0;
 	}
 	if (msg == WM_KEYDOWN && ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+	if (msg == WM_KEYDOWN && ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x7F)) return 0; // swallow beep
 	if (msg == WM_KILLFOCUS) {
 		// No Enter pressed -- snap the box back to the actual current page
@@ -4870,15 +5407,26 @@ void FrameWindow::layout()
 	UINT dpi = GetDpiForWindow(hwnd_);
 	int fullW = rc.right - rc.left;
 
-	// Toolbar auto-docks itself to (0,0) full-width in response to
-	// TB_AUTOSIZE; the tab strip goes right below it (not above -- see the
-	// comment on toolbar_'s creation).
-	SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
 	SendMessageW(status_, WM_SIZE, 0, 0);
+	layoutStatusParts();
 
+	int tabStripH = Scale(30, dpi);
+
+	// Tab strip sits right below the title bar (Edge-style), toolbar below
+	// that -- the reverse of comctl32's own default toolbar behavior (which
+	// auto-docks to (0,0) full-width), so the toolbar is created with
+	// CCS_NOPARENTALIGN|CCS_NORESIZE (see its creation comment) and fully
+	// positioned/sized here instead. It needs a real width via MoveWindow
+	// BEFORE TB_AUTOSIZE, since that's what TB_AUTOSIZE uses to figure out
+	// button wrapping (TBSTYLE_WRAPABLE) and its own resulting height.
+	MoveWindow(toolbar_, 0, tabStripH, fullW, Scale(40, dpi), TRUE);
+	SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
 	RECT tb; GetWindowRect(toolbar_, &tb);
 	int tbH = tb.bottom - tb.top;
-	int tabStripH = Scale(30, dpi);
+	// TB_AUTOSIZE only recomputes height for the width already in place --
+	// re-set the position with that final height so anything below it lines
+	// up exactly (matters if WRAPABLE ever kicks in and grows past one row).
+	MoveWindow(toolbar_, 0, tabStripH, fullW, tbH, TRUE);
 
 	// Position the zoom-% label over its toolbar button's reserved rect.
 	if (zoomLabel_) {
@@ -4889,24 +5437,32 @@ void FrameWindow::layout()
 		}
 	}
 
-	// Page-number jump box claims the right end of the tab strip row.
-	int editW = Scale(44, dpi);
-	int ofW = Scale(56, dpi);
-	int pageGap = Scale(6, dpi);
-	int pageAreaW = editW + pageGap + ofW + pageGap;
-	int tabStripW = std::max(0, fullW - pageAreaW);
-	MoveWindow(tabStrip_, 0, tbH, tabStripW, tabStripH, TRUE);
-	updateTabWidths(tabStripW);
-	int editH = Scale(22, dpi);
-	int py = tbH + (tabStripH - editH) / 2;
-	int px = fullW - pageAreaW;
-	MoveWindow(pageEdit_, px, py, editW, editH, TRUE); px += editW + pageGap;
-	MoveWindow(pageOfLabel_, px, py, ofW, editH, TRUE);
+	// Page-number jump box: same overlay-a-real-control technique as
+	// zoomLabel_, now inline in the toolbar (moved off the tab-strip row per
+	// user request, to match Edge's placement). Splits the reserved rect
+	// unevenly between the edit box and the "of N" label, same ~44/56 ratio
+	// the tab-strip-row version used.
+	if (pageEdit_ && pageOfLabel_) {
+		RECT pr = {};
+		if (SendMessageW(toolbar_, TB_GETRECT, IDM_VIEW_PAGELABEL, reinterpret_cast<LPARAM>(&pr))) {
+			MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&pr), 2);
+			int totalW = pr.right - pr.left;
+			int editW = std::max(Scale(30, dpi), totalW * 4 / 10);
+			int ofW = std::max(0, totalW - editW);
+			int editH = Scale(22, dpi);
+			int py = pr.top + ((pr.bottom - pr.top) - editH) / 2;
+			MoveWindow(pageEdit_, pr.left, py, editW, editH, TRUE);
+			MoveWindow(pageOfLabel_, pr.left + editW, py, ofW, editH, TRUE);
+		}
+	}
+
+	MoveWindow(tabStrip_, 0, 0, fullW, tabStripH, TRUE);
+	updateTabWidths(fullW);
 
 	RECT sb; GetWindowRect(status_, &sb);
 	int sbH = sb.bottom - sb.top;
 
-	int top = tbH + tabStripH;
+	int top = tabStripH + tbH;
 	int fullW0 = fullW;
 	if (searchVisible_) {
 		int y = top + Scale(4, dpi);
@@ -4982,6 +5538,36 @@ void FrameWindow::layout()
 		MoveWindow(splitClose_, x, y, closeW, h, TRUE); x += closeW + pad;
 		MoveWindow(splitResult_, x, y, std::max(0, fullW0 - x - pad), h, TRUE);
 		top += splitBarH_;
+	}
+	if (setPwdVisible_) {
+		int y = top + Scale(4, dpi);
+		int h = Scale(24, dpi);
+		int pad = Scale(6, dpi);
+		int x = pad;
+		int lblW = Scale(220, dpi);
+		int editW = Scale(160, dpi);
+		int btnW = Scale(100, dpi);
+		int closeW = Scale(60, dpi);
+		MoveWindow(setPwdLabel_, x, y, lblW, h, TRUE); x += lblW + pad;
+		MoveWindow(setPwdEdit_, x, y, editW, h, TRUE); x += editW + pad;
+		MoveWindow(setPwdButton_, x, y, btnW, h, TRUE); x += btnW + pad;
+		MoveWindow(setPwdClose_, x, y, closeW, h, TRUE);
+		top += setPwdBarH_;
+	}
+	if (webPdfVisible_) {
+		int y = top + Scale(4, dpi);
+		int h = Scale(24, dpi);
+		int pad = Scale(6, dpi);
+		int x = pad;
+		int lblW = Scale(90, dpi);
+		int btnW = Scale(76, dpi);
+		int closeW = Scale(60, dpi);
+		MoveWindow(webPdfLabel_, x, y, lblW, h, TRUE); x += lblW + pad;
+		int editW = std::max(0, fullW0 - x - pad - btnW - pad - closeW - pad);
+		MoveWindow(webPdfEdit_, x, y, editW, h, TRUE); x += editW + pad;
+		MoveWindow(webPdfButton_, x, y, btnW, h, TRUE); x += btnW + pad;
+		MoveWindow(webPdfClose_, x, y, closeW, h, TRUE);
+		top += webPdfBarH_;
 	}
 	if (redactBarVisible_) {
 		int y = top + Scale(4, dpi);
@@ -5098,11 +5684,12 @@ void FrameWindow::switchToTab(int idx)
 	switch (canvas_->tool()) {
 	case CanvasView::Tool::Highlight: toolId = IDM_TOOL_HIGHLIGHT; break;
 	case CanvasView::Tool::Draw: toolId = IDM_TOOL_DRAW; break;
+	case CanvasView::Tool::Erase: toolId = IDM_TOOL_ERASE; break;
 	case CanvasView::Tool::Text: toolId = IDM_TOOL_TEXT; break;
 	case CanvasView::Tool::Redact: toolId = IDM_TOOL_REDACT; break;
 	default: break;
 	}
-	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
+	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
 		SendMessageW(toolbar_, TB_CHECKBUTTON, b, MAKELPARAM(b == toolId, 0));
 	updateRedactBar();
 
@@ -5126,18 +5713,77 @@ void FrameWindow::closeTab(int idx)
 	DestroyWindow(tabs_[idx]->thumbs->hwnd());
 	SendMessageW(tabStrip_, TCM_DELETEITEM, idx, 0);
 	tabs_.erase(tabs_.begin() + idx);
+	clearTabMultiSelect(); // indices below would otherwise drift out of sync
 
 	if (tabs_.empty()) {
-		// Closing the last tab closes the app (browser-tab convention would
-		// leave a blank tab behind; a single-purpose document app instead
-		// quits, like closing the last document in Acrobat/Preview). The
-		// closed tab was already prompted-for-save above, so there's nothing
-		// left to check -- just tear the window down directly.
+		// Closing the last tab closes this window (browser-tab convention
+		// would leave a blank tab behind; a single-purpose document app
+		// instead quits, like closing the last document in Acrobat/Preview).
+		// The whole app only exits once every such window is gone -- see
+		// g_liveFrameCount's comment. The closed tab was already prompted-
+		// for-save above, so there's nothing left to check here.
 		DestroyWindow(hwnd_);
 		return;
 	}
 	activeTab_ = -1; // force switchToTab to treat this as a real switch
 	switchToTab(std::min(idx, static_cast<int>(tabs_.size()) - 1));
+}
+
+void FrameWindow::detachTabToNewWindow(int idx)
+{
+	detachTabsToNewWindow({ idx });
+}
+
+// Handles both a lone tab (idx alone) and a multi-selected group together --
+// every selected tab's file lands as its own tab in ONE new window,
+// preserving their relative order.
+void FrameWindow::detachTabsToNewWindow(std::vector<int> indices)
+{
+	std::sort(indices.begin(), indices.end());
+	indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+	indices.erase(std::remove_if(indices.begin(), indices.end(),
+		[&](int i) { return i < 0 || i >= static_cast<int>(tabs_.size()); }), indices.end());
+	if (indices.empty()) return;
+	if (indices.size() == tabs_.size()) return; // would just recreate an equivalent window with everything in it
+
+	// Moving the live CanvasView/ThumbPanel/PdfDocument to another top-level
+	// window (reparenting HWNDs, re-pointing every callback that captured
+	// `this`) is a lot of fragile surface for little benefit -- instead close
+	// each tab here and reopen its file fresh in the new window, exactly like
+	// a normal Open would. Requires a real path, so an unsaved/untitled tab
+	// (e.g. a fresh Merge result before its first Save) can't be detached
+	// this way yet -- those are silently skipped (with a warning if any were).
+	std::vector<std::wstring> paths;
+	int skippedUnsaved = 0;
+	for (int idx : indices) {
+		switchToTab(idx);
+		if (tabs_[idx]->path.empty()) { ++skippedUnsaved; continue; }
+		if (!promptSaveIfDirty()) return; // user cancelled -- abort the whole move
+		paths.push_back(tabs_[idx]->path);
+	}
+	if (paths.empty()) { MessageBeep(MB_ICONWARNING); return; }
+	if (skippedUnsaved > 0) {
+		wchar_t msg[160];
+		swprintf(msg, 160, L"%d unsaved tab(s) don't have a file yet and were left where they are. Save them first to move them.",
+			skippedUnsaved);
+		MessageBoxW(hwnd_, msg, L"Open in New Window", MB_OK | MB_ICONINFORMATION);
+	}
+
+	// Remove highest-index-first so earlier indices in `indices` stay valid.
+	for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+		int idx = *it;
+		if (tabs_[idx]->path.empty()) continue; // left in place above
+		DestroyWindow(tabs_[idx]->canvas->hwnd());
+		DestroyWindow(tabs_[idx]->thumbs->hwnd());
+		SendMessageW(tabStrip_, TCM_DELETEITEM, idx, 0);
+		tabs_.erase(tabs_.begin() + idx);
+	}
+	clearTabMultiSelect();
+	if (tabs_.empty()) { DestroyWindow(hwnd_); return; }
+	activeTab_ = -1;
+	switchToTab(std::min(indices[0], static_cast<int>(tabs_.size()) - 1));
+
+	SpawnNewWindow(hInst_, paths);
 }
 
 void FrameWindow::cycleTab(int dir)
@@ -5197,6 +5843,104 @@ void FrameWindow::reorderTab(int from, int to)
 	InvalidateRect(tabStrip_, nullptr, FALSE);
 }
 
+// Like reorderTab(), but moves an entire multi-selected block of tabs to
+// `to` as one contiguous unit, preserving their relative order -- used when
+// dragging a tab that's part of an active multi-selection.
+void FrameWindow::reorderTabGroup(std::vector<int> indices, int to)
+{
+	std::sort(indices.begin(), indices.end());
+	indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+	int n = static_cast<int>(tabs_.size());
+	if (indices.empty() || to < 0 || to >= n) return;
+
+	DocTab* activeDoc = (activeTab_ >= 0 && activeTab_ < n) ? tabs_[activeTab_].get() : nullptr;
+
+	// Same owner-drawn-control convention as reorderTab(): its only real
+	// per-item state is the label text, so delete+reinsert loses nothing.
+	std::vector<std::wstring> labels;
+	for (int idx : indices) {
+		wchar_t label[128] = {};
+		TCITEMW item = {}; item.mask = TCIF_TEXT; item.pszText = label; item.cchTextMax = 128;
+		SendMessageW(tabStrip_, TCM_GETITEMW, idx, reinterpret_cast<LPARAM>(&item));
+		labels.emplace_back(label);
+	}
+
+	std::vector<std::unique_ptr<DocTab>> moving(indices.size());
+	for (size_t k = 0; k < indices.size(); ++k) moving[k] = std::move(tabs_[indices[k]]);
+	for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+		tabs_.erase(tabs_.begin() + *it);
+		SendMessageW(tabStrip_, TCM_DELETEITEM, *it, 0);
+	}
+
+	// `to` was a position in the pre-removal indexing -- shift it down by
+	// however many removed tabs sat at or before it, then clamp into the
+	// now-shorter vector's valid insertion range.
+	int adjTo = to;
+	for (int idx : indices) if (idx < to) --adjTo;
+	adjTo = std::clamp(adjTo, 0, static_cast<int>(tabs_.size()));
+
+	for (size_t k = 0; k < moving.size(); ++k) {
+		int pos = adjTo + static_cast<int>(k);
+		tabs_.insert(tabs_.begin() + pos, std::move(moving[k]));
+		TCITEMW item = {};
+		item.mask = TCIF_TEXT;
+		item.pszText = const_cast<LPWSTR>(labels[k].c_str());
+		SendMessageW(tabStrip_, TCM_INSERTITEMW, pos, reinterpret_cast<LPARAM>(&item));
+	}
+
+	if (activeDoc) {
+		for (int i = 0; i < static_cast<int>(tabs_.size()); ++i)
+			if (tabs_[i].get() == activeDoc) { activeTab_ = i; break; }
+	}
+	multiSelectedTabs_.clear();
+	for (size_t k = 0; k < moving.size(); ++k) multiSelectedTabs_.push_back(adjTo + static_cast<int>(k));
+	SendMessageW(tabStrip_, TCM_SETCURSEL, activeTab_, 0);
+	InvalidateRect(tabStrip_, nullptr, FALSE);
+}
+
+bool FrameWindow::isTabMultiSelected(int idx) const
+{
+	return std::find(multiSelectedTabs_.begin(), multiSelectedTabs_.end(), idx) != multiSelectedTabs_.end();
+}
+
+void FrameWindow::clearTabMultiSelect()
+{
+	if (multiSelectedTabs_.empty()) return;
+	multiSelectedTabs_.clear();
+	InvalidateRect(tabStrip_, nullptr, FALSE);
+}
+
+// Ctrl+click: toggle a tab in/out of the multi-selection without switching
+// the active/shown tab (Explorer-style -- marking tabs for a bulk move
+// shouldn't disrupt what's currently on screen).
+void FrameWindow::toggleTabMultiSelect(int idx)
+{
+	if (idx < 0 || idx >= static_cast<int>(tabs_.size())) return;
+	// A bare multi-selection of just the active tab isn't meaningful (every
+	// group operation already treats a lone tab as "no selection"); seed it
+	// with the active tab too so Ctrl+clicking a second tab immediately forms
+	// a real 2-tab group instead of feeling like nothing happened.
+	if (multiSelectedTabs_.empty()) multiSelectedTabs_.push_back(activeTab_);
+	auto it = std::find(multiSelectedTabs_.begin(), multiSelectedTabs_.end(), idx);
+	if (it != multiSelectedTabs_.end()) multiSelectedTabs_.erase(it);
+	else multiSelectedTabs_.push_back(idx);
+	if (multiSelectedTabs_.size() < 2) multiSelectedTabs_.clear(); // back down to "no selection"
+	tabSelectAnchor_ = idx;
+	InvalidateRect(tabStrip_, nullptr, FALSE);
+}
+
+// Shift+click: select every tab between the last plain-clicked tab and this
+// one, inclusive.
+void FrameWindow::selectTabRange(int fromIdx, int toIdx)
+{
+	int n = static_cast<int>(tabs_.size());
+	if (fromIdx < 0 || fromIdx >= n || toIdx < 0 || toIdx >= n) return;
+	int lo = std::min(fromIdx, toIdx), hi = std::max(fromIdx, toIdx);
+	multiSelectedTabs_.clear();
+	if (lo != hi) for (int i = lo; i <= hi; ++i) multiSelectedTabs_.push_back(i);
+	InvalidateRect(tabStrip_, nullptr, FALSE);
+}
+
 // Shrinks the (TCS_FIXEDWIDTH) tab item width so all open tabs fit within
 // barW, down to a floor that still leaves room for an ellipsized label and
 // the close "x" -- instead of comctl32's default of keeping every tab at a
@@ -5238,21 +5982,66 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 				self->closeTab(idx);
 				return 0; // swallow -- don't let the default proc also select it
 			}
-			// Anywhere else on a tab: arm drag-to-reorder tracking, but still
-			// fall through to DefSubclassProc so the control's normal
-			// click-to-select behavior also runs on this same button-down.
+			bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+			bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+			if (ctrl) {
+				// Toggle membership only -- don't touch the active/shown tab
+				// or arm a drag, and don't let the default proc change the
+				// control's own selection either.
+				self->toggleTabMultiSelect(idx);
+				return 0;
+			}
+			if (shift && self->tabSelectAnchor_ >= 0) {
+				self->selectTabRange(self->tabSelectAnchor_, idx);
+				return 0;
+			}
+			// Plain click: if this tab isn't already part of an active
+			// multi-selection, that selection no longer applies.
+			if (!self->isTabMultiSelected(idx)) self->clearTabMultiSelect();
+			self->tabSelectAnchor_ = idx;
+			// Arm drag-to-reorder tracking, but still fall through to
+			// DefSubclassProc so the control's normal click-to-select
+			// behavior also runs on this same button-down.
 			self->tabDragIndex_ = idx;
 			self->tabDragArmed_ = true;
 			SetCapture(hwnd);
 		}
 	}
 	if (msg == WM_MOUSEMOVE && self->tabDragArmed_ && (wp & MK_LBUTTON)) {
-		TCHITTESTINFO hit = {};
-		hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+		POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+		// A multi-selected group being dragged moves/tears off together;
+		// otherwise just the one tab under the cursor, as before.
+		bool asGroup = self->isTabMultiSelected(self->tabDragIndex_) && self->multiSelectedTabs_.size() > 1;
+		// Dragging far enough above/below the strip (mouse capture keeps
+		// these coordinates coming even once the cursor leaves the control)
+		// tears the tab(s) off into their own window, Chrome/Edge-style,
+		// instead of just reordering within the strip.
+		RECT rc; GetClientRect(hwnd, &rc);
+		int tearThreshold = Scale(50, GetDpiForWindow(hwnd));
+		if (pt.y < rc.top - tearThreshold || pt.y > rc.bottom + tearThreshold) {
+			int idx = self->tabDragIndex_;
+			std::vector<int> group = asGroup ? self->multiSelectedTabs_ : std::vector<int>{ idx };
+			self->tabDragArmed_ = false;
+			self->tabDragIndex_ = -1;
+			ReleaseCapture();
+			self->detachTabsToNewWindow(group);
+			return 0;
+		}
+		TCHITTESTINFO hit = {}; hit.pt = pt;
 		int idx = TabCtrl_HitTest(hwnd, &hit);
 		if (idx >= 0 && idx != self->tabDragIndex_) {
-			self->reorderTab(self->tabDragIndex_, idx);
-			self->tabDragIndex_ = idx;
+			if (asGroup) {
+				DocTab* draggedDoc = (self->tabDragIndex_ >= 0 && self->tabDragIndex_ < static_cast<int>(self->tabs_.size()))
+					? self->tabs_[self->tabDragIndex_].get() : nullptr;
+				self->reorderTabGroup(self->multiSelectedTabs_, idx);
+				if (draggedDoc) {
+					for (int i = 0; i < static_cast<int>(self->tabs_.size()); ++i)
+						if (self->tabs_[i].get() == draggedDoc) { self->tabDragIndex_ = i; break; }
+				}
+			} else {
+				self->reorderTab(self->tabDragIndex_, idx);
+				self->tabDragIndex_ = idx;
+			}
 		}
 		return 0;
 	}
@@ -5271,14 +6060,21 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 			if (msg == WM_MBUTTONUP) {
 				self->closeTab(idx);
 			} else {
+				bool asGroup = self->isTabMultiSelected(idx) && self->multiSelectedTabs_.size() > 1;
+				std::vector<int> group = asGroup ? self->multiSelectedTabs_ : std::vector<int>{ idx };
 				HMENU m = CreatePopupMenu();
 				AppendMenuW(m, MF_STRING, IDM_TAB_CLOSE, L"Close Tab");
+				wchar_t openLabel[48];
+				if (asGroup) swprintf(openLabel, 48, L"Open %d Tabs in New Window", static_cast<int>(group.size()));
+				else wcscpy_s(openLabel, L"Open in New Window");
+				AppendMenuW(m, MF_STRING, IDM_TAB_OPEN_NEW_WINDOW, openLabel);
 				POINT pt = hit.pt;
 				ClientToScreen(hwnd, &pt);
 				self->switchToTab(idx);
 				int sel = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, self->hwnd_, nullptr);
 				DestroyMenu(m);
 				if (sel == IDM_TAB_CLOSE) self->closeTab(idx);
+				else if (sel == IDM_TAB_OPEN_NEW_WINDOW) self->detachTabsToNewWindow(group);
 			}
 			return 0;
 		}
@@ -5317,6 +6113,12 @@ void FrameWindow::drawTabItem(const DRAWITEMSTRUCT* dis)
 		FillRect(dc, &under, accent);
 		DeleteObject(accent);
 	}
+	// Multi-tab selection (Ctrl/Shift+click, see multiSelectedTabs_) gets its
+	// own translucent tint independent of the single "active/shown" tab's
+	// accent bar above -- several tabs can be marked at once, only one is
+	// ever actually on screen.
+	if (isTabMultiSelected(static_cast<int>(dis->itemID)))
+		FillAlpha(dc, rc, th.tabAccent, 60);
 	HPEN gridPen = CreatePen(PS_SOLID, 1, th.tabBorder);
 	HGDIOBJ oldPen = SelectObject(dc, gridPen);
 	MoveToEx(dc, rc.right - 1, rc.top + 4, nullptr);
@@ -5354,12 +6156,14 @@ void FrameWindow::drawTabItem(const DRAWITEMSTRUCT* dis)
 	DeleteObject(xpen);
 }
 
-// Only reached for a part that was set with the SBT_OWNERDRAW flag (see
-// CanvasView::updateStatus) -- i.e. only in dark mode. Status bar controls
-// don't reliably send NM_CUSTOMDRAW like other common controls do, so
-// SBT_OWNERDRAW + WM_DRAWITEM (the same mechanism the tab strip already
-// uses) is the documented, reliable way to recolor its text. The sizegrip
-// corner is drawn separately by the control itself, unaffected by this.
+// Part 0 (page/zoom) is only reached here when SBT_OWNERDRAW was set -- i.e.
+// only in dark mode (see CanvasView::updateStatus). Part 1 (file path) is
+// ALWAYS owner-drawn regardless of theme, so it can use DT_PATH_ELLIPSIS
+// (see updateStatusPath()'s comment). Status bar controls don't reliably
+// send NM_CUSTOMDRAW like other common controls do, so SBT_OWNERDRAW +
+// WM_DRAWITEM (the same mechanism the tab strip already uses) is the
+// documented, reliable way to hand-draw their text. The sizegrip corner is
+// drawn separately by the control itself, unaffected by this.
 void FrameWindow::drawStatusBarItem(const DRAWITEMSTRUCT* dis)
 {
 	const ThemeColors& th = Theme(isDark_);
@@ -5367,14 +6171,26 @@ void FrameWindow::drawStatusBarItem(const DRAWITEMSTRUCT* dis)
 	FillRect(dis->hDC, &dis->rcItem, bg);
 	DeleteObject(bg);
 
+	SetTextColor(dis->hDC, th.statusText);
+	SetBkMode(dis->hDC, TRANSPARENT);
+	RECT tr = dis->rcItem;
+	UINT dpi = GetDpiForWindow(status_);
+
+	if (dis->itemID == 1) {
+		std::wstring path = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size()))
+			? tabs_[activeTab_]->path : std::wstring();
+		tr.left += Scale(6, dpi);
+		tr.right -= Scale(6, dpi);
+		DrawTextW(dis->hDC, path.c_str(), -1, &tr,
+			DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS | DT_NOPREFIX);
+		return;
+	}
+
 	// SB_GETTEXTW can't be used here: once a part is marked SBT_OWNERDRAW,
 	// its text slot holds opaque app data, not a retrievable string (see
 	// CanvasView::statusText_'s comment) -- read the mirrored text instead.
 	if (canvas_) {
-		RECT tr = dis->rcItem;
-		tr.left += Scale(6, GetDpiForWindow(status_));
-		SetTextColor(dis->hDC, th.statusText);
-		SetBkMode(dis->hDC, TRANSPARENT);
+		tr.left += Scale(6, dpi);
 		DrawTextW(dis->hDC, canvas_->currentStatusText().c_str(), -1, &tr,
 			DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 	}
@@ -5396,6 +6212,8 @@ void FrameWindow::openDocument(const wchar_t* path)
 		return;
 	}
 	if (!ok) {
+		pendingSetPasswordAfterOpen_ = false;
+		pendingFlattenAfterOpen_ = 0;
 		std::wstring wmsg(err.begin(), err.end());
 		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to open document." : wmsg.c_str(),
 			L"Open PDF", MB_OK | MB_ICONERROR);
@@ -5416,7 +6234,22 @@ void FrameWindow::finishOpenDocument(const wchar_t* path)
 	at->protDismissed = false;
 	updateTitle();
 	updateProtectionBar();
-	SetFocus(canvas_->hwnd());
+	bool chainToSetPassword = false;
+	if (pendingSetPasswordAfterOpen_) {
+		pendingSetPasswordAfterOpen_ = false;
+		// Only chains into the bar for a PDF that doesn't already have a
+		// password -- one that needed one just got its own offer to remove
+		// it, via updateProtectionBar() above.
+		chainToSetPassword = doc_ && doc_->isPdf() && !doc_->isEncrypted();
+	}
+	if (pendingFlattenAfterOpen_) {
+		int which = pendingFlattenAfterOpen_;
+		pendingFlattenAfterOpen_ = 0;
+		if (which == 1) doFlatten();
+		else doFlattenEdits();
+	}
+	if (chainToSetPassword) showSetPasswordBar(true); // moves focus to its own edit box
+	else SetFocus(canvas_->hwnd());
 }
 
 void FrameWindow::toggleThumbs()
@@ -5453,6 +6286,21 @@ void FrameWindow::onCommand(int id)
 	case IDM_FILE_OPEN: {
 		std::wstring p = OpenFileDialog(hwnd_);
 		if (!p.empty()) openDocument(p.c_str());
+		break;
+	}
+	case IDM_EMPTY_SET_PASSWORD: {
+		std::wstring p = OpenFileDialog(hwnd_);
+		if (!p.empty()) { pendingSetPasswordAfterOpen_ = true; openDocument(p.c_str()); }
+		break;
+	}
+	case IDM_EMPTY_FLATTEN_IMAGE: {
+		std::wstring p = OpenFileDialog(hwnd_);
+		if (!p.empty()) { pendingFlattenAfterOpen_ = 1; openDocument(p.c_str()); }
+		break;
+	}
+	case IDM_EMPTY_FLATTEN_EDITS: {
+		std::wstring p = OpenFileDialog(hwnd_);
+		if (!p.empty()) { pendingFlattenAfterOpen_ = 2; openDocument(p.c_str()); }
 		break;
 	}
 	case IDM_FILE_EXIT: if (promptSaveIfDirty()) DestroyWindow(hwnd_); break;
@@ -5495,6 +6343,10 @@ void FrameWindow::onCommand(int id)
 	case IDC_OPRESULT_CLOSE: showOpResultBar(false); break;
 	case IDC_SPLIT_BUTTON: runSplit(); break;
 	case IDC_SPLIT_CLOSE: showSplitBar(false); break;
+	case IDC_SETPWD_BUTTON: runSetPassword(); break;
+	case IDC_SETPWD_CLOSE: showSetPasswordBar(false); break;
+	case IDC_WEBPDF_BUTTON: runWebToPdf(); break;
+	case IDC_WEBPDF_CLOSE: showWebPdfBar(false); break;
 	case IDC_REDACT_APPLY: applyRedactionsCmd(); break;
 	case IDC_REDACT_CLEAR: clearRedactions(); break;
 	case IDC_REDACT_DONE: selectTool(IDM_TOOL_SELECT); break;
@@ -5504,7 +6356,11 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOLS_SPLIT: showSplitBar(true); break;
 	case IDM_TOOLS_RESIZE_A4: doResizeToA4(); break;
 	case IDM_TOOLS_FLATTEN: doFlatten(); break;
+	case IDM_TOOLS_FLATTEN_EDITS: doFlattenEdits(); break;
 	case IDM_TOOLS_COMPRESS: doCompress(); break;
+	case IDM_TOOLS_SET_PASSWORD: showSetPasswordBar(true); break;
+	case IDM_TOOLS_CONVERT: doConvertToPdf(); break;
+	case IDM_TOOLS_WEBPDF: showWebPdfBar(true); break;
 	case IDM_VIEW_TOGGLETHEME: toggleTheme(); break;
 	case IDM_HELP_CHECKUPDATE: startUpdateCheck(/*manual=*/true); break;
 	case IDC_ORGANIZE_INSERT: organizeInsertPages(); break;
@@ -5513,6 +6369,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOL_SELECT:
 	case IDM_TOOL_HIGHLIGHT:
 	case IDM_TOOL_DRAW:
+	case IDM_TOOL_ERASE:
 	case IDM_TOOL_TEXT:
 	case IDM_TOOL_REDACT: selectTool(id); break;
 	case IDM_TOOL_COLOR: chooseColor(); break;
@@ -5522,6 +6379,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_FILE_SAVEAS: saveDocument(true); break;
 	case IDM_VIEW_ZOOMIN: canvas_->zoomIn(); break;
 	case IDM_VIEW_ZOOMLABEL: canvas_->actualSize(); break;
+	case IDM_VIEW_PAGELABEL: if (pageEdit_) SetFocus(pageEdit_); break; // underlying button forwards a click that missed the edit box overlay
 	case IDM_VIEW_ZOOMOUT: canvas_->zoomOut(); break;
 	case IDM_VIEW_ACTUALSIZE: canvas_->actualSize(); break;
 	case IDM_VIEW_FITWIDTH: canvas_->setFit(CanvasView::Fit::Width); break;
@@ -5549,12 +6407,13 @@ void FrameWindow::selectTool(int id)
 	switch (id) {
 	case IDM_TOOL_HIGHLIGHT: t = CanvasView::Tool::Highlight; break;
 	case IDM_TOOL_DRAW: t = CanvasView::Tool::Draw; break;
+	case IDM_TOOL_ERASE: t = CanvasView::Tool::Erase; break;
 	case IDM_TOOL_TEXT: t = CanvasView::Tool::Text; break;
 	case IDM_TOOL_REDACT: t = CanvasView::Tool::Redact; break;
 	default: t = CanvasView::Tool::Select; break;
 	}
 	if (canvas_) canvas_->setTool(t);
-	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
+	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
 		SendMessageW(toolbar_, TB_CHECKBUTTON, b, MAKELPARAM(b == id, 0));
 	updateRedactBar();
 }
@@ -5590,8 +6449,14 @@ void FrameWindow::showToolsMenu()
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_SPLIT, L"Split PDF...");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_RESIZE_A4, L"Resize Pages to A4");
-	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN, L"Convert to Read-Only (Flatten)");
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN, L"Flatten to Image (Read-Only)");
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN_EDITS, L"Flatten Edits Only (Keep Text Selectable)");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_COMPRESS, L"Compress PDF");
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_SET_PASSWORD, L"Set Password...");
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_CONVERT, L"Convert to PDF...");
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_WEBPDF, L"Web Page to PDF...");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, MF_STRING, IDM_HELP_CHECKUPDATE, L"Check for Updates…");
 	int sel = popupUnderButton(IDM_TOOLS_MENU, m);
@@ -5624,6 +6489,22 @@ void FrameWindow::doFlatten()
 		std::wstring wmsg(err.begin(), err.end());
 		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to flatten pages." : wmsg.c_str(),
 			L"Flatten", MB_OK | MB_ICONERROR);
+		return;
+	}
+	if (canvas_) canvas_->refreshAfterSave();
+	if (thumbs_) thumbs_->refreshAfterSave();
+	showOpResultBar(true);
+}
+
+void FrameWindow::doFlattenEdits()
+{
+	if (!doc_ || !doc_->isOpen() || !doc_->isPdf()) return;
+	if (canvas_) canvas_->flushPendingEdit();
+	std::string err;
+	if (!doc_->flattenAnnotationsToContent(err)) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to flatten annotations." : wmsg.c_str(),
+			L"Flatten Edits", MB_OK | MB_ICONERROR);
 		return;
 	}
 	if (canvas_) canvas_->refreshAfterSave();
@@ -5675,6 +6556,34 @@ void FrameWindow::chooseOpacity()
 		canvas_->setOpacity(pct[sel - IDM_OPACITY_BASE] / 100.0f);
 }
 
+// Two status bar parts: [0] the existing "Page X / N   Zoom Y%" (left,
+// CanvasView::updateStatus() owns its text), [1] the active tab's full file
+// path (right, filling the rest of the bar). Part 0's width is a fixed
+// budget wide enough for its longest realistic text; part -1 means "extends
+// to the status bar's own right edge" (SB_SETPARTS convention), which also
+// keeps the sizegrip corner working normally.
+void FrameWindow::layoutStatusParts()
+{
+	if (!status_) return;
+	UINT dpi = GetDpiForWindow(status_);
+	int leftW = Scale(240, dpi);
+	int parts[2] = { leftW, -1 };
+	SendMessageW(status_, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
+}
+
+// Always owner-drawn (regardless of theme, unlike part 0 which stays fully
+// native in light mode) so a long path can be drawn with DT_PATH_ELLIPSIS
+// (elides from the middle -- "C:\...\test.pdf" -- far more readable for a
+// path than clipping or a trailing "..."), which the native status bar
+// rendering can't do on its own.
+void FrameWindow::updateStatusPath()
+{
+	if (!status_) return;
+	std::wstring path = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size()))
+		? tabs_[activeTab_]->path : std::wstring();
+	SendMessageW(status_, SB_SETTEXTW, 1 | SBT_OWNERDRAW, reinterpret_cast<LPARAM>(path.c_str()));
+}
+
 void FrameWindow::updateTitle()
 {
 	DocTab* at = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size())) ? tabs_[activeTab_].get() : nullptr;
@@ -5686,6 +6595,7 @@ void FrameWindow::updateTitle()
 	}
 	SetWindowTextW(hwnd_, t.c_str());
 	if (activeTab_ >= 0) updateTabLabel(activeTab_);
+	updateStatusPath();
 }
 
 void FrameWindow::saveDocument(bool saveAs)
@@ -5949,8 +6859,18 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		if (self->uiFont_) { DeleteObject(self->uiFont_); self->uiFont_ = nullptr; }
 		if (self->toolbarImages_) { ImageList_Destroy(self->toolbarImages_); self->toolbarImages_ = nullptr; }
 		if (self->ctrlBgBrush_) { DeleteObject(self->ctrlBgBrush_); self->ctrlBgBrush_ = nullptr; }
-		PostQuitMessage(0);
+		// Only quit the whole app once every top-level window is gone -- a
+		// second window (from dragging a tab out / "Open in New Window")
+		// closing on its own must not end the process out from under the
+		// others. See g_liveFrameCount's comment.
+		if (--g_liveFrameCount <= 0) PostQuitMessage(0);
 		return 0;
+	case WM_NCDESTROY:
+		// The very last message this HWND ever receives -- safe to free
+		// `self` now (every FrameWindow is heap-allocated and self-owning;
+		// see SpawnNewWindow's comment). Must not touch `self` afterward.
+		delete self;
+		return DefWindowProcW(hwnd, msg, wp, lp);
 	}
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -6116,6 +7036,20 @@ void OfferSetAsDefault(HWND owner)
 
 } // namespace
 
+// Used by "drag a tab out of the strip" and the tab context menu's "Open in
+// New Window" -- the window class is already registered and common controls
+// already initialized by the time either of those can happen (both require
+// an existing window with an open document), so this just repeats the
+// window-creation half of RunViewer() without any of the once-per-process
+// setup (single-instance mutex, Start Menu shortcut, update check).
+FrameWindow* SpawnNewWindow(HINSTANCE hInst, const std::vector<std::wstring>& paths)
+{
+	FrameWindow* fw = new FrameWindow(hInst);
+	if (!fw->create(SW_SHOWNORMAL, /*checkForUpdates=*/false)) { delete fw; return nullptr; }
+	for (const auto& path : paths) if (!path.empty()) fw->openDocument(path.c_str());
+	return fw;
+}
+
 // ===========================================================================
 // Entry
 // ===========================================================================
@@ -6164,8 +7098,12 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 	wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
 	RegisterClassW(&wc);
 
-	auto frame = std::make_unique<FrameWindow>(hInstance);
-	if (!frame->create(nCmdShow)) return 1;
+	// Heap-allocated and self-deleting (see g_liveFrameCount's comment) --
+	// not owned by a smart pointer here, since additional windows can be
+	// spawned later (SpawnNewWindow) that must outlive this function's stack
+	// frame the same way this first one does.
+	FrameWindow* frame = new FrameWindow(hInstance);
+	if (!frame->create(nCmdShow)) { delete frame; return 1; }
 
 	if (optionalPath && *optionalPath) frame->openDocument(optionalPath);
 
@@ -6182,22 +7120,31 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 
 	HACCEL accel = LoadAcceleratorsW(hInstance, MAKEINTRESOURCEW(IDR_ACCEL));
 
-	HWND frameHwnd = frame->hwnd();
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0)) {
-		// Ctrl+C is also in our accelerator table (to copy selected PDF page
-		// text), but native EDIT controls (search box, inline annotation/
-		// form-field editors) already handle Ctrl+C themselves. If one of
-		// those has focus, let the keystroke fall through to it untranslated
-		// instead of hijacking it into our page-text-copy command.
+		// Ctrl+C and Ctrl+A are also in our accelerator table (copy/select-all
+		// for PDF page text), but native EDIT controls (search box, inline
+		// annotation/form-field editors, page-jump box, ...) need to handle
+		// those themselves -- e.g. Ctrl+A in the Find box must select that
+		// box's text, not the whole PDF page. TranslateAcceleratorW runs
+		// before the keystroke would ever reach the focused control's own
+		// WM_KEYDOWN handler, so if one of those has focus, skip translation
+		// entirely and let it fall through untranslated instead of hijacking
+		// the keystroke into our page-text command.
 		bool skipAccel = false;
-		if (msg.message == WM_KEYDOWN && msg.wParam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+		if (msg.message == WM_KEYDOWN && (msg.wParam == 'C' || msg.wParam == 'A') &&
+			(GetKeyState(VK_CONTROL) & 0x8000)) {
 			wchar_t cls[32] = {};
 			HWND focused = GetFocus();
 			if (focused && GetClassNameW(focused, cls, 32) && _wcsicmp(cls, L"Edit") == 0)
 				skipAccel = true;
 		}
-		if (skipAccel || !TranslateAcceleratorW(frameHwnd, accel, &msg)) {
+		// Accelerators must be translated against whichever top-level
+		// FrameWindow is actually active, not always the first one created --
+		// dragging a tab out / "Open in New Window" means more than one can
+		// now exist on this same thread's message queue.
+		HWND active = GetActiveWindow();
+		if (skipAccel || !active || !TranslateAcceleratorW(active, accel, &msg)) {
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
 		}
