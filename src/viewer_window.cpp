@@ -975,8 +975,9 @@ private:
 	static LRESULT CALLBACK SplitEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK SetPwdEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK WebPdfEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
-	void jumpToPageEditValue();
 	void updatePageEditBox();
+	void beginPageNumberEdit();          // creates the transient page-number EDIT control and focuses it
+	void endPageNumberEdit(bool commit); // destroys it, optionally jumping to the typed page first
 	void selectTool(int id);
 	void chooseColor();
 	int popupUnderButton(int buttonId, HMENU menu);
@@ -1220,20 +1221,29 @@ private:
 	// demand via TTN_GETDISPINFOW sidesteps it entirely.
 	std::unordered_map<int, std::wstring> toolbarTips_;
 
-	// Page-number jump box (top-right of the tab strip row), like Edge's.
-	HWND pageEdit_ = nullptr;
-	HWND pageOfLabel_ = nullptr;
+	// Zoom-%/page-number readouts: plain text the toolbar's own NM_CUSTOMDRAW
+	// draws directly onto the IDM_VIEW_ZOOMLABEL/IDM_VIEW_PAGELABEL
+	// placeholder buttons' reserved rects (see the CDDS_ITEMPREPAINT case) --
+	// NOT a STATIC control overlaid on top of them like an earlier version of
+	// this. That overlay-window approach had a real, confirmed-in-practice
+	// bug: the toolbar's own hover/hot-tracking repaint of the button
+	// underneath would win a race against the overlay window's own repaint,
+	// leaving it visibly blank for as long as it stayed hovered (multiple
+	// attempts at clipping/re-asserting the overlay never fully closed the
+	// race). Plain owner-drawn text has no second competing window, so
+	// there's no race at all -- the same technique the status bar already
+	// uses successfully for this exact same content.
+	std::wstring zoomText_ = L"100%";
+	std::wstring pageLabelText_;
+	// Page-number jump box: normally just the plain text above, like the
+	// zoom readout. Clicking it creates this real EDIT control on demand,
+	// positioned over the reserved rect and focused for typing (same
+	// create-when-needed philosophy as this app's inline annotation/form
+	// editing elsewhere) -- destroyed again on Enter/Escape/focus-loss, so
+	// it only exists, and only competes for those pixels, for the few
+	// seconds the user is actually typing a page number.
+	HWND pageEditActive_ = nullptr;
 	HFONT uiFont_ = nullptr;
-
-	// Zoom-% readout: a real STATIC control overlaid on top of the
-	// IDM_VIEW_ZOOMLABEL toolbar button's reserved space (see updateZoomLabel
-	// and layout) rather than that button's own BTNS_SHOWTEXT caption --
-	// which, empirically, never renders once the toolbar has an NM_CUSTOMDRAW
-	// handler attached (an undocumented comctl32 interaction; confirmed by
-	// testing several fixes that didn't help). The button still exists
-	// underneath purely to reserve width and forward IDM_VIEW_ZOOMLABEL's
-	// click handling if this label is ever missed.
-	HWND zoomLabel_ = nullptr;
 };
 
 // ===========================================================================
@@ -2158,6 +2168,18 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 	int lo = std::min(selAnchorIdx_, selFocusIdx_);
 	int hi = std::max(selAnchorIdx_, selFocusIdx_);
 	float sc = effScale();
+	// Merge consecutive characters on the same line into one filled rect,
+	// instead of alpha-blending each glyph's own quad separately -- doing it
+	// per-glyph double-blends the shared edges between adjacent quads
+	// (rounding in the float->pixel cast rarely lines them up exactly),
+	// giving the highlight a seamed/"wired" look instead of one smooth band
+	// like every other text-selection UI draws.
+	bool haveRun = false;
+	RECT run{};
+	auto flush = [&]() {
+		if (haveRun) FillAlpha(dc, run, RGB(60, 120, 220), 90);
+		haveRun = false;
+	};
 	for (int i = lo; i <= hi && i < static_cast<int>(selChars_.size()); ++i) {
 		const auto& q = selChars_[i].quad;
 		RECT r;
@@ -2165,8 +2187,16 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 		r.top = pageY + static_cast<int>(q.y0 * sc);
 		r.right = pageX + static_cast<int>(q.x1 * sc);
 		r.bottom = pageY + static_cast<int>(q.y1 * sc);
-		FillAlpha(dc, r, RGB(60, 120, 220), 90);
+		if (!haveRun) { run = r; haveRun = true; }
+		else {
+			run.left = std::min(run.left, r.left);
+			run.top = std::min(run.top, r.top);
+			run.right = std::max(run.right, r.right);
+			run.bottom = std::max(run.bottom, r.bottom);
+		}
+		if (selChars_[i].lineBreakAfter || selChars_[i].paragraphBreakAfter) flush();
 	}
+	flush();
 }
 
 HCURSOR CanvasView::cursorForSelectAt(int mx, int my)
@@ -2236,9 +2266,21 @@ void CanvasView::copySelectionToClipboard()
 		} else {
 			text.push_back(static_cast<wchar_t>(c.unicode));
 		}
+		// Never emit a trailing break after the LAST selected character --
+		// triple-click (select line) lands exactly on a lineBreakAfter char,
+		// so without this guard every line-selection copy carried an invisible
+		// trailing blank line, which pasted into Word as an extra Enter.
+		if (i == hi) continue;
 		if (c.paragraphBreakAfter) text += L"\r\n\r\n";
 		else if (c.lineBreakAfter) text += L"\r\n";
 	}
+	// MuPDF's text extraction can include a real/synthesized trailing space
+	// at the end of a line (a word-gap heuristic, or an actual space glyph
+	// before the line wraps) -- invisible when followed by a newline, but
+	// triple-click (select line) has no newline after it anymore (see the
+	// guard above), so that trailing space pasted as a visible stray
+	// character with nothing after it to hide it. Trim it.
+	while (!text.empty() && (text.back() == L' ' || text.back() == L'\t')) text.pop_back();
 	if (text.empty()) return;
 	if (!OpenClipboard(hwnd_)) return;
 	EmptyClipboard();
@@ -4293,8 +4335,13 @@ void FrameWindow::createChildren()
 	// control a real width via MoveWindow) collapsed it to 0 height -- giving
 	// it a real width first, THEN calling TB_AUTOSIZE (see layout()), avoids
 	// that.
+	// WS_CLIPSIBLINGS: the page-number box's transient EDIT control
+	// (pageEditActive_, created only while actively typing -- see its
+	// comment) is a real overlapping sibling while it exists; this keeps the
+	// toolbar's own hover/hot-tracking repaint of the button underneath
+	// clipped around it instead of painting straight over it.
 	toolbar_ = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
-		WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE |
+		WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE |
 		CCS_NODIVIDER | CCS_NOPARENTALIGN | CCS_NORESIZE,
 		0, 0, 0, 0, hwnd_, nullptr, hInst_, nullptr);
 	SendMessageW(toolbar_, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
@@ -4386,18 +4433,19 @@ void FrameWindow::createChildren()
 	sep();
 	btn(IDM_VIEW_ZOOMOUT, iZoomOut, L"Zoom Out");
 	// "1200%" (not "100%") purely to reserve enough width for the widest
-	// realistic zoom value (kMaxZoom = 1200%) -- zoomLabel_ (a real STATIC
-	// control layered on top, see its declaration) is what actually renders
-	// the current value; this button's own caption is never shown.
+	// realistic zoom value (kMaxZoom = 1200%) -- this button's own
+	// BTNS_SHOWTEXT caption is never actually shown (see the file's own
+	// notes on that comctl32 quirk); zoomText_ is drawn directly onto this
+	// reserved rect by CDDS_ITEMPREPAINT instead.
 	textBtn(IDM_VIEW_ZOOMLABEL, L"1200%");
 	btn(IDM_VIEW_ZOOMIN, iZoomIn, L"Zoom In");
 	btn(IDM_VIEW_FITWIDTH, iFitWidth, L"Fit Width");
 	btn(IDM_VIEW_FITPAGE, iFitPage, L"Fit Page");
 	sep();
 	// "9999 of 9999" purely to reserve enough width for a realistically huge
-	// page count -- pageEdit_/pageOfLabel_ (real EDIT/STATIC controls layered
-	// on top, see their layout() positioning) are what actually render this;
-	// this button's own caption is never shown. Moved here from the tab-strip
+	// page count -- pageLabelText_ is drawn directly onto this reserved rect
+	// by CDDS_ITEMPREPAINT; clicking it creates the transient pageEditActive_
+	// EDIT control (see beginPageNumberEdit()). Moved here from the tab-strip
 	// row per user request, to sit inline in the toolbar like Edge's.
 	textBtn(IDM_VIEW_PAGELABEL, L"9999 of 9999");
 	sep();
@@ -4603,26 +4651,9 @@ void FrameWindow::createChildren()
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 	organizeBarH_ = Scale(34, GetDpiForWindow(hwnd_));
 
-	// Page-number jump box, top-right of the tab strip row (like Edge's).
-	// A flat themed border (WS_BORDER + SetWindowTheme "Explorer") instead
-	// of the classic sunken WS_EX_CLIENTEDGE look, to match the flat modern
-	// chrome everywhere else.
-	pageEdit_ = CreateWindowExW(0, L"EDIT", L"",
-		WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_CENTER | ES_NUMBER,
-		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_PAGE_EDIT), hInst_, nullptr);
-	SetWindowTheme(pageEdit_, L"Explorer", nullptr);
-	pageOfLabel_ = CreateWindowExW(0, L"STATIC", L"of 0",
-		WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, hwnd_, nullptr, hInst_, nullptr);
-	SendMessageW(pageEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
-	SendMessageW(pageOfLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
-	SetWindowSubclass(pageEdit_, PageEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
-
-	// Zoom-% readout -- see zoomLabel_'s comment for why this is a real
-	// control layered over the toolbar instead of that button's own caption.
-	zoomLabel_ = CreateWindowExW(0, L"STATIC", L"100%",
-		WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY,
-		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDM_VIEW_ZOOMLABEL), hInst_, nullptr);
-	SendMessageW(zoomLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+	// Zoom-%/page-number readouts are now plain owner-drawn text (see
+	// zoomText_'s comment) -- no permanent child windows to create here.
+	// pageEditActive_ is created on demand by beginPageNumberEdit().
 
 	// Start with a single empty tab -- Open/drag-drop reuses it (browser-
 	// style: an empty tab gets reused, a non-empty one doesn't).
@@ -5357,48 +5388,84 @@ LRESULT CALLBACK FrameWindow::PageEditSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 {
 	auto* self = reinterpret_cast<FrameWindow*>(ref);
 	if (msg == WM_KEYDOWN && wp == VK_RETURN) {
-		self->jumpToPageEditValue();
-		if (self->canvas_) SetFocus(self->canvas_->hwnd());
+		self->endPageNumberEdit(true);
+		return 0;
+	}
+	if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
+		self->endPageNumberEdit(false);
 		return 0;
 	}
 	if (msg == WM_KEYDOWN && ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
 	if (msg == WM_KEYDOWN && ConsumeCtrlSelectAll(hwnd, wp)) return 0;
-	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x7F)) return 0; // swallow beep
+	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
 	if (msg == WM_KILLFOCUS) {
-		// No Enter pressed -- snap the box back to the actual current page
-		// instead of leaving a half-typed/invalid number showing.
-		self->updatePageEditBox();
+		// No Enter pressed -- discard the half-typed value; endPageNumberEdit
+		// destroys the box and reverts to the plain owner-drawn "N of M" text.
+		self->endPageNumberEdit(false);
 	}
 	return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
-void FrameWindow::jumpToPageEditValue()
+// Creates the transient page-number EDIT control over the toolbar's reserved
+// IDM_VIEW_PAGELABEL rect and focuses it -- see pageEditActive_'s comment on
+// why this is created on demand instead of permanently overlaid.
+void FrameWindow::beginPageNumberEdit()
 {
-	if (!canvas_ || !doc_ || !doc_->isOpen()) return;
-	wchar_t buf[16] = {};
-	GetWindowTextW(pageEdit_, buf, 16);
-	int n = _wtoi(buf);
-	if (n >= 1 && n <= doc_->pageCount())
-		canvas_->goToPage(n - 1);
-	updatePageEditBox(); // reflect the clamped/actual page either way
+	if (pageEditActive_ || !canvas_ || !doc_ || !doc_->isOpen() || !toolbar_) return;
+	RECT pr = {};
+	if (!SendMessageW(toolbar_, TB_GETRECT, IDM_VIEW_PAGELABEL, reinterpret_cast<LPARAM>(&pr))) return;
+	MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&pr), 2);
+	UINT dpi = GetDpiForWindow(hwnd_);
+	int totalW = pr.right - pr.left;
+	int editW = std::max(Scale(30, dpi), totalW * 4 / 10);
+	int editH = Scale(22, dpi);
+	int py = pr.top + ((pr.bottom - pr.top) - editH) / 2;
+	// Flat themed border (WS_BORDER + SetWindowTheme "Explorer") instead of
+	// the classic sunken WS_EX_CLIENTEDGE look, to match the flat modern
+	// chrome everywhere else.
+	pageEditActive_ = CreateWindowExW(0, L"EDIT", L"",
+		WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_CENTER | ES_NUMBER,
+		pr.left, py, editW, editH, hwnd_, reinterpret_cast<HMENU>(IDC_PAGE_EDIT), hInst_, nullptr);
+	if (!pageEditActive_) return;
+	SetWindowTheme(pageEditActive_, L"Explorer", nullptr);
+	HFONT f = uiFont_ ? uiFont_ : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+	SendMessageW(pageEditActive_, WM_SETFONT, reinterpret_cast<WPARAM>(f), TRUE);
+	SetWindowSubclass(pageEditActive_, PageEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+	wchar_t buf[16];
+	swprintf(buf, 16, L"%d", canvas_->currentPage() + 1);
+	SetWindowTextW(pageEditActive_, buf);
+	SetFocus(pageEditActive_);
+	SendMessageW(pageEditActive_, EM_SETSEL, 0, -1);
+}
+
+// Destroys the transient page-number EDIT control, optionally jumping to the
+// typed value first (Enter), or just discarding it (Escape/focus-loss).
+void FrameWindow::endPageNumberEdit(bool commit)
+{
+	if (!pageEditActive_) return;
+	if (commit && canvas_ && doc_ && doc_->isOpen()) {
+		wchar_t buf[16] = {};
+		GetWindowTextW(pageEditActive_, buf, 16);
+		int n = _wtoi(buf);
+		if (n >= 1 && n <= doc_->pageCount()) canvas_->goToPage(n - 1);
+	}
+	HWND old = pageEditActive_;
+	pageEditActive_ = nullptr;
+	DestroyWindow(old);
+	updatePageEditBox(); // refresh pageLabelText_ to the (possibly just-jumped) current page
+	if (canvas_) SetFocus(canvas_->hwnd());
 }
 
 void FrameWindow::updatePageEditBox()
 {
-	if (!pageEdit_) return;
 	if (!doc_ || !doc_->isOpen()) {
-		SetWindowTextW(pageEdit_, L"");
-		SetWindowTextW(pageOfLabel_, L"of 0");
-		EnableWindow(pageEdit_, FALSE);
-		return;
+		pageLabelText_.clear();
+	} else {
+		wchar_t buf[40];
+		swprintf(buf, 40, L"%d of %d", canvas_->currentPage() + 1, doc_->pageCount());
+		pageLabelText_ = buf;
 	}
-	EnableWindow(pageEdit_, TRUE);
-	wchar_t buf[16];
-	swprintf(buf, 16, L"%d", canvas_->currentPage() + 1);
-	SetWindowTextW(pageEdit_, buf);
-	wchar_t buf2[24];
-	swprintf(buf2, 24, L"of %d", doc_->pageCount());
-	SetWindowTextW(pageOfLabel_, buf2);
+	if (toolbar_) InvalidateRect(toolbar_, nullptr, FALSE);
 }
 
 void FrameWindow::layout()
@@ -5428,31 +5495,20 @@ void FrameWindow::layout()
 	// up exactly (matters if WRAPABLE ever kicks in and grows past one row).
 	MoveWindow(toolbar_, 0, tabStripH, fullW, tbH, TRUE);
 
-	// Position the zoom-% label over its toolbar button's reserved rect.
-	if (zoomLabel_) {
-		RECT zr = {};
-		if (SendMessageW(toolbar_, TB_GETRECT, IDM_VIEW_ZOOMLABEL, reinterpret_cast<LPARAM>(&zr))) {
-			MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&zr), 2);
-			MoveWindow(zoomLabel_, zr.left, zr.top, zr.right - zr.left, zr.bottom - zr.top, TRUE);
-		}
-	}
-
-	// Page-number jump box: same overlay-a-real-control technique as
-	// zoomLabel_, now inline in the toolbar (moved off the tab-strip row per
-	// user request, to match Edge's placement). Splits the reserved rect
-	// unevenly between the edit box and the "of N" label, same ~44/56 ratio
-	// the tab-strip-row version used.
-	if (pageEdit_ && pageOfLabel_) {
+	// The zoom-%/page-number readouts are plain owner-drawn text now (see
+	// zoomText_'s comment) -- nothing to position here. If the transient
+	// page-number EDIT control happens to be up during a resize, keep it
+	// aligned with its reserved rect using the same math beginPageNumberEdit()
+	// used to create it.
+	if (pageEditActive_) {
 		RECT pr = {};
 		if (SendMessageW(toolbar_, TB_GETRECT, IDM_VIEW_PAGELABEL, reinterpret_cast<LPARAM>(&pr))) {
 			MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&pr), 2);
 			int totalW = pr.right - pr.left;
 			int editW = std::max(Scale(30, dpi), totalW * 4 / 10);
-			int ofW = std::max(0, totalW - editW);
 			int editH = Scale(22, dpi);
 			int py = pr.top + ((pr.bottom - pr.top) - editH) / 2;
-			MoveWindow(pageEdit_, pr.left, py, editW, editH, TRUE);
-			MoveWindow(pageOfLabel_, pr.left + editW, py, ofW, editH, TRUE);
+			MoveWindow(pageEditActive_, pr.left, py, editW, editH, TRUE);
 		}
 	}
 
@@ -6261,10 +6317,11 @@ void FrameWindow::toggleThumbs()
 
 void FrameWindow::updateZoomLabel()
 {
-	if (!zoomLabel_ || !canvas_) return;
+	if (!canvas_) return;
 	wchar_t buf[16];
 	swprintf(buf, 16, L"%d%%", static_cast<int>(std::lround(canvas_->zoom() * 100)));
-	SetWindowTextW(zoomLabel_, buf);
+	zoomText_ = buf;
+	if (toolbar_) InvalidateRect(toolbar_, nullptr, FALSE);
 }
 
 void FrameWindow::syncMenuChecks()
@@ -6379,7 +6436,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_FILE_SAVEAS: saveDocument(true); break;
 	case IDM_VIEW_ZOOMIN: canvas_->zoomIn(); break;
 	case IDM_VIEW_ZOOMLABEL: canvas_->actualSize(); break;
-	case IDM_VIEW_PAGELABEL: if (pageEdit_) SetFocus(pageEdit_); break; // underlying button forwards a click that missed the edit box overlay
+	case IDM_VIEW_PAGELABEL: beginPageNumberEdit(); break;
 	case IDM_VIEW_ZOOMOUT: canvas_->zoomOut(); break;
 	case IDM_VIEW_ACTUALSIZE: canvas_->actualSize(); break;
 	case IDM_VIEW_FITWIDTH: canvas_->setFit(CanvasView::Fit::Width); break;
@@ -6720,7 +6777,23 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			// toolbarTips_), so serve the text on demand here. idFrom is the
 			// button's command id for a toolbar-owned tooltip.
 			auto* di = reinterpret_cast<NMTTDISPINFOW*>(lp);
-			auto it = self->toolbarTips_.find(static_cast<int>(nm->idFrom));
+			int ttId = static_cast<int>(nm->idFrom);
+			// The zoom-%/page-number placeholders are a live, constantly-
+			// relevant readout, not a button that needs an explanatory
+			// tooltip -- and critically, THIS was the actual root cause of
+			// the "readout disappears while hovered" bug several rounds of
+			// paint/z-order fixes elsewhere failed to resolve: these two IDs
+			// were never in toolbarTips_, so lpszText was left as whatever
+			// stale/garbage value happened to already be in this reused
+			// NMTTDISPINFOW struct, and the tooltip control showed it anyway
+			// -- an (often blank-looking) popup sitting right over the
+			// readout for as long as the tooltip stayed up. An explicit
+			// empty string suppresses the tooltip outright instead.
+			if (ttId == IDM_VIEW_ZOOMLABEL || ttId == IDM_VIEW_PAGELABEL) {
+				di->lpszText = const_cast<LPWSTR>(L"");
+				return 0;
+			}
+			auto it = self->toolbarTips_.find(ttId);
 			if (it != self->toolbarTips_.end())
 				di->lpszText = const_cast<LPWSTR>(it->second.c_str());
 			return 0;
@@ -6739,6 +6812,19 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			switch (cd->nmcd.dwDrawStage) {
 			case CDDS_PREPAINT: {
 				RECT rc; GetClientRect(self->toolbar_, &rc);
+				// pageEditActive_ (see its comment) is the one remaining real
+				// sibling window that can overlap this toolbar, and only
+				// while the user is actively typing a page number. Excluding
+				// its current rect from this DC's clip region keeps this
+				// PREPAINT fill (which covers the toolbar's FULL client rect
+				// on every redraw, including one triggered by hovering some
+				// unrelated button) from ever painting over it, on top of the
+				// WS_CLIPSIBLINGS style already set on the toolbar itself.
+				if (self->pageEditActive_) {
+					RECT wr; GetWindowRect(self->pageEditActive_, &wr);
+					MapWindowPoints(HWND_DESKTOP, self->toolbar_, reinterpret_cast<POINT*>(&wr), 2);
+					ExcludeClipRect(cd->nmcd.hdc, wr.left, wr.top, wr.right, wr.bottom);
+				}
 				HBRUSH bg = CreateSolidBrush(th.toolbarBg);
 				FillRect(cd->nmcd.hdc, &rc, bg);
 				DeleteObject(bg);
@@ -6746,7 +6832,19 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				// procedure's RETURN value -- DWLP_MSGRESULT is a dialog-proc
 				// mechanism and is ignored here. (Returning it wrong is why an
 				// earlier attempt's per-item drawing never ran.)
-				return CDRF_NOTIFYITEMDRAW;
+				// CDRF_NOTIFYPOSTPAINT requests a CDDS_POSTPAINT callback once
+				// this whole paint cycle finishes -- belt-and-suspenders on top
+				// of the clip-exclusion above: force pageEditActive_ to repaint
+				// itself right after, so it can never be left looking erased
+				// for longer than one frame while it's up.
+				return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+			}
+			case CDDS_POSTPAINT: {
+				if (self->pageEditActive_) {
+					InvalidateRect(self->pageEditActive_, nullptr, FALSE);
+					UpdateWindow(self->pageEditActive_);
+				}
+				return CDRF_DODEFAULT;
 			}
 			case CDDS_ITEMPREPAINT: {
 				// Fluent-style state layer: a soft rounded "pill" behind the
@@ -6758,6 +6856,38 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				// Separators (and anything we can't resolve) fall through to
 				// the default drawing, which renders them on the white bg.
 				UINT id = static_cast<UINT>(cd->nmcd.dwItemSpec);
+				// The zoom-%/page-number buttons are pure width-reserving
+				// placeholders (see textBtn() call sites) -- draw their text
+				// directly here instead of showing/hiding a pill (there's
+				// nothing to hover-highlight, they're a plain readout, not an
+				// action button -- clicking them is handled via onCommand()
+				// same as any other button, no visual press state needed).
+				// This used to be a real STATIC/EDIT control permanently
+				// overlaid on top of this exact rect, which had a confirmed
+				// bug: this toolbar's own hover repaint would race the
+				// overlay's own repaint and could leave it blank for as long
+				// as it stayed hovered. Owner-drawing the text directly here,
+				// in the SAME window that would otherwise paint over it,
+				// removes the race entirely -- there's no second window to
+				// race against, exactly like the status bar's own page/zoom
+				// text never had this problem.
+				if (id == IDM_VIEW_ZOOMLABEL || id == IDM_VIEW_PAGELABEL) {
+					// While pageEditActive_ is up, it already covers this
+					// exact rect (see beginPageNumberEdit()) -- skip drawing
+					// text underneath it.
+					if (id == IDM_VIEW_PAGELABEL && self->pageEditActive_) return CDRF_SKIPDEFAULT;
+					const std::wstring& text = (id == IDM_VIEW_ZOOMLABEL) ? self->zoomText_ : self->pageLabelText_;
+					if (!text.empty()) {
+						RECT r = cd->nmcd.rc;
+						SetBkMode(cd->nmcd.hdc, TRANSPARENT);
+						SetTextColor(cd->nmcd.hdc, th.ctrlText);
+						HFONT old = self->uiFont_
+							? static_cast<HFONT>(SelectObject(cd->nmcd.hdc, self->uiFont_)) : nullptr;
+						DrawTextW(cd->nmcd.hdc, text.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+						if (old) SelectObject(cd->nmcd.hdc, old);
+					}
+					return CDRF_SKIPDEFAULT;
+				}
 				TBBUTTONINFOW bi = {};
 				bi.cbSize = sizeof(bi);
 				bi.dwMask = TBIF_IMAGE | TBIF_STYLE;
