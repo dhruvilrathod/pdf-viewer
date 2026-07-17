@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -156,7 +157,13 @@ void installSystemFontHook(fz_context* ctx)
 }
 
 // Build a 32-bit top-down BGRA DIB section from an RGB (3-component) pixmap.
-HBITMAP pixmapToDIB(fz_context* ctx, fz_pixmap* pix, int& outW, int& outH)
+// If targetW/targetH are given (and differ from the pixmap's own size), the
+// source is box-filtered down to that size instead of copied 1:1 -- each
+// destination pixel averages the rectangle of source pixels that map onto
+// it, so partially-covered/anti-aliased glyph edges from a higher-resolution
+// source blend into smoother, denser-looking output instead of each output
+// pixel only sampling a single (possibly barely-covered) source pixel.
+HBITMAP pixmapToDIB(fz_context* ctx, fz_pixmap* pix, int& outW, int& outH, int targetW = 0, int targetH = 0)
 {
 	int w = fz_pixmap_width(ctx, pix);
 	int h = fz_pixmap_height(ctx, pix);
@@ -165,10 +172,13 @@ HBITMAP pixmapToDIB(fz_context* ctx, fz_pixmap* pix, int& outW, int& outH)
 	const unsigned char* src = fz_pixmap_samples(ctx, pix);
 	if (w <= 0 || h <= 0 || n < 3) return nullptr;
 
+	int dstW = (targetW > 0) ? targetW : w;
+	int dstH = (targetH > 0) ? targetH : h;
+
 	BITMAPINFO bmi = {};
 	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = w;
-	bmi.bmiHeader.biHeight = -h; // negative => top-down
+	bmi.bmiHeader.biWidth = dstW;
+	bmi.bmiHeader.biHeight = -dstH; // negative => top-down
 	bmi.bmiHeader.biPlanes = 1;
 	bmi.bmiHeader.biBitCount = 32;
 	bmi.bmiHeader.biCompression = BI_RGB;
@@ -178,19 +188,50 @@ HBITMAP pixmapToDIB(fz_context* ctx, fz_pixmap* pix, int& outW, int& outH)
 	if (!hbmp || !bits) { if (hbmp) DeleteObject(hbmp); return nullptr; }
 
 	auto* dst = static_cast<unsigned char*>(bits);
-	for (int y = 0; y < h; ++y) {
-		const unsigned char* srow = src + static_cast<ptrdiff_t>(y) * stride;
-		unsigned char* drow = dst + static_cast<ptrdiff_t>(y) * w * 4;
-		for (int x = 0; x < w; ++x) {
-			const unsigned char* sp = srow + static_cast<ptrdiff_t>(x) * n;
-			unsigned char* dp = drow + static_cast<ptrdiff_t>(x) * 4;
-			dp[0] = sp[2]; // B
-			dp[1] = sp[1]; // G
-			dp[2] = sp[0]; // R
-			dp[3] = 255;   // A (opaque)
+	if (dstW == w && dstH == h) {
+		for (int y = 0; y < h; ++y) {
+			const unsigned char* srow = src + static_cast<ptrdiff_t>(y) * stride;
+			unsigned char* drow = dst + static_cast<ptrdiff_t>(y) * w * 4;
+			for (int x = 0; x < w; ++x) {
+				const unsigned char* sp = srow + static_cast<ptrdiff_t>(x) * n;
+				unsigned char* dp = drow + static_cast<ptrdiff_t>(x) * 4;
+				dp[0] = sp[2]; // B
+				dp[1] = sp[1]; // G
+				dp[2] = sp[0]; // R
+				dp[3] = 255;   // A (opaque)
+			}
+		}
+	} else {
+		for (int dy = 0; dy < dstH; ++dy) {
+			int sy0 = static_cast<int>(static_cast<int64_t>(dy) * h / dstH);
+			int sy1 = static_cast<int>(static_cast<int64_t>(dy + 1) * h / dstH);
+			if (sy1 <= sy0) sy1 = sy0 + 1;
+			if (sy1 > h) sy1 = h;
+			unsigned char* drow = dst + static_cast<ptrdiff_t>(dy) * dstW * 4;
+			for (int dx = 0; dx < dstW; ++dx) {
+				int sx0 = static_cast<int>(static_cast<int64_t>(dx) * w / dstW);
+				int sx1 = static_cast<int>(static_cast<int64_t>(dx + 1) * w / dstW);
+				if (sx1 <= sx0) sx1 = sx0 + 1;
+				if (sx1 > w) sx1 = w;
+				unsigned int sr = 0, sg = 0, sb = 0, count = 0;
+				for (int sy = sy0; sy < sy1; ++sy) {
+					const unsigned char* srow = src + static_cast<ptrdiff_t>(sy) * stride;
+					for (int sx = sx0; sx < sx1; ++sx) {
+						const unsigned char* sp = srow + static_cast<ptrdiff_t>(sx) * n;
+						sr += sp[0]; sg += sp[1]; sb += sp[2];
+						++count;
+					}
+				}
+				if (count == 0) count = 1;
+				unsigned char* dp = drow + static_cast<ptrdiff_t>(dx) * 4;
+				dp[0] = static_cast<unsigned char>(sb / count); // B
+				dp[1] = static_cast<unsigned char>(sg / count); // G
+				dp[2] = static_cast<unsigned char>(sr / count); // R
+				dp[3] = 255;                                    // A (opaque)
+			}
 		}
 	}
-	outW = w; outH = h;
+	outW = dstW; outH = dstH;
 	return hbmp;
 }
 
@@ -396,15 +437,55 @@ PageBitmap PdfDocument::renderPage(int index, float scale)
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	fz_page* page = nullptr;
 	fz_pixmap* pix = nullptr;
+	fz_device* dev = nullptr;
 	fz_try(ctx_) {
 		page = fz_load_page(ctx_, doc_, index);
-		fz_matrix ctm = fz_scale(scale, scale);
-		pix = fz_new_pixmap_from_page(ctx_, page, ctm, fz_device_rgb(ctx_), 0);
-		int w = 0, h = 0;
-		HBITMAP hbmp = pixmapToDIB(ctx_, pix, w, h);
-		if (hbmp) { result.hbmp = hbmp; result.width = w; result.height = h; }
+
+		// Target (final) pixel box -- exactly what a direct render at `scale`
+		// produces (fz_new_pixmap_from_page uses this same round_rect, see
+		// util.c) and the size the on-screen layout (pagePixelSize) expects.
+		fz_irect targetBox = fz_round_rect(fz_transform_rect(fz_bound_page(ctx_, page), fz_scale(scale, scale)));
+		int targetW = std::max(1, targetBox.x1 - targetBox.x0);
+		int targetH = std::max(1, targetBox.y1 - targetBox.y0);
+
+		if (scale < 1.5f) {
+			// Below 150% zoom, rasterizing straight at `scale` leaves thin
+			// glyph stems only partially covering a single output pixel --
+			// grainy/washed-out next to Chrome, especially on bold text.
+			// Supersample at 2x, then box-filter back down to the target size
+			// (pixmapToDIB) for extra effective anti-aliasing.
+			//
+			// The supersampled pixmap MUST be EXACTLY 2x the target box in each
+			// axis, so every output pixel averages a uniform 2x2 source block.
+			// Letting MuPDF round a `scale*2` matrix into its own bbox gives a
+			// non-integer size ratio, so different glyph stems land on 2- vs
+			// 3-pixel averaging boxes -- which shows up as visibly uneven
+			// per-letter boldness (a real bug this exact-2x construction fixes).
+			// Otherwise this mirrors fz_new_pixmap_from_page (util.c) exactly:
+			// the ctm goes to the draw device, the page runs with fz_identity,
+			// opaque pixmap => white clear.
+			fz_irect ssBox = { targetBox.x0 * 2, targetBox.y0 * 2, targetBox.x1 * 2, targetBox.y1 * 2 };
+			fz_matrix ctm = fz_scale(scale * 2.0f, scale * 2.0f);
+			pix = fz_new_pixmap_with_bbox(ctx_, fz_device_rgb(ctx_), ssBox, nullptr, 0);
+			fz_clear_pixmap_with_value(ctx_, pix, 0xFF);
+			dev = fz_new_draw_device(ctx_, ctm, pix);
+			fz_run_page(ctx_, page, dev, fz_identity, nullptr);
+			fz_close_device(ctx_, dev);
+			int w = 0, h = 0;
+			HBITMAP hbmp = pixmapToDIB(ctx_, pix, w, h, targetW, targetH);
+			if (hbmp) { result.hbmp = hbmp; result.width = w; result.height = h; }
+		} else {
+			// At/above 150% zoom a glyph stem already spans several device
+			// pixels, so supersampling wouldn't help -- render straight.
+			fz_matrix ctm = fz_scale(scale, scale);
+			pix = fz_new_pixmap_from_page(ctx_, page, ctm, fz_device_rgb(ctx_), 0);
+			int w = 0, h = 0;
+			HBITMAP hbmp = pixmapToDIB(ctx_, pix, w, h);
+			if (hbmp) { result.hbmp = hbmp; result.width = w; result.height = h; }
+		}
 	}
 	fz_always(ctx_) {
+		if (dev) fz_drop_device(ctx_, dev);
 		if (pix) fz_drop_pixmap(ctx_, pix);
 		if (page) fz_drop_page(ctx_, page);
 	}

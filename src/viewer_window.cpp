@@ -1539,6 +1539,15 @@ void CanvasView::stepHit(int dir)
 void CanvasView::scrollToHit(int hitIdx)
 {
 	if (hitIdx < 0 || hitIdx >= static_cast<int>(hits_.size())) return;
+	// A direct jump overrides any in-flight smooth-scroll (see goToPage()) --
+	// without this, a scroll animation left running from a prior arrow-key/
+	// wheel scroll can tick again after this jump (or a zoom right after it)
+	// and overwrite scrollY_ with stale pre-jump coordinates, snapping the
+	// view to an unrelated page.
+	if (scrollAnimY_ || scrollAnimX_) {
+		scrollAnimY_ = scrollAnimX_ = false;
+		KillTimer(hwnd_, kScrollAnimTimerId);
+	}
 	const Hit& h = hits_[hitIdx];
 	if (mode_ == Mode::SinglePage) {
 		if (h.page != currentPage_) { currentPage_ = h.page; relayout(); }
@@ -2801,6 +2810,16 @@ void CanvasView::setZoom(float z)
 {
 	z = std::clamp(z, kMinZoom, kMaxZoom);
 	if (std::abs(z - zoom_) < 1e-4f) return;
+	// A direct scroll-position write below overrides any in-flight
+	// smooth-scroll (see goToPage()/scrollToHit()) -- otherwise a still-
+	// running animation timer (e.g. from a scroll or search jump just
+	// before this zoom) can tick again afterward and overwrite scrollY_
+	// with coordinates computed for the pre-zoom layout, jumping to an
+	// unrelated page.
+	if (scrollAnimY_ || scrollAnimX_) {
+		scrollAnimY_ = scrollAnimX_ = false;
+		KillTimer(hwnd_, kScrollAnimTimerId);
+	}
 	// preserve vertical center anchor
 	RECT rc; GetClientRect(hwnd_, &rc);
 	int ch = rc.bottom - rc.top;
@@ -2822,6 +2841,13 @@ void CanvasView::setZoomAnchored(float z, int anchorClientX, int anchorClientY)
 {
 	z = std::clamp(z, kMinZoom, kMaxZoom);
 	if (std::abs(z - zoom_) < 1e-4f) return;
+	// See setZoom()'s comment -- a stale in-flight smooth-scroll must not be
+	// left running across a zoom, or it can overwrite the freshly-computed
+	// scroll position a moment later and jump to an unrelated page.
+	if (scrollAnimY_ || scrollAnimX_) {
+		scrollAnimY_ = scrollAnimX_ = false;
+		KillTimer(hwnd_, kScrollAnimTimerId);
+	}
 	float fracX = canvasW_ > 0 ? (scrollX_ + anchorClientX) / static_cast<float>(canvasW_) : 0.0f;
 	float fracY = canvasH_ > 0 ? (scrollY_ + anchorClientY) / static_cast<float>(canvasH_) : 0.0f;
 	zoom_ = z;
@@ -6841,16 +6867,27 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				// NOTE: an earlier attempt also requested CDRF_NOTIFYPOSTPAINT
 				// here and, on receiving it, force-invalidated+UpdateWindow'd
 				// pageEditActive_ on every single toolbar paint cycle as a
-				// "belt and suspenders" measure against it being painted over.
-				// That turned out to be actively harmful instead: repeatedly
-				// forcing a synchronous repaint of a focused, actively-being-
-				// typed-into EDIT control (toolbar paint cycles fire often --
-				// any hover anywhere on the toolbar) left it rendering blank/
-				// stuck. The clip-region exclusion above is sufficient on its
-				// own (this is a real sibling window with WS_CLIPSIBLINGS
-				// already set on the toolbar); no need to also fight the
-				// control's own redraw timing.
-				return CDRF_NOTIFYITEMDRAW;
+				// "belt and suspenders" measure against it being painted over,
+				// then removed it after that broke live typing -- forcing a
+				// SYNCHRONOUS repaint (UpdateWindow) fought the control's own
+				// caret/redraw timing and left it rendering blank while typing.
+				// Reintroduced below in a narrower form: the clip-region
+				// exclusion above turns out NOT to be sufficient on its own --
+				// confirmed via a live repro that merely hovering the mouse
+				// over this reserved rect (without any click/typing) still
+				// blanks the edit box, on every OS/comctl32 build tested,
+				// which the exclusion alone should have prevented. Requesting
+				// CDRF_NOTIFYPOSTPAINT and doing an ASYNC-only
+				// InvalidateRect(..., FALSE) (no UpdateWindow) below reasserts
+				// the control after whatever painted over it, without forcing
+				// a synchronous repaint that could race live typing.
+				return self->pageEditActive_
+					? (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT)
+					: CDRF_NOTIFYITEMDRAW;
+			}
+			case CDDS_POSTPAINT: {
+				if (self->pageEditActive_) InvalidateRect(self->pageEditActive_, nullptr, FALSE);
+				return CDRF_DODEFAULT;
 			}
 			case CDDS_ITEMPREPAINT: {
 				// Fluent-style state layer: a soft rounded "pill" behind the
