@@ -224,6 +224,12 @@ constexpr float kMaxZoom = 12.0f;
 
 int Scale(int v, UINT dpi) { return MulDiv(v, static_cast<int>(dpi), 96); }
 
+// Width of the page-number edit box within the toolbar's reserved
+// IDM_VIEW_PAGELABEL rect (the rest shows "of N") -- shared by
+// beginPageNumberEdit(), layout(), and the CDDS_ITEMPREPAINT "of N" draw so
+// all three always agree on where the boundary is.
+int PageEditBoxWidth(int totalW, UINT dpi) { return std::max(Scale(30, dpi), totalW * 4 / 10); }
+
 // Ctrl+Backspace in a stock Win32 EDIT control does NOT delete the previous
 // word -- the keyboard layout translates it to the ASCII "DEL" control char
 // (0x7F), which the default edit proc just inserts as literal text, showing
@@ -5417,7 +5423,7 @@ void FrameWindow::beginPageNumberEdit()
 	MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&pr), 2);
 	UINT dpi = GetDpiForWindow(hwnd_);
 	int totalW = pr.right - pr.left;
-	int editW = std::max(Scale(30, dpi), totalW * 4 / 10);
+	int editW = PageEditBoxWidth(totalW, dpi);
 	int editH = Scale(22, dpi);
 	int py = pr.top + ((pr.bottom - pr.top) - editH) / 2;
 	// Flat themed border (WS_BORDER + SetWindowTheme "Explorer") instead of
@@ -5505,7 +5511,7 @@ void FrameWindow::layout()
 		if (SendMessageW(toolbar_, TB_GETRECT, IDM_VIEW_PAGELABEL, reinterpret_cast<LPARAM>(&pr))) {
 			MapWindowPoints(toolbar_, hwnd_, reinterpret_cast<POINT*>(&pr), 2);
 			int totalW = pr.right - pr.left;
-			int editW = std::max(Scale(30, dpi), totalW * 4 / 10);
+			int editW = PageEditBoxWidth(totalW, dpi);
 			int editH = Scale(22, dpi);
 			int py = pr.top + ((pr.bottom - pr.top) - editH) / 2;
 			MoveWindow(pageEditActive_, pr.left, py, editW, editH, TRUE);
@@ -6832,19 +6838,19 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				// procedure's RETURN value -- DWLP_MSGRESULT is a dialog-proc
 				// mechanism and is ignored here. (Returning it wrong is why an
 				// earlier attempt's per-item drawing never ran.)
-				// CDRF_NOTIFYPOSTPAINT requests a CDDS_POSTPAINT callback once
-				// this whole paint cycle finishes -- belt-and-suspenders on top
-				// of the clip-exclusion above: force pageEditActive_ to repaint
-				// itself right after, so it can never be left looking erased
-				// for longer than one frame while it's up.
-				return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
-			}
-			case CDDS_POSTPAINT: {
-				if (self->pageEditActive_) {
-					InvalidateRect(self->pageEditActive_, nullptr, FALSE);
-					UpdateWindow(self->pageEditActive_);
-				}
-				return CDRF_DODEFAULT;
+				// NOTE: an earlier attempt also requested CDRF_NOTIFYPOSTPAINT
+				// here and, on receiving it, force-invalidated+UpdateWindow'd
+				// pageEditActive_ on every single toolbar paint cycle as a
+				// "belt and suspenders" measure against it being painted over.
+				// That turned out to be actively harmful instead: repeatedly
+				// forcing a synchronous repaint of a focused, actively-being-
+				// typed-into EDIT control (toolbar paint cycles fire often --
+				// any hover anywhere on the toolbar) left it rendering blank/
+				// stuck. The clip-region exclusion above is sufficient on its
+				// own (this is a real sibling window with WS_CLIPSIBLINGS
+				// already set on the toolbar); no need to also fight the
+				// control's own redraw timing.
+				return CDRF_NOTIFYITEMDRAW;
 			}
 			case CDDS_ITEMPREPAINT: {
 				// Fluent-style state layer: a soft rounded "pill" behind the
@@ -6872,13 +6878,21 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 				// race against, exactly like the status bar's own page/zoom
 				// text never had this problem.
 				if (id == IDM_VIEW_ZOOMLABEL || id == IDM_VIEW_PAGELABEL) {
-					// While pageEditActive_ is up, it already covers this
-					// exact rect (see beginPageNumberEdit()) -- skip drawing
-					// text underneath it.
-					if (id == IDM_VIEW_PAGELABEL && self->pageEditActive_) return CDRF_SKIPDEFAULT;
-					const std::wstring& text = (id == IDM_VIEW_ZOOMLABEL) ? self->zoomText_ : self->pageLabelText_;
+					RECT r = cd->nmcd.rc;
+					std::wstring text = (id == IDM_VIEW_ZOOMLABEL) ? self->zoomText_ : self->pageLabelText_;
+					// While pageEditActive_ is up, it already covers the left
+					// portion of this rect (see beginPageNumberEdit()) --
+					// keep showing "of N" in the REMAINING portion instead of
+					// blanking the whole reserved rect (that looked like the
+					// readout going blank all over again the moment you
+					// clicked to edit it).
+					if (id == IDM_VIEW_PAGELABEL && self->pageEditActive_) {
+						size_t sp = text.find(L' ');
+						text = (sp != std::wstring::npos) ? text.substr(sp + 1) : std::wstring();
+						UINT dpi2 = GetDpiForWindow(self->toolbar_);
+						r.left += PageEditBoxWidth(r.right - r.left, dpi2);
+					}
 					if (!text.empty()) {
-						RECT r = cd->nmcd.rc;
 						SetBkMode(cd->nmcd.hdc, TRANSPARENT);
 						SetTextColor(cd->nmcd.hdc, th.ctrlText);
 						HFONT old = self->uiFont_
