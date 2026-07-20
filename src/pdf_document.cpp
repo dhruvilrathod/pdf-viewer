@@ -504,6 +504,9 @@ void PdfDocument::close()
 	authed_ = false;
 	isPdf_ = false;
 	dirty_ = false;
+	fullRewriteProbed_ = false;
+	fullRewriteRisky_ = false;
+	widgetBaseFontSize_.clear();
 	pageCount_ = 0;
 	sizes_.clear();
 	bounds_.clear();
@@ -816,7 +819,85 @@ WidgetInfo describeWidget(fz_context* ctx, pdf_annot* w, int idx)
 	return info;
 }
 
+std::wstring toWide(const std::string& utf8)
+{
+	if (utf8.empty()) return {};
+	int wn = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+	if (wn <= 0) return {};
+	std::wstring w(static_cast<size_t>(wn - 1), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, w.data(), wn);
+	return w;
+}
+
+// Rough GDI-measured width, in PDF points, of `text` set at `sizePt`. Uses
+// Arial as a metrically-close stand-in for Helvetica (MuPDF's "Helv" base-14
+// alias, what the overwhelming majority of real-world form fields use) --
+// this is a shrink-to-fit decision, not meant to be pixel-exact.
+float measureTextWidthPt(const std::wstring& text, float sizePt)
+{
+	if (text.empty()) return 0.0f;
+	constexpr int kRefDpi = 96;
+	HDC dc = GetDC(nullptr);
+	LOGFONTW lf = {};
+	lf.lfHeight = -MulDiv(std::max(1, static_cast<int>(std::lround(sizePt))), kRefDpi, 72);
+	lf.lfWeight = FW_NORMAL;
+	lf.lfCharSet = DEFAULT_CHARSET;
+	wcscpy_s(lf.lfFaceName, L"Arial");
+	HFONT f = CreateFontIndirectW(&lf);
+	HFONT old = static_cast<HFONT>(SelectObject(dc, f));
+	SIZE sz{};
+	GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &sz);
+	SelectObject(dc, old);
+	DeleteObject(f);
+	ReleaseDC(nullptr, dc);
+	return sz.cx * 72.0f / kRefDpi;
+}
+
 } // namespace
+
+void PdfDocument::autoFitTextWidgetFontSize(pdf_annot* w, int page, int widgetIndex, const std::string& utf8)
+{
+	// MuPDF's own appearance generator already does a correct shrink-to-fit
+	// for single-line fields whose DA font size is 0 ("auto", per spec) --
+	// see write_variable_text() in pdf-appearance.c, which measures the text
+	// with the real embedded font and solves for the size that exactly fills
+	// the box width. Multiline/comb fields are a different story: multiline
+	// auto-size always falls back to a fixed 12pt there (no fit computation
+	// at all) and comb fields are fixed-width cells by design -- neither is
+	// this bug (a FIXED nonzero DA size silently clipping the box's own
+	// render-time clip rect), so leave both alone rather than fighting
+	// MuPDF's own behavior for them.
+	int ff = pdf_annot_field_flags(ctx_, w);
+	if (ff & (PDF_TX_FIELD_IS_MULTILINE | PDF_TX_FIELD_IS_COMB)) return;
+
+	const char* font = nullptr;
+	float size = 0.0f, color[4] = {};
+	int n = 0;
+	pdf_annot_default_appearance(ctx_, w, &font, &size, &n, color);
+	if (size <= 0) return; // already auto -- MuPDF fits this on its own
+
+	// Fit FROM the field's size the first time this session touches it, not
+	// from whatever it may already have been shrunk to by an earlier edit --
+	// otherwise typing a long value then deleting it back down to something
+	// short would leave the font permanently small.
+	long long key = (static_cast<long long>(page) << 32) | static_cast<unsigned>(widgetIndex);
+	auto it = widgetBaseFontSize_.find(key);
+	float base = it != widgetBaseFontSize_.end() ? it->second : size;
+	if (it == widgetBaseFontSize_.end()) widgetBaseFontSize_[key] = base;
+
+	fz_rect r = pdf_bound_widget(ctx_, w);
+	constexpr float kPad = 4.0f; // rough border/padding allowance
+	float avail = std::max(1.0f, (r.x1 - r.x0) - kPad);
+
+	std::wstring wtext = toWide(utf8);
+	constexpr float kFloor = 4.0f;
+	float fitted = base;
+	while (fitted > kFloor && measureTextWidthPt(wtext, fitted) > avail)
+		fitted -= 0.5f;
+
+	if (fitted != size)
+		pdf_set_annot_default_appearance(ctx_, w, font, fitted, n, color);
+}
 
 std::vector<WidgetInfo> PdfDocument::pageWidgets(int page)
 {
@@ -887,7 +968,12 @@ bool PdfDocument::setTextWidget(int page, int widgetIndex, const std::string& ut
 	fz_try(ctx_) {
 		pg = pdf_load_page(ctx_, pdf, page);
 		pdf_annot* w = widgetByIndex(ctx_, pg, widgetIndex);
-		if (w) { pdf_set_text_field_value(ctx_, w, utf8.c_str()); pdf_update_annot(ctx_, w); ok = true; }
+		if (w) {
+			autoFitTextWidgetFontSize(w, page, widgetIndex, utf8);
+			pdf_set_text_field_value(ctx_, w, utf8.c_str());
+			pdf_update_annot(ctx_, w);
+			ok = true;
+		}
 	}
 	fz_always(ctx_) { if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg)); }
 	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }
@@ -1373,7 +1459,77 @@ bool verifyPdfFile(const std::string& utf8path, int expectedPageCount, const cha
 	return ok;
 }
 
+// Some third-party PDF generators write an xref whose subsections leave a
+// hole for one or more object numbers -- the number is never declared
+// in-use OR free, in any generation of an incremental chain. A plain
+// open/render never needs to resolve that number, so the file "opens fine",
+// but MuPDF's full/garbage-collecting write path (do_garbage=1, used for
+// every normal Save in this app -- see writeAndReplace()) walks every
+// declared object number while marking/renumbering and hard-throws "cannot
+// find object in xref (N 0 R)" on the hole. That renumbering mutates the
+// document's xref table in place as it goes, so if this were probed against
+// the LIVE, already-edited doc_/ctx_, a failed attempt could leave it
+// half-renumbered and break a subsequent save attempt too (confirmed
+// empirically). This runs the same probe against a disposable, freshly
+// re-read copy of the file in its own throwaway fz_context instead --
+// whatever happens to it can't affect the live document -- purely to answer
+// "would a full rewrite of this file's structure choke on a missing
+// object," independent of anything this session has edited.
+bool fullRewriteChokesOnMissingObject(const std::wstring& wpath)
+{
+	std::string upath = toUtf8(wpath.c_str());
+	std::wstring wprobe = wpath + L".pdfviewer_probe_tmp";
+	std::string uprobe = toUtf8(wprobe.c_str());
+
+	fz_context* pctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+	if (!pctx) return false;
+	installSystemFontHook(pctx);
+	bool chokes = false;
+	fz_try(pctx) {
+		fz_register_document_handlers(pctx);
+		fz_document* pdoc = fz_open_document(pctx, upath.c_str());
+		fz_try(pctx) {
+			if (!fz_needs_password(pctx, pdoc)) {
+				pdf_document* ppdf = pdf_document_from_fz_document(pctx, pdoc);
+				if (ppdf) {
+					fz_try(pctx) {
+						pdf_write_options opts = pdf_default_write_options;
+						opts.do_garbage = 1;
+						opts.do_compress = 1;
+						opts.do_compress_images = 1;
+						opts.do_compress_fonts = 1;
+						opts.do_use_objstms = 1;
+						opts.compression_effort = 100;
+						pdf_save_document(pctx, ppdf, uprobe.c_str(), &opts);
+					}
+					fz_catch(pctx) {
+						const char* msg = fz_caught_message(pctx);
+						chokes = msg && std::strstr(msg, "cannot find object in xref") != nullptr;
+					}
+				}
+			}
+		}
+		fz_always(pctx) { fz_drop_document(pctx, pdoc); }
+		fz_catch(pctx) { /* open/needs-password failure -- not this bug, leave chokes=false */ }
+	}
+	fz_catch(pctx) {
+		/* leave chokes=false */
+	}
+	fz_drop_context(pctx);
+	DeleteFileW(wprobe.c_str());
+	return chokes;
+}
+
 } // namespace
+
+bool PdfDocument::probeFullRewriteRisky()
+{
+	if (!fullRewriteProbed_) {
+		fullRewriteRisky_ = !openedPath_.empty() && fullRewriteChokesOnMissingObject(openedPath_);
+		fullRewriteProbed_ = true;
+	}
+	return fullRewriteRisky_;
+}
 
 bool PdfDocument::save(const wchar_t* path, bool incremental, std::string& err)
 {
@@ -1417,10 +1573,53 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
 	std::string utemp = toUtf8(wtemp.c_str());
 
+	// Some third-party PDF generators write an xref whose subsections leave
+	// a hole for one or more object numbers -- never declared in-use OR
+	// free, in any generation of the incremental chain. A plain render never
+	// needs to resolve that number, but a full/garbage-collecting rewrite
+	// (do_garbage=1, this app's normal Save) walks every declared object
+	// number while marking/renumbering and hard-throws "cannot find object
+	// in xref (N 0 R)" on it. That renumbering mutates the xref table in
+	// place as it walks, so if the full write is even ATTEMPTED against the
+	// live doc_ and then fails partway through, doc_ is left half-renumbered
+	// and a subsequent save attempt (even a plain incremental one) fails too
+	// -- confirmed empirically, so the full path must never be attempted
+	// live once it's known to be broken for this file. probeFullRewriteRisky()
+	// answers that question safely on a disposable copy first. When it's
+	// risky, skip straight to an INCREMENTAL write seeded with a copy of the
+	// original bytes (do_garbage/compress require do_incremental=0, so this
+	// sidesteps the hole entirely: no mark/sweep pass, only the objects
+	// actually touched this session get serialized) -- this preserves every
+	// pending edit, unlike pdf_repair_xref() (which would also clear the
+	// hole, but calls pdf_forget_xref() internally and unconditionally
+	// discards the in-memory incremental section, i.e. every unsaved edit).
+	// Only applies to the plain edit-save case -- changing encryption always
+	// requires a full rewrite by construction (see the checks inside
+	// pdf_save_document itself), so this fallback doesn't apply there.
+	bool useIncremental = incremental;
+	if (!useIncremental && !stripEncryption && !newPassword && probeFullRewriteRisky()) {
+		useIncremental = true;
+	}
+
 	bool wrote = false;
+	if (useIncremental && !incremental) {
+		// Forced into incremental by the probe above (the caller asked for a
+		// normal full save): seed the temp file with the CURRENTLY OPEN
+		// file's bytes first, since an incremental write only appends a new
+		// xref generation after whatever's already at the output path --
+		// and that must be openedPath_ (what doc_ actually is), not
+		// `wtarget`. They're the same file for a plain in-place Save, but
+		// differ for Save As, where wtarget is a brand-new path that has no
+		// bytes yet.
+		if (openedPath_.empty() || !CopyFileW(openedPath_.c_str(), wtemp.c_str(), FALSE)) {
+			err = "could not prepare incremental fallback save";
+			DeleteFileW(wtemp.c_str());
+			return false;
+		}
+	}
 	fz_try(ctx_) {
 		pdf_write_options opts = pdf_default_write_options;
-		if (incremental) {
+		if (useIncremental) {
 			opts.do_incremental = 1;
 		} else {
 			opts.do_garbage = 1;

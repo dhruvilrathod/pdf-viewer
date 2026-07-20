@@ -119,6 +119,10 @@
 #define IDM_EMPTY_FLATTEN_IMAGE 1226 // empty-state "Flatten to Image" tile: Open, then auto-flatten-to-image
 #define IDM_EMPTY_FLATTEN_EDITS 1227 // empty-state "Flatten Edits Only" tile: Open, then auto-flatten-edits-only
 
+// Right-click context menu over a link/email in the page (Select tool only)
+#define IDM_LINK_OPEN  1228  // "Open Link" / "Send Email"
+#define IDM_LINK_COPY  1229  // "Copy Link Address" / "Copy Email Address"
+
 // Web-to-PDF bar (URL text box + Convert button)
 #define IDC_WEBPDF_LABEL   1134
 #define IDC_WEBPDF_EDIT    1135

@@ -681,6 +681,7 @@ private:
 	bool pageScreenOrigin(int page, int& sx, int& sy) const;
 	bool hitTestPage(int mx, int my, int& page, float& px, float& py) const;
 	void onLButtonDown(int mx, int my);
+	void onRButtonDown(int mx, int my);
 	void onMouseMove(int mx, int my);
 	void onLButtonUp(int mx, int my);
 	void eraseAt(int mx, int my);
@@ -703,11 +704,18 @@ private:
 		bool showPopup = false;        // show floating color/size/delete popup
 		bool autoExitSelect = false;   // switch tool back to Select on commit
 		int existingAnnotIndex = -1;   // >=0 => editing an existing FreeText annot
+		int widgetIndex = -1;          // >=0 => editing this form-field widget (for Tab navigation)
 		float fontSize = 12.0f;
 	};
 	void beginInlineEdit(int page, PageRectPt rectPt, const std::string& utf8,
 		const InlineEditOptions& opts, std::function<void(const std::string&, bool committed)> onDone);
 	void commitInlineEdit(bool commit);
+	// Shared by doFormFill's click-to-edit and Tab/Shift+Tab navigation.
+	void beginTextWidgetEdit(int page, int widgetIndex, PageRectPt rect, const std::string& value, bool multiline);
+	// Commits the field currently being edited and opens the next (or, if
+	// !forward, previous) text field on the same page, wrapping around.
+	// No-op unless a form-field text widget is currently being edited.
+	void tabToAdjacentTextWidget(bool forward);
 	static LRESULT CALLBACK InlineEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	void positionInlineEdit();
 	void updateInlineEditFont();
@@ -793,6 +801,7 @@ private:
 	bool inlineShowPopup_ = false;
 	bool inlineAutoExitSelect_ = false;
 	int inlineExistingAnnotIndex_ = -1;
+	int inlineWidgetIndex_ = -1; // >=0 while inlineIsWidget_ -- which widget, for Tab navigation
 	float inlineFontSize_ = 12.0f;
 
 	// Resize-handle state for the free-text box currently being edited.
@@ -1847,20 +1856,7 @@ void CanvasView::doFormFill(int page, float px, float py)
 	switch (wi.kind) {
 	case WidgetKind::Text: {
 		// Type straight into the field on the page -- no popup dialog.
-		int widgetIndex = wi.index;
-		InlineEditOptions opts;
-		opts.multiline = wi.multiline;
-		opts.isWidget = true;
-		beginInlineEdit(page, wi.rect, wi.value, opts,
-			[this, page, widgetIndex](const std::string& text, bool committed) {
-				if (!committed) return;
-				std::string err2;
-				if (doc_->setTextWidget(page, widgetIndex, text, err2)) {
-					invalidatePage(page);
-					invalidate();
-					if (onChanged_) onChanged_();
-				}
-			});
+		beginTextWidgetEdit(page, wi.index, wi.rect, wi.value, wi.multiline);
 		return; // inline editor owns the rest of this interaction
 	}
 	case WidgetKind::Checkbox:
@@ -2100,6 +2096,56 @@ void CanvasView::activateLink(const LinkInfo& link)
 	auto starts = [&](const wchar_t* s) { return _wcsnicmp(uri.c_str(), s, wcslen(s)) == 0; };
 	if (!(starts(L"http://") || starts(L"https://") || starts(L"mailto:"))) return;
 	ShellExecuteW(hwnd_, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void CanvasView::onRButtonDown(int mx, int my)
+{
+	if (tool_ != Tool::Select) return;
+	int page; float px, py;
+	if (!hitTestPage(mx, my, page, px, py)) return;
+	const LinkInfo* hit = linkAt(page, px, py);
+	if (!hit) return;
+	LinkInfo link = *hit; // TrackPopupMenu pumps messages; don't hold a pointer into the cache across that.
+
+	bool isMail = link.external && _strnicmp(link.uri.c_str(), "mailto:", 7) == 0;
+	HMENU menu = CreatePopupMenu();
+	AppendMenuW(menu, MF_STRING, IDM_LINK_OPEN, !link.external ? L"Open Link" : isMail ? L"Send Email" : L"Open Link");
+	// Internal (page-jump) links carry no user-meaningful address to copy --
+	// their `uri` is MuPDF's internal "#page=N" form, not something a link
+	// annotation's target is ever expected to be shared/pasted.
+	if (link.external)
+		AppendMenuW(menu, MF_STRING, IDM_LINK_COPY, isMail ? L"Copy Email Address" : L"Copy Link Address");
+
+	POINT pt{ mx, my };
+	ClientToScreen(hwnd_, &pt);
+	int sel = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd_, nullptr);
+	DestroyMenu(menu);
+
+	if (sel == IDM_LINK_OPEN) {
+		activateLink(link);
+	} else if (sel == IDM_LINK_COPY) {
+		// mailto: links copy just the address (Outlook/Edge convention), not
+		// the scheme prefix; internal (non-external) links have no real URI
+		// worth copying, so the menu never offers Copy for those.
+		std::string addr = link.uri;
+		if (isMail) addr = addr.substr(7);
+		int n = MultiByteToWideChar(CP_UTF8, 0, addr.c_str(), -1, nullptr, 0);
+		if (n > 0) {
+			std::wstring wtext(static_cast<size_t>(n - 1), L'\0');
+			MultiByteToWideChar(CP_UTF8, 0, addr.c_str(), -1, wtext.data(), n);
+			if (OpenClipboard(hwnd_)) {
+				EmptyClipboard();
+				HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (wtext.size() + 1) * sizeof(wchar_t));
+				if (mem) {
+					void* p = GlobalLock(mem);
+					memcpy(p, wtext.c_str(), (wtext.size() + 1) * sizeof(wchar_t));
+					GlobalUnlock(mem);
+					SetClipboardData(CF_UNICODETEXT, mem);
+				}
+				CloseClipboard();
+			}
+		}
+	}
 }
 
 void CanvasView::beginTextSelection(int page, float px, float py)
@@ -2532,6 +2578,7 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 	inlineShowPopup_ = opts.showPopup;
 	inlineAutoExitSelect_ = opts.autoExitSelect;
 	inlineExistingAnnotIndex_ = opts.existingAnnotIndex;
+	inlineWidgetIndex_ = opts.widgetIndex;
 	inlineFontSize_ = opts.fontSize;
 
 	if (inlineShowPopup_) {
@@ -2589,6 +2636,7 @@ void CanvasView::commitInlineEdit(bool commit)
 	int page = inlineEditPage_;
 	inlineEditPage_ = -1;
 	inlineExistingAnnotIndex_ = -1;
+	inlineWidgetIndex_ = -1;
 	auto done = std::move(inlineEditDone_);
 	inlineEditDone_ = nullptr;
 	if (done) done(WideToUtf8(buf), commit);
@@ -2682,6 +2730,54 @@ void CanvasView::beginExistingAnnotEdit(int page, const AnnotInfo& ai)
 		});
 }
 
+void CanvasView::beginTextWidgetEdit(int page, int widgetIndex, PageRectPt rect, const std::string& value, bool multiline)
+{
+	InlineEditOptions opts;
+	opts.multiline = multiline;
+	opts.isWidget = true;
+	opts.widgetIndex = widgetIndex;
+	beginInlineEdit(page, rect, value, opts,
+		[this, page, widgetIndex](const std::string& text, bool committed) {
+			if (!committed) return;
+			std::string err2;
+			if (doc_->setTextWidget(page, widgetIndex, text, err2)) {
+				invalidatePage(page);
+				invalidate();
+				if (onChanged_) onChanged_();
+			}
+		});
+}
+
+void CanvasView::tabToAdjacentTextWidget(bool forward)
+{
+	if (!inlineEdit_ || !inlineIsWidget_ || inlineEditPage_ < 0) return;
+	int page = inlineEditPage_;
+	int curIndex = inlineWidgetIndex_;
+
+	// Commit the current field first (Tab confirms-and-moves-on, same as any
+	// other form filler) -- this also invalidates the page's cached widget
+	// list, so the lookup below picks up the value just typed.
+	commitInlineEdit(true);
+
+	const auto& widgets = widgetsForPage(page);
+	// Only text fields get an inline edit box to tab into; walk just those,
+	// in the page's own field order, wrapping around. Position relative to
+	// the field just left (by its widget index), not by its position in
+	// `widgets` -- checkboxes/combos can sit between text fields there.
+	std::vector<int> textPositions;
+	int curPos = -1;
+	for (size_t i = 0; i < widgets.size(); ++i) {
+		if (widgets[i].kind != WidgetKind::Text) continue;
+		if (widgets[i].index == curIndex) curPos = static_cast<int>(textPositions.size());
+		textPositions.push_back(static_cast<int>(i));
+	}
+	if (textPositions.empty()) return;
+	int count = static_cast<int>(textPositions.size());
+	int nextPos = curPos < 0 ? (forward ? 0 : count - 1) : (curPos + (forward ? 1 : -1) + count) % count;
+	const WidgetInfo& next = widgets[textPositions[nextPos]];
+	beginTextWidgetEdit(page, next.index, next.rect, next.value, next.multiline);
+}
+
 LRESULT CALLBACK CanvasView::InlineEditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 	UINT_PTR, DWORD_PTR ref)
 {
@@ -2716,10 +2812,21 @@ LRESULT CALLBACK CanvasView::InlineEditSubclass(HWND hwnd, UINT msg, WPARAM wp, 
 		bool multiline = (GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_MULTILINE) != 0;
 		if (wp == VK_RETURN && !multiline) { self->commitInlineEdit(true); return 0; }
 		if (wp == VK_ESCAPE) { self->commitInlineEdit(false); return 0; }
+		if (wp == VK_TAB && self->inlineIsWidget_) {
+			bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+			self->tabToAdjacentTextWidget(!shift);
+			return 0;
+		}
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
 		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
 	if (msg == WM_CHAR && wp == 0x7F) return 0; // see ConsumeCtrlBackspaceWordDelete
+	// Swallow the WM_CHAR('\t') TranslateMessage queues for the VK_TAB
+	// handled above -- tabToAdjacentTextWidget() destroys this control and
+	// immediately creates a new one, and Windows can reuse the same HWND
+	// value for it; without this, that stray queued char can land in the
+	// brand-new field as a literal typed tab.
+	if (msg == WM_CHAR && wp == L'\t' && self->inlineIsWidget_) return 0;
 	if (msg == WM_KILLFOCUS) {
 		// Losing focus to the color popup shouldn't commit/close the edit.
 		HWND next = reinterpret_cast<HWND>(wp);
@@ -3242,6 +3349,7 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
 		return 0;
 	case WM_LBUTTONDOWN: self->onLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+	case WM_RBUTTONDOWN: self->onRButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_MOUSEMOVE: self->onMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_LBUTTONUP: self->onLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_SETCURSOR:

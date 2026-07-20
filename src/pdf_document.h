@@ -5,11 +5,16 @@
 #include <windows.h>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
 #include <mupdf/fitz.h>
 }
+
+// Forward-declared rather than pulling in mupdf/pdf.h here (keeps this
+// header light -- only pdf_document.cpp needs the full PDF-specific API).
+extern "C" { typedef struct pdf_annot pdf_annot; }
 
 struct PageSizePt { float w = 0.0f; float h = 0.0f; }; // page size in points (1/72")
 
@@ -306,6 +311,13 @@ private:
 	bool isPdf_ = false;
 	bool dirty_ = false;
 	bool neededPassword_ = false;
+	// Memoized result of probeFullRewriteRisky() (see its comment in
+	// pdf_document.cpp) -- computed at most once per opened file.
+	bool fullRewriteProbed_ = false;
+	bool fullRewriteRisky_ = false;
+	// Each text widget's font size the first time this session touches it
+	// (key: page<<32 | widgetIndex) -- see autoFitTextWidgetFontSize().
+	std::unordered_map<long long, float> widgetBaseFontSize_;
 	int pageCount_ = 0;
 	std::vector<PageSizePt> sizes_;
 	std::vector<PageRectPt> bounds_;
@@ -340,4 +352,12 @@ private:
 	// stripEncryption in practice (callers only ever pass one).
 	bool writeAndReplace(const wchar_t* path, bool incremental, bool stripEncryption, std::string& err,
 		const char* newPassword = nullptr);
+	// See its definition for why this exists and why it must never run
+	// against the live ctx_/doc_.
+	bool probeFullRewriteRisky();
+	// Shrinks a fixed-size single-line text field's font just enough that
+	// `utf8` fits its box, so committed text can never render invisibly
+	// clipped -- see the definition for why this doesn't apply to
+	// multiline/comb fields or already-auto-size (DA size 0) ones.
+	void autoFitTextWidgetFontSize(pdf_annot* w, int page, int widgetIndex, const std::string& utf8);
 };
