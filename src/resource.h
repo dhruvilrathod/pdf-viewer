@@ -123,11 +123,51 @@
 #define IDM_LINK_OPEN  1228  // "Open Link" / "Send Email"
 #define IDM_LINK_COPY  1229  // "Copy Link Address" / "Copy Email Address"
 
+// Right-click context menu over an active text selection (Select tool only)
+#define IDM_SEL_COPY             1230
+#define IDM_SEL_EDIT_RICHTEXT    1231
+
 // Web-to-PDF bar (URL text box + Convert button)
 #define IDC_WEBPDF_LABEL   1134
 #define IDC_WEBPDF_EDIT    1135
 #define IDC_WEBPDF_BUTTON  1136
 #define IDC_WEBPDF_CLOSE   1137
+
+// Print side panel (right-docked, replaces the native print dialog --
+// settings changes live-update the preview shown in the canvas area)
+#define IDC_PRINT_TITLE          1138
+#define IDC_PRINT_PRINTER_LABEL  1139
+#define IDC_PRINT_PRINTER_COMBO  1140
+#define IDC_PRINT_COPIES_LABEL   1141
+#define IDC_PRINT_COPIES_EDIT    1142
+#define IDC_PRINT_RANGE_LABEL    1143
+#define IDC_PRINT_RANGE_ALL      1144
+#define IDC_PRINT_RANGE_CURRENT  1145
+#define IDC_PRINT_RANGE_CUSTOM   1146
+#define IDC_PRINT_RANGE_EDIT     1147
+#define IDC_PRINT_ORIENT_LABEL   1148
+#define IDC_PRINT_ORIENT_PORTRAIT  1149
+#define IDC_PRINT_ORIENT_LANDSCAPE 1150
+#define IDC_PRINT_COLOR_LABEL    1151
+#define IDC_PRINT_COLOR_COLOR    1152
+#define IDC_PRINT_COLOR_GRAY     1153
+#define IDC_PRINT_PAGENAV_LABEL  1154
+#define IDC_PRINT_PAGENAV_PREV   1155
+#define IDC_PRINT_PAGENAV_NEXT   1156
+#define IDC_PRINT_GO             1157
+#define IDC_PRINT_CANCEL         1158
+
+// Rich-text-editor side panel (right-docked, mutually exclusive with the
+// print panel -- "Edit as Rich Text..." on a text selection's right-click menu)
+#define IDC_TEXTPANEL_TITLE      1159
+#define IDC_TEXTPANEL_BOLD       1160
+#define IDC_TEXTPANEL_ITALIC     1161
+#define IDC_TEXTPANEL_UNDERLINE  1162
+#define IDC_TEXTPANEL_CASE_LABEL 1163
+#define IDC_TEXTPANEL_CASE_COMBO 1164
+#define IDC_TEXTPANEL_RICHEDIT   1165
+#define IDC_TEXTPANEL_COPY       1166
+#define IDC_TEXTPANEL_CLOSE      1167
 
 // Toolbar button command IDs reuse the menu IDs above.
 

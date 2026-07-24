@@ -17,6 +17,7 @@
 #include <uxtheme.h>  // SetWindowTheme (flat "Explorer" edit-box border)
 #include <dwmapi.h>   // DwmSetWindowAttribute (Win11 rounded corners, Mica, dark title bar)
 #include <windowsx.h>
+#include <richedit.h> // MSFTEDIT_CLASS / CHARFORMAT2W -- the rich-text-editor tool's edit control
 
 #include <algorithm>
 #include <cmath>
@@ -579,6 +580,11 @@ public:
 	// is open) is clicked; the int is the IDM_* command id to run, so the
 	// frame just forwards it straight into its existing onCommand().
 	void setOnEmptyStateAction(std::function<void(int)> f) { onEmptyStateAction_ = std::move(f); }
+	// Fired when the user picks "Edit as Rich Text" from the right-click menu
+	// over an active text selection -- the string is the selection's plain
+	// text (see selectedText()); the frame owns opening the actual editor
+	// window (CanvasView has no business owning a top-level window).
+	void setOnOpenTextEditor(std::function<void(const std::wstring&)> f) { onOpenTextEditor_ = std::move(f); }
 	// After Save, PdfDocument reopens its underlying fz_document internally
 	// (same PdfDocument object, new handle) -- drop caches keyed to the old
 	// handle without resetting scroll/zoom/page position like setDocument().
@@ -634,8 +640,25 @@ public:
 
 	// Plain-text selection (drag over rendered text with the Select tool).
 	void copySelectionToClipboard();
+	// The current selection's text (same extraction copySelectionToClipboard
+	// uses), for callers that want the string itself instead of the
+	// clipboard -- e.g. handing it to the rich-text-editor tool.
+	std::wstring selectedText();
 	void selectAll();
 	bool hasTextSelection() const { return selAnchorIdx_ >= 0 && selFocusIdx_ >= 0; }
+
+	// Print preview: while active, onPaint() shows one sheet from `pages`
+	// (rendered via RenderPrintPreviewPage, reflecting grayscale/landscape)
+	// instead of the normal scrollable document -- the print panel's live
+	// preview. endPrintPreview() restores normal viewing exactly as it was
+	// (no state elsewhere is touched by entering/leaving preview).
+	void beginPrintPreview(std::vector<int> pages, bool grayscale, bool landscape);
+	void setPrintPreviewOptions(std::vector<int> pages, bool grayscale, bool landscape);
+	void printPreviewGoTo(int index);
+	void endPrintPreview();
+	bool printPreviewActive() const { return printPreviewActive_; }
+	int printPreviewPageCount() const { return static_cast<int>(printPreviewPages_.size()); }
+	int printPreviewCursor() const { return printPreviewCursor_; }
 
 	// Used by the floating popup (a free-standing window, not a CanvasView
 	// member) to adjust the in-progress text-box/annotation session.
@@ -735,11 +758,20 @@ private:
 	void endResize();
 	void makeInlineBgBrush();
 
-	// Plain-text selection
+	// Plain-text selection. Anchor and focus each carry their own page, so a
+	// drag that crosses a page boundary (continuous mode) extends the
+	// selection onto the new page instead of freezing -- see
+	// selectionRangeForPage() for how a multi-page span is resolved back to
+	// a per-page character range.
 	void beginTextSelection(int page, float px, float py);
 	void updateTextSelection(int page, float px, float py);
 	void clearTextSelection();
 	void drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY);
+	// If any part of the current selection falls on `pageIndex`, fills
+	// lo/hi (a char-index range into charsForPage(pageIndex), hi may exceed
+	// the page's char count -- callers already clamp with their own loop's
+	// `i < chars.size()` guard) and returns true.
+	bool selectionRangeForPage(int pageIndex, int& lo, int& hi) const;
 	static int nearestCharIndex(const std::vector<PageChar>& chars, float px, float py);
 	void selectWordAt(int page, float px, float py);
 	void selectLineAt(int page, float px, float py);
@@ -821,12 +853,22 @@ private:
 	std::vector<Hit> hits_;
 	int currentHit_ = -1;
 
-	// Plain-text selection (Select tool, drag over rendered text)
-	std::vector<PageChar> selChars_;
-	int selPage_ = -1;
+	// Plain-text selection (Select tool, drag over rendered text). Chars are
+	// fetched on demand via charsForPage() (already cached) rather than
+	// snapshotted here, since a selection can now span more than one page.
+	int selAnchorPage_ = -1;
+	int selFocusPage_ = -1;
 	int selAnchorIdx_ = -1;
 	int selFocusIdx_ = -1;
 	bool selDragging_ = false;
+
+	// Print preview (see beginPrintPreview()'s comment).
+	bool printPreviewActive_ = false;
+	std::vector<int> printPreviewPages_;
+	int printPreviewCursor_ = 0;
+	bool printPreviewGrayscale_ = false;
+	bool printPreviewLandscape_ = false;
+	void onPaintPrintPreview(HDC mem, int cw, int ch);
 	DWORD lastClickTime_ = 0;
 	POINT lastClickPos_ = {};
 	int clickCount_ = 0;
@@ -868,6 +910,7 @@ private:
 	std::function<void()> onExitTextTool_;
 	std::function<void()> onViewChanged_;
 	std::function<void(int)> onEmptyStateAction_;
+	std::function<void(const std::wstring&)> onOpenTextEditor_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1143,11 @@ private:
 	HIMAGELIST toolbarImages_ = nullptr;
 	HWND status_ = nullptr;
 	HWND tabStrip_ = nullptr;
+	// The tab strip's own auto-managed tooltip control (TCS_TOOLTIPS) --
+	// captured once so WM_NOTIFY can tell its TTN_GETDISPINFOW requests
+	// apart from the toolbar's (see the handler for why that distinction
+	// matters: idFrom means something different for each).
+	HWND tabTooltip_ = nullptr;
 	std::vector<std::unique_ptr<DocTab>> tabs_;
 	int activeTab_ = -1;
 	// Drag-to-reorder state for the tab strip (see TabStripSubclass).
@@ -1225,6 +1273,48 @@ private:
 	HWND redactDone_ = nullptr;
 	bool redactBarVisible_ = false;
 	int redactBarH_ = 0;
+
+	// Print side panel -- replaces the native print dialog. Right-docked
+	// (canvas shrinks to make room, see layout()); settings changes drive
+	// CanvasView's print-preview mode live (see updatePrintPreviewFromPanel).
+	HWND printTitle_ = nullptr;
+	HWND printPrinterLabel_ = nullptr, printPrinterCombo_ = nullptr;
+	HWND printCopiesLabel_ = nullptr, printCopiesEdit_ = nullptr;
+	HWND printRangeLabel_ = nullptr, printRangeAll_ = nullptr, printRangeCurrent_ = nullptr,
+		printRangeCustom_ = nullptr, printRangeEdit_ = nullptr;
+	HWND printOrientLabel_ = nullptr, printOrientPortrait_ = nullptr, printOrientLandscape_ = nullptr;
+	HWND printColorLabel_ = nullptr, printColorColor_ = nullptr, printColorGray_ = nullptr;
+	HWND printPageNavLabel_ = nullptr, printPageNavPrev_ = nullptr, printPageNavNext_ = nullptr;
+	HWND printGo_ = nullptr, printCancel_ = nullptr;
+	bool printPanelVisible_ = false;
+	void showPrintPanel(bool show);
+	void updatePrintPreviewFromPanel();
+	void doExecutePrint();
+	PrintSettings readPrintSettingsFromPanel() const;
+
+	// Rich-text-editor side panel -- right-docked like the print panel (and
+	// mutually exclusive with it: opening either closes the other, since
+	// both claim the same right-hand column). "Edit as Rich Text..." on a
+	// text selection's right-click menu opens this pre-filled with the
+	// selection; Bold/Italic/Underline and the case-converter apply to
+	// whatever's selected inside the rich edit (or the whole box if
+	// nothing's selected there). Deliberately never writes back into the
+	// PDF -- it's a formatting scratchpad, not another edit path.
+	HWND textPanelTitle_ = nullptr;
+	HWND textBoldBtn_ = nullptr, textItalicBtn_ = nullptr, textUnderlineBtn_ = nullptr;
+	HWND textCaseLabel_ = nullptr, textCaseCombo_ = nullptr;
+	HWND textRichEdit_ = nullptr;
+	HWND textCopyBtn_ = nullptr, textCloseBtn_ = nullptr;
+	bool textPanelVisible_ = false;
+	void showTextEditorPanel(bool show, const std::wstring& initialText = std::wstring());
+	void textPanelToggleFormat(DWORD mask, DWORD effect);
+	// Syncs the B/I/U buttons' checked (pressed) look to whatever formatting
+	// is actually active at the current caret/selection -- called after every
+	// toggle and on caret movement (EN_SELCHANGE), since clicking a button is
+	// not the only way the effective format changes.
+	void updateTextFormatButtons();
+	void textPanelApplyCase(int mode); // 0=UPPER, 1=lower, 2=Title Case, 3=Sentence case
+	void textPanelCopy();
 
 	// Toolbar tooltip text, keyed by button command id. Deliberately NOT
 	// using TBBUTTON::iString for icon-only buttons: a toolbar containing
@@ -1636,6 +1726,7 @@ bool CanvasView::hitTestPage(int mx, int my, int& page, float& px, float& py) co
 
 void CanvasView::onLButtonDown(int mx, int my)
 {
+	if (printPreviewActive_) return; // preview is read-only -- no selecting/drawing/form-filling
 	// A real mouse click can only reach the canvas's own WM_LBUTTONDOWN when
 	// it lands outside the inline edit control (clicks inside go straight to
 	// that child window). So if a free-text box is being edited, this click
@@ -1722,7 +1813,7 @@ void CanvasView::onMouseMove(int mx, int my)
 	if (activeResizeDir_ >= 0) { updateResize(mx, my); return; }
 	if (selDragging_) {
 		int page; float px, py;
-		if (hitTestPage(mx, my, page, px, py) && page == selPage_)
+		if (hitTestPage(mx, my, page, px, py))
 			updateTextSelection(page, px, py);
 		return;
 	}
@@ -2104,7 +2195,26 @@ void CanvasView::onRButtonDown(int mx, int my)
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return;
 	const LinkInfo* hit = linkAt(page, px, py);
-	if (!hit) return;
+	if (!hit) {
+		// No link under the cursor: offer the active selection's menu
+		// instead, if there is one (matches any text editor's right-click
+		// behavior -- Copy plus the new "send to rich text tool" action).
+		if (!hasTextSelection()) return;
+		HMENU selMenu = CreatePopupMenu();
+		AppendMenuW(selMenu, MF_STRING, IDM_SEL_COPY, L"Copy");
+		AppendMenuW(selMenu, MF_STRING, IDM_SEL_EDIT_RICHTEXT, L"Edit as Rich Text...");
+		POINT spt{ mx, my };
+		ClientToScreen(hwnd_, &spt);
+		int selCmd = TrackPopupMenu(selMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, spt.x, spt.y, 0, hwnd_, nullptr);
+		DestroyMenu(selMenu);
+		if (selCmd == IDM_SEL_COPY) {
+			copySelectionToClipboard();
+		} else if (selCmd == IDM_SEL_EDIT_RICHTEXT) {
+			std::wstring text = selectedText();
+			if (!text.empty() && onOpenTextEditor_) onOpenTextEditor_(text);
+		}
+		return;
+	}
 	LinkInfo link = *hit; // TrackPopupMenu pumps messages; don't hold a pointer into the cache across that.
 
 	bool isMail = link.external && _strnicmp(link.uri.c_str(), "mailto:", 7) == 0;
@@ -2150,9 +2260,9 @@ void CanvasView::onRButtonDown(int mx, int my)
 
 void CanvasView::beginTextSelection(int page, float px, float py)
 {
-	selPage_ = page;
-	selChars_ = charsForPage(page);
-	selAnchorIdx_ = selFocusIdx_ = nearestCharIndex(selChars_, px, py);
+	const auto& chars = charsForPage(page);
+	selAnchorPage_ = selFocusPage_ = page;
+	selAnchorIdx_ = selFocusIdx_ = nearestCharIndex(chars, px, py);
 	selDragging_ = true;
 	SetCapture(hwnd_);
 	invalidate();
@@ -2160,26 +2270,28 @@ void CanvasView::beginTextSelection(int page, float px, float py)
 
 void CanvasView::updateTextSelection(int page, float px, float py)
 {
-	if (page != selPage_ || selChars_.empty()) return;
-	selFocusIdx_ = nearestCharIndex(selChars_, px, py);
+	const auto& chars = charsForPage(page);
+	if (chars.empty()) return;
+	selFocusPage_ = page;
+	selFocusIdx_ = nearestCharIndex(chars, px, py);
 	invalidate();
 }
 
 void CanvasView::selectWordAt(int page, float px, float py)
 {
-	selPage_ = page;
-	selChars_ = charsForPage(page);
-	int idx = nearestCharIndex(selChars_, px, py);
+	const auto& chars = charsForPage(page);
+	selAnchorPage_ = selFocusPage_ = page;
+	int idx = nearestCharIndex(chars, px, py);
 	if (idx < 0) { clearTextSelection(); return; }
 	auto isWordChar = [](int u) { return u != ' ' && u != '\t' && u != 0; };
-	bool wantWord = isWordChar(selChars_[idx].unicode);
+	bool wantWord = isWordChar(chars[idx].unicode);
 	int lo = idx, hi = idx;
-	while (lo > 0 && !selChars_[lo - 1].lineBreakAfter && !selChars_[lo - 1].paragraphBreakAfter &&
-		isWordChar(selChars_[lo - 1].unicode) == wantWord)
+	while (lo > 0 && !chars[lo - 1].lineBreakAfter && !chars[lo - 1].paragraphBreakAfter &&
+		isWordChar(chars[lo - 1].unicode) == wantWord)
 		--lo;
-	while (hi + 1 < static_cast<int>(selChars_.size()) &&
-		!selChars_[hi].lineBreakAfter && !selChars_[hi].paragraphBreakAfter &&
-		isWordChar(selChars_[hi + 1].unicode) == wantWord)
+	while (hi + 1 < static_cast<int>(chars.size()) &&
+		!chars[hi].lineBreakAfter && !chars[hi].paragraphBreakAfter &&
+		isWordChar(chars[hi + 1].unicode) == wantWord)
 		++hi;
 	selAnchorIdx_ = lo;
 	selFocusIdx_ = hi;
@@ -2188,14 +2300,14 @@ void CanvasView::selectWordAt(int page, float px, float py)
 
 void CanvasView::selectLineAt(int page, float px, float py)
 {
-	selPage_ = page;
-	selChars_ = charsForPage(page);
-	int idx = nearestCharIndex(selChars_, px, py);
+	const auto& chars = charsForPage(page);
+	selAnchorPage_ = selFocusPage_ = page;
+	int idx = nearestCharIndex(chars, px, py);
 	if (idx < 0) { clearTextSelection(); return; }
 	int lo = idx, hi = idx;
-	while (lo > 0 && !selChars_[lo - 1].lineBreakAfter && !selChars_[lo - 1].paragraphBreakAfter)
+	while (lo > 0 && !chars[lo - 1].lineBreakAfter && !chars[lo - 1].paragraphBreakAfter)
 		--lo;
-	while (hi + 1 < static_cast<int>(selChars_.size()) && !selChars_[hi].lineBreakAfter && !selChars_[hi].paragraphBreakAfter)
+	while (hi + 1 < static_cast<int>(chars.size()) && !chars[hi].lineBreakAfter && !chars[hi].paragraphBreakAfter)
 		++hi;
 	selAnchorIdx_ = lo;
 	selFocusIdx_ = hi;
@@ -2206,28 +2318,52 @@ void CanvasView::selectAll()
 {
 	if (!doc_ || !doc_->isOpen()) return;
 	int page = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
-	selPage_ = page;
-	selChars_ = charsForPage(page);
-	if (selChars_.empty()) { clearTextSelection(); return; }
+	const auto& chars = charsForPage(page);
+	selAnchorPage_ = selFocusPage_ = page;
+	if (chars.empty()) { clearTextSelection(); return; }
 	selAnchorIdx_ = 0;
-	selFocusIdx_ = static_cast<int>(selChars_.size()) - 1;
+	selFocusIdx_ = static_cast<int>(chars.size()) - 1;
 	invalidate();
 }
 
 void CanvasView::clearTextSelection()
 {
-	if (selAnchorIdx_ < 0 && selFocusIdx_ < 0 && selChars_.empty()) return;
-	selChars_.clear();
-	selPage_ = -1;
+	if (selAnchorIdx_ < 0 && selFocusIdx_ < 0) return;
+	selAnchorPage_ = selFocusPage_ = -1;
 	selAnchorIdx_ = selFocusIdx_ = -1;
 	invalidate();
 }
 
+bool CanvasView::selectionRangeForPage(int pageIndex, int& lo, int& hi) const
+{
+	if (selAnchorIdx_ < 0 || selFocusIdx_ < 0) return false;
+	int startPage = std::min(selAnchorPage_, selFocusPage_);
+	int endPage = std::max(selAnchorPage_, selFocusPage_);
+	if (pageIndex < startPage || pageIndex > endPage) return false;
+	if (startPage == endPage) {
+		// Single-page selection (the common case): order is whichever of
+		// anchor/focus is smaller -- a drag can go either direction.
+		lo = std::min(selAnchorIdx_, selFocusIdx_);
+		hi = std::max(selAnchorIdx_, selFocusIdx_);
+		return true;
+	}
+	// Multi-page: whichever of anchor/focus sits on the earlier page is the
+	// span's start index; the other is the end index (independent of which
+	// one is literally "anchor" -- the user can drag either up or down).
+	bool anchorIsStart = selAnchorPage_ <= selFocusPage_;
+	int startIdx = anchorIsStart ? selAnchorIdx_ : selFocusIdx_;
+	int endIdx = anchorIsStart ? selFocusIdx_ : selAnchorIdx_;
+	if (pageIndex == startPage) { lo = startIdx; hi = std::numeric_limits<int>::max(); return true; } // to end of page
+	if (pageIndex == endPage) { lo = 0; hi = endIdx; return true; } // from start of page
+	lo = 0; hi = std::numeric_limits<int>::max(); // a page fully between start and end is fully selected
+	return true;
+}
+
 void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 {
-	if (selAnchorIdx_ < 0 || selFocusIdx_ < 0 || pageIndex != selPage_) return;
-	int lo = std::min(selAnchorIdx_, selFocusIdx_);
-	int hi = std::max(selAnchorIdx_, selFocusIdx_);
+	int lo, hi;
+	if (!selectionRangeForPage(pageIndex, lo, hi)) return;
+	const auto& chars = charsForPage(pageIndex);
 	float sc = effScale();
 	// Merge consecutive characters on the same line into one filled rect,
 	// instead of alpha-blending each glyph's own quad separately -- doing it
@@ -2241,8 +2377,8 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 		if (haveRun) FillAlpha(dc, run, RGB(60, 120, 220), 90);
 		haveRun = false;
 	};
-	for (int i = lo; i <= hi && i < static_cast<int>(selChars_.size()); ++i) {
-		const auto& q = selChars_[i].quad;
+	for (int i = lo; i <= hi && i < static_cast<int>(chars.size()); ++i) {
+		const auto& q = chars[i].quad;
 		RECT r;
 		r.left = pageX + static_cast<int>(q.x0 * sc);
 		r.top = pageY + static_cast<int>(q.y0 * sc);
@@ -2255,7 +2391,7 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 			run.right = std::max(run.right, r.right);
 			run.bottom = std::max(run.bottom, r.bottom);
 		}
-		if (selChars_[i].lineBreakAfter || selChars_[i].paragraphBreakAfter) flush();
+		if (chars[i].lineBreakAfter || chars[i].paragraphBreakAfter) flush();
 	}
 	flush();
 }
@@ -2311,29 +2447,41 @@ void CanvasView::updateLinkHover(int mx, int my)
 	}
 }
 
-void CanvasView::copySelectionToClipboard()
+std::wstring CanvasView::selectedText()
 {
-	if (selAnchorIdx_ < 0 || selFocusIdx_ < 0) return;
-	int lo = std::min(selAnchorIdx_, selFocusIdx_);
-	int hi = std::max(selAnchorIdx_, selFocusIdx_);
+	if (selAnchorIdx_ < 0 || selFocusIdx_ < 0) return {};
+	int startPage = std::min(selAnchorPage_, selFocusPage_);
+	int endPage = std::max(selAnchorPage_, selFocusPage_);
 	std::wstring text;
-	for (int i = lo; i <= hi && i < static_cast<int>(selChars_.size()); ++i) {
-		const auto& c = selChars_[i];
-		if (c.unicode >= 0x10000) {
-			// Encode as a UTF-16 surrogate pair.
-			unsigned int v = static_cast<unsigned int>(c.unicode) - 0x10000;
-			text.push_back(static_cast<wchar_t>(0xD800 + (v >> 10)));
-			text.push_back(static_cast<wchar_t>(0xDC00 + (v & 0x3FF)));
-		} else {
-			text.push_back(static_cast<wchar_t>(c.unicode));
+	for (int page = startPage; page <= endPage; ++page) {
+		int lo, hi;
+		if (!selectionRangeForPage(page, lo, hi)) continue;
+		const auto& chars = charsForPage(page);
+		int hiClamped = std::min(hi, static_cast<int>(chars.size()) - 1);
+		for (int i = lo; i <= hiClamped; ++i) {
+			const auto& c = chars[i];
+			if (c.unicode >= 0x10000) {
+				// Encode as a UTF-16 surrogate pair.
+				unsigned int v = static_cast<unsigned int>(c.unicode) - 0x10000;
+				text.push_back(static_cast<wchar_t>(0xD800 + (v >> 10)));
+				text.push_back(static_cast<wchar_t>(0xDC00 + (v & 0x3FF)));
+			} else {
+				text.push_back(static_cast<wchar_t>(c.unicode));
+			}
+			// Never emit a trailing break after the LAST selected character
+			// of the WHOLE (possibly multi-page) selection -- triple-click
+			// (select line) lands exactly on a lineBreakAfter char, so
+			// without this guard every line-selection copy carried an
+			// invisible trailing blank line, which pasted into Word as an
+			// extra Enter. A page boundary mid-selection is deliberately
+			// NOT forced to break here either: a paragraph that continues
+			// from the bottom of one page onto the next has no real
+			// line/paragraph break at that character, and should paste as
+			// one continuous paragraph, not get an unwanted line split.
+			if (page == endPage && i == hiClamped) continue;
+			if (c.paragraphBreakAfter) text += L"\r\n\r\n";
+			else if (c.lineBreakAfter) text += L"\r\n";
 		}
-		// Never emit a trailing break after the LAST selected character --
-		// triple-click (select line) lands exactly on a lineBreakAfter char,
-		// so without this guard every line-selection copy carried an invisible
-		// trailing blank line, which pasted into Word as an extra Enter.
-		if (i == hi) continue;
-		if (c.paragraphBreakAfter) text += L"\r\n\r\n";
-		else if (c.lineBreakAfter) text += L"\r\n";
 	}
 	// MuPDF's text extraction can include a real/synthesized trailing space
 	// at the end of a line (a word-gap heuristic, or an actual space glyph
@@ -2342,6 +2490,12 @@ void CanvasView::copySelectionToClipboard()
 	// guard above), so that trailing space pasted as a visible stray
 	// character with nothing after it to hide it. Trim it.
 	while (!text.empty() && (text.back() == L' ' || text.back() == L'\t')) text.pop_back();
+	return text;
+}
+
+void CanvasView::copySelectionToClipboard()
+{
+	std::wstring text = selectedText();
 	if (text.empty()) return;
 	if (!OpenClipboard(hwnd_)) return;
 	EmptyClipboard();
@@ -3099,7 +3253,9 @@ void CanvasView::onPaint()
 	FillRect(mem, &rc, bg);
 	DeleteObject(bg);
 
-	if (doc_ && doc_->isOpen()) {
+	if (printPreviewActive_) {
+		onPaintPrintPreview(mem, cw, ch);
+	} else if (doc_ && doc_->isOpen()) {
 		int offX = (canvasW_ <= cw) ? (cw - canvasW_) / 2 : -scrollX_;
 		int offY = (canvasH_ <= ch) ? (ch - canvasH_) / 2 : -scrollY_;
 
@@ -3180,6 +3336,59 @@ void CanvasView::onPaint()
 	EndPaint(hwnd_, &ps);
 }
 
+void CanvasView::onPaintPrintPreview(HDC mem, int cw, int ch)
+{
+	RECT rc = { 0, 0, cw, ch };
+	if (!doc_ || printPreviewPages_.empty()) { drawEmptyState(mem, rc); return; }
+	int idx = printPreviewPages_[std::clamp(printPreviewCursor_, 0, static_cast<int>(printPreviewPages_.size()) - 1)];
+	HBITMAP sheet = RenderPrintPreviewPage(*doc_, idx, cw, ch, printPreviewGrayscale_, printPreviewLandscape_);
+	if (!sheet) return;
+	HDC src = CreateCompatibleDC(mem);
+	HBITMAP old = static_cast<HBITMAP>(SelectObject(src, sheet));
+	BitBlt(mem, 0, 0, cw, ch, src, 0, 0, SRCCOPY);
+	SelectObject(src, old);
+	DeleteDC(src);
+	DeleteObject(sheet);
+}
+
+void CanvasView::beginPrintPreview(std::vector<int> pages, bool grayscale, bool landscape)
+{
+	if (inlineEdit_) commitInlineEdit(false);
+	clearTextSelection();
+	printPreviewActive_ = true;
+	printPreviewPages_ = std::move(pages);
+	printPreviewCursor_ = 0;
+	printPreviewGrayscale_ = grayscale;
+	printPreviewLandscape_ = landscape;
+	invalidate();
+}
+
+void CanvasView::setPrintPreviewOptions(std::vector<int> pages, bool grayscale, bool landscape)
+{
+	if (!printPreviewActive_) return;
+	printPreviewPages_ = std::move(pages);
+	printPreviewCursor_ = std::clamp(printPreviewCursor_, 0, std::max(0, static_cast<int>(printPreviewPages_.size()) - 1));
+	printPreviewGrayscale_ = grayscale;
+	printPreviewLandscape_ = landscape;
+	invalidate();
+}
+
+void CanvasView::printPreviewGoTo(int index)
+{
+	if (!printPreviewActive_ || printPreviewPages_.empty()) return;
+	printPreviewCursor_ = std::clamp(index, 0, static_cast<int>(printPreviewPages_.size()) - 1);
+	invalidate();
+}
+
+void CanvasView::endPrintPreview()
+{
+	if (!printPreviewActive_) return;
+	printPreviewActive_ = false;
+	printPreviewPages_.clear();
+	printPreviewCursor_ = 0;
+	invalidate();
+}
+
 void CanvasView::onSize()
 {
 	if (fit_ != Fit::None) applyFit();
@@ -3249,6 +3458,15 @@ void CanvasView::onHScroll(WPARAM wp)
 
 void CanvasView::onWheel(short delta, bool ctrl, bool horiz, POINT screenPt)
 {
+	if (printPreviewActive_) {
+		// The preview shows one full sheet at a time -- there's no scrollable
+		// content underneath for the wheel to move, so treat it the same as
+		// the panel's prev/next buttons instead of silently doing nothing.
+		int steps = delta / WHEEL_DELTA;
+		if (steps != 0) printPreviewGoTo(printPreviewCursor_ - steps); // already invalidates
+		if (onViewChanged_) onViewChanged_();
+		return;
+	}
 	if (ctrl) {
 		POINT pt = screenPt;
 		ScreenToClient(hwnd_, &pt);
@@ -4615,6 +4833,7 @@ void FrameWindow::createChildren()
 		0, 0, 0, 0, hwnd_, nullptr, hInst_, nullptr);
 	SendMessageW(tabStrip_, TCM_SETITEMSIZE, 0, MAKELPARAM(Scale(160, dpi), Scale(28, dpi)));
 	SetWindowSubclass(tabStrip_, TabStripSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+	tabTooltip_ = reinterpret_cast<HWND>(SendMessageW(tabStrip_, TCM_GETTOOLTIPS, 0, 0));
 
 	// Status bar
 	status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
@@ -4776,6 +4995,122 @@ void FrameWindow::createChildren()
 	for (HWND h : { redactLabel_, redactApply_, redactClear_, redactDone_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 	redactBarH_ = Scale(34, GetDpiForWindow(hwnd_));
+
+	// Print side panel (hidden until File > Print). A vertical stack of
+	// plain native controls, same idiom as the horizontal bars above --
+	// positioned in layout() instead of laid out here.
+	auto mkStatic = [&](const wchar_t* text, int id) {
+		return CreateWindowExW(0, L"STATIC", text, WS_CHILD, 0, 0, 0, 0, hwnd_,
+			reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst_, nullptr);
+	};
+	auto mkRadio = [&](const wchar_t* text, int id, bool group) {
+		HWND h = CreateWindowExW(0, L"BUTTON", text,
+			WS_CHILD | BS_AUTORADIOBUTTON | (group ? WS_GROUP : 0), 0, 0, 0, 0, hwnd_,
+			reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst_, nullptr);
+		// A themed (visual-styles) button ignores whatever WM_CTLCOLORBTN
+		// returns -- the theme engine draws it regardless (same constraint
+		// noted on ctrlBgBrush_'s WM_CTLCOLORSTATIC/EDIT handler, which is
+		// why THAT handler explicitly leaves BUTTON children alone). Opting
+		// these specific radios out of theming reverts them to classic
+		// rendering, which DOES respect a custom text/background color, so
+		// their labels can actually be recolored for dark mode below.
+		SetWindowTheme(h, L"", L"");
+		return h;
+	};
+	printTitle_ = mkStatic(L"Print", IDC_PRINT_TITLE);
+	printPrinterLabel_ = mkStatic(L"Printer", IDC_PRINT_PRINTER_LABEL);
+	printPrinterCombo_ = CreateWindowExW(0, L"COMBOBOX", L"",
+		WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_PRINTER_COMBO), hInst_, nullptr);
+	printCopiesLabel_ = mkStatic(L"Copies", IDC_PRINT_COPIES_LABEL);
+	printCopiesEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1",
+		WS_CHILD | ES_AUTOHSCROLL | ES_NUMBER, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_COPIES_EDIT), hInst_, nullptr);
+	printRangeLabel_ = mkStatic(L"Pages", IDC_PRINT_RANGE_LABEL);
+	printRangeAll_ = mkRadio(L"All", IDC_PRINT_RANGE_ALL, true);
+	printRangeCurrent_ = mkRadio(L"Current page", IDC_PRINT_RANGE_CURRENT, false);
+	printRangeCustom_ = mkRadio(L"Custom range", IDC_PRINT_RANGE_CUSTOM, false);
+	printRangeEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+		WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_RANGE_EDIT), hInst_, nullptr);
+	printOrientLabel_ = mkStatic(L"Orientation", IDC_PRINT_ORIENT_LABEL);
+	printOrientPortrait_ = mkRadio(L"Portrait", IDC_PRINT_ORIENT_PORTRAIT, true);
+	printOrientLandscape_ = mkRadio(L"Landscape", IDC_PRINT_ORIENT_LANDSCAPE, false);
+	printColorLabel_ = mkStatic(L"Color", IDC_PRINT_COLOR_LABEL);
+	printColorColor_ = mkRadio(L"Color", IDC_PRINT_COLOR_COLOR, true);
+	printColorGray_ = mkRadio(L"Grayscale", IDC_PRINT_COLOR_GRAY, false);
+	printPageNavLabel_ = mkStatic(L"", IDC_PRINT_PAGENAV_LABEL);
+	printPageNavPrev_ = CreateWindowExW(0, L"BUTTON", L"◀", WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_PAGENAV_PREV), hInst_, nullptr);
+	printPageNavNext_ = CreateWindowExW(0, L"BUTTON", L"▶", WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_PAGENAV_NEXT), hInst_, nullptr);
+	printGo_ = CreateWindowExW(0, L"BUTTON", L"Print",
+		WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_GO), hInst_, nullptr);
+	printCancel_ = CreateWindowExW(0, L"BUTTON", L"Cancel",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_CANCEL), hInst_, nullptr);
+	SendMessageW(printRangeAll_, BM_SETCHECK, BST_CHECKED, 0);
+	SendMessageW(printOrientPortrait_, BM_SETCHECK, BST_CHECKED, 0);
+	SendMessageW(printColorColor_, BM_SETCHECK, BST_CHECKED, 0);
+	for (HWND h : { printTitle_, printPrinterLabel_, printPrinterCombo_, printCopiesLabel_, printCopiesEdit_,
+		printRangeLabel_, printRangeAll_, printRangeCurrent_, printRangeCustom_, printRangeEdit_,
+		printOrientLabel_, printOrientPortrait_, printOrientLandscape_,
+		printColorLabel_, printColorColor_, printColorGray_,
+		printPageNavLabel_, printPageNavPrev_, printPageNavNext_, printGo_, printCancel_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+
+	// Rich-text-editor side panel (hidden until "Edit as Rich Text..."),
+	// same right-docked idiom as the print panel above (and mutually
+	// exclusive with it -- see showTextEditorPanel()).
+	LoadLibraryW(L"Msftedit.dll"); // registers MSFTEDIT_CLASS; needed once, before creating the rich edit below
+	textPanelTitle_ = mkStatic(L"Edit as Rich Text", IDC_TEXTPANEL_TITLE);
+	// BS_CHECKBOX|BS_PUSHLIKE (not BS_AUTOCHECKBOX) so the button draws with a
+	// pressed/sunken look when checked, matching what a bold/italic/underline
+	// toggle should look like, but WITHOUT the control auto-flipping its own
+	// check state on click -- textPanelToggleFormat()/updateTextFormatButtons()
+	// drive the check state explicitly from the rich edit's actual character
+	// format, which is the only way to stay correct for a mixed-format
+	// selection (where "currently on" isn't a simple flip).
+	textBoldBtn_ = CreateWindowExW(0, L"BUTTON", L"B", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_BOLD), hInst_, nullptr);
+	textItalicBtn_ = CreateWindowExW(0, L"BUTTON", L"I", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_ITALIC), hInst_, nullptr);
+	textUnderlineBtn_ = CreateWindowExW(0, L"BUTTON", L"U", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_UNDERLINE), hInst_, nullptr);
+	textCaseLabel_ = mkStatic(L"Change case", IDC_TEXTPANEL_CASE_LABEL);
+	textCaseCombo_ = CreateWindowExW(0, L"COMBOBOX", L"",
+		WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_CASE_COMBO), hInst_, nullptr);
+	for (const wchar_t* item : { L"UPPERCASE", L"lowercase", L"Title Case", L"Sentence case" })
+		SendMessageW(textCaseCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+	textRichEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+		WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_TEXTPANEL_RICHEDIT), hInst_, nullptr);
+	{
+		// A comfortable default reading size -- the rich edit's built-in
+		// default is a small legacy font that looks out of place next to
+		// real UI text.
+		CHARFORMAT2W cf = { sizeof(cf) };
+		cf.dwMask = CFM_FACE | CFM_SIZE;
+		wcscpy_s(cf.szFaceName, L"Segoe UI");
+		cf.yHeight = 200; // twips: 10pt
+		SendMessageW(textRichEdit_, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
+	}
+	// EN_SELCHANGE is opt-in for a rich edit -- needed so the B/I/U buttons
+	// can follow the caret (see updateTextFormatButtons()) instead of only
+	// updating right after a click.
+	SendMessageW(textRichEdit_, EM_SETEVENTMASK, 0,
+		SendMessageW(textRichEdit_, EM_GETEVENTMASK, 0, 0) | ENM_SELCHANGE);
+	textCopyBtn_ = CreateWindowExW(0, L"BUTTON", L"Copy to Clipboard",
+		WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_COPY), hInst_, nullptr);
+	textCloseBtn_ = CreateWindowExW(0, L"BUTTON", L"Close",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_TEXTPANEL_CLOSE), hInst_, nullptr);
+	for (HWND h : { textPanelTitle_, textBoldBtn_, textItalicBtn_, textUnderlineBtn_,
+		textCaseLabel_, textCaseCombo_, textRichEdit_, textCopyBtn_, textCloseBtn_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 
 	// Organize side panel's bottom action strip (hidden outside organize mode).
 	organizeInsert_ = CreateWindowExW(0, L"BUTTON", L"Insert...",
@@ -5165,6 +5500,216 @@ void FrameWindow::updateRedactBar()
 		EnableWindow(redactClear_, n > 0);
 	}
 	layout();
+}
+
+void FrameWindow::showPrintPanel(bool show)
+{
+	if (show == printPanelVisible_) return;
+	if (show) {
+		if (!doc_ || !doc_->isOpen() || !canvas_) return;
+		if (textPanelVisible_) showTextEditorPanel(false); // one right-hand panel at a time
+		// Populate the printer list fresh every time the panel opens (cheap,
+		// and picks up printers installed/removed since last time).
+		SendMessageW(printPrinterCombo_, CB_RESETCONTENT, 0, 0);
+		std::vector<std::wstring> printers = ListPrinterNames();
+		std::wstring def = DefaultPrinterName();
+		int defIndex = 0;
+		for (size_t i = 0; i < printers.size(); ++i) {
+			SendMessageW(printPrinterCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(printers[i].c_str()));
+			if (printers[i] == def) defIndex = static_cast<int>(i);
+		}
+		if (!printers.empty()) SendMessageW(printPrinterCombo_, CB_SETCURSEL, defIndex, 0);
+		// Reset the rest of the panel to sensible defaults each time it opens.
+		SetWindowTextW(printCopiesEdit_, L"1");
+		SendMessageW(printRangeAll_, BM_SETCHECK, BST_CHECKED, 0);
+		SendMessageW(printRangeCurrent_, BM_SETCHECK, BST_UNCHECKED, 0);
+		SendMessageW(printRangeCustom_, BM_SETCHECK, BST_UNCHECKED, 0);
+		SetWindowTextW(printRangeEdit_, L"");
+		EnableWindow(printRangeEdit_, FALSE);
+		SendMessageW(printOrientPortrait_, BM_SETCHECK, BST_CHECKED, 0);
+		SendMessageW(printOrientLandscape_, BM_SETCHECK, BST_UNCHECKED, 0);
+		SendMessageW(printColorColor_, BM_SETCHECK, BST_CHECKED, 0);
+		SendMessageW(printColorGray_, BM_SETCHECK, BST_UNCHECKED, 0);
+		printPanelVisible_ = true;
+		layout();
+		updatePrintPreviewFromPanel();
+	} else {
+		printPanelVisible_ = false;
+		if (canvas_) canvas_->endPrintPreview();
+		layout();
+	}
+}
+
+PrintSettings FrameWindow::readPrintSettingsFromPanel() const
+{
+	PrintSettings s;
+	int sel = static_cast<int>(SendMessageW(printPrinterCombo_, CB_GETCURSEL, 0, 0));
+	if (sel >= 0) {
+		wchar_t buf[512];
+		if (SendMessageW(printPrinterCombo_, CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(buf)) > 0)
+			s.printerName = buf;
+	}
+	wchar_t copiesBuf[16];
+	GetWindowTextW(printCopiesEdit_, copiesBuf, 16);
+	s.copies = std::max(1, _wtoi(copiesBuf));
+	if (SendMessageW(printRangeCurrent_, BM_GETCHECK, 0, 0) == BST_CHECKED)
+		s.rangeMode = PrintRangeMode::Current;
+	else if (SendMessageW(printRangeCustom_, BM_GETCHECK, 0, 0) == BST_CHECKED)
+		s.rangeMode = PrintRangeMode::Custom;
+	else
+		s.rangeMode = PrintRangeMode::All;
+	wchar_t rangeBuf[128];
+	GetWindowTextW(printRangeEdit_, rangeBuf, 128);
+	s.customRange = rangeBuf;
+	s.landscape = SendMessageW(printOrientLandscape_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	s.grayscale = SendMessageW(printColorGray_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	return s;
+}
+
+void FrameWindow::updatePrintPreviewFromPanel()
+{
+	if (!printPanelVisible_ || !doc_ || !doc_->isOpen() || !canvas_) return;
+	EnableWindow(printRangeEdit_, SendMessageW(printRangeCustom_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+	PrintSettings s = readPrintSettingsFromPanel();
+	int curPage = canvas_->currentPage();
+	std::vector<int> pages = ResolvePrintPages(s, doc_->pageCount(), curPage);
+	if (!canvas_->printPreviewActive())
+		canvas_->beginPrintPreview(pages, s.grayscale, s.landscape);
+	else
+		canvas_->setPrintPreviewOptions(pages, s.grayscale, s.landscape);
+	int n = canvas_->printPreviewPageCount();
+	wchar_t buf[64];
+	if (n <= 0) wcscpy_s(buf, L"No pages");
+	else swprintf(buf, 64, L"Page %d of %d", canvas_->printPreviewCursor() + 1, n);
+	SetWindowTextW(printPageNavLabel_, buf);
+	EnableWindow(printPageNavPrev_, n > 1 && canvas_->printPreviewCursor() > 0);
+	EnableWindow(printPageNavNext_, n > 1 && canvas_->printPreviewCursor() < n - 1);
+	EnableWindow(printGo_, n > 0);
+}
+
+void FrameWindow::doExecutePrint()
+{
+	if (!doc_ || !doc_->isOpen() || !canvas_) return;
+	PrintSettings s = readPrintSettingsFromPanel();
+	std::vector<int> pages = ResolvePrintPages(s, doc_->pageCount(), canvas_->currentPage());
+	if (pages.empty()) {
+		MessageBoxW(hwnd_, L"No pages to print -- check the page range.", L"Print", MB_OK | MB_ICONWARNING);
+		return;
+	}
+	std::string err;
+	bool ok = ExecutePrintJob(hwnd_, *doc_, s, pages, err);
+	if (!ok) {
+		std::wstring werr(err.begin(), err.end());
+		MessageBoxW(hwnd_, werr.empty() ? L"Printing failed." : werr.c_str(), L"Print", MB_OK | MB_ICONERROR);
+		return; // leave the panel open so the user can fix settings and retry
+	}
+	showPrintPanel(false);
+}
+
+void FrameWindow::showTextEditorPanel(bool show, const std::wstring& initialText)
+{
+	if (show) {
+		if (printPanelVisible_) showPrintPanel(false); // one right-hand panel at a time
+		SetWindowTextW(textRichEdit_, initialText.c_str());
+		SendMessageW(textRichEdit_, EM_SETSEL, 0, 0);
+		textPanelVisible_ = true;
+		layout();
+		SetFocus(textRichEdit_);
+		updateTextFormatButtons();
+	} else {
+		if (!textPanelVisible_) return;
+		textPanelVisible_ = false;
+		SetWindowTextW(textRichEdit_, L""); // don't hold onto the last selection's text once closed
+		layout();
+	}
+}
+
+void FrameWindow::textPanelToggleFormat(DWORD mask, DWORD effect)
+{
+	CHARFORMAT2W cf = { sizeof(cf) };
+	SendMessageW(textRichEdit_, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
+	bool currentlyOn = (cf.dwMask & mask) && (cf.dwEffects & effect);
+	cf.dwMask = mask;
+	cf.dwEffects = currentlyOn ? 0 : effect;
+	SendMessageW(textRichEdit_, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
+	SetFocus(textRichEdit_);
+	updateTextFormatButtons();
+}
+
+void FrameWindow::updateTextFormatButtons()
+{
+	CHARFORMAT2W cf = { sizeof(cf) };
+	SendMessageW(textRichEdit_, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
+	// A mixed-format selection reports the bit absent from dwMask (not just
+	// dwEffects) -- treated as "off" here, same as GDI/Word's own toolbars.
+	auto isOn = [&](DWORD mask, DWORD effect) { return (cf.dwMask & mask) && (cf.dwEffects & effect); };
+	SendMessageW(textBoldBtn_, BM_SETCHECK, isOn(CFM_BOLD, CFE_BOLD) ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW(textItalicBtn_, BM_SETCHECK, isOn(CFM_ITALIC, CFE_ITALIC) ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW(textUnderlineBtn_, BM_SETCHECK, isOn(CFM_UNDERLINE, CFE_UNDERLINE) ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+void FrameWindow::textPanelApplyCase(int mode)
+{
+	DWORD selStart = 0, selEnd = 0;
+	SendMessageW(textRichEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart), reinterpret_cast<LPARAM>(&selEnd));
+	if (selStart == selEnd) {
+		// Nothing selected -- apply to the whole box, matching what a user
+		// would expect from picking a case with no explicit selection
+		// (there's nothing else the command could mean).
+		SendMessageW(textRichEdit_, EM_SETSEL, 0, -1);
+		SendMessageW(textRichEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart), reinterpret_cast<LPARAM>(&selEnd));
+	}
+	int len = static_cast<int>(selEnd - selStart);
+	if (len <= 0) return;
+	std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+	SendMessageW(textRichEdit_, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(text.data()));
+	text.resize(wcslen(text.c_str()));
+
+	switch (mode) {
+	case 0: // UPPERCASE
+		CharUpperBuffW(text.data(), static_cast<DWORD>(text.size()));
+		break;
+	case 1: // lowercase
+		CharLowerBuffW(text.data(), static_cast<DWORD>(text.size()));
+		break;
+	case 2: { // Title Case
+		bool startOfWord = true;
+		for (auto& ch : text) {
+			if (iswspace(ch)) { startOfWord = true; continue; }
+			if (startOfWord) CharUpperBuffW(&ch, 1);
+			else CharLowerBuffW(&ch, 1);
+			startOfWord = false;
+		}
+		break;
+	}
+	case 3: { // Sentence case
+		bool startOfSentence = true;
+		for (auto& ch : text) {
+			if (iswspace(ch)) continue;
+			if (startOfSentence) { CharUpperBuffW(&ch, 1); startOfSentence = false; }
+			else CharLowerBuffW(&ch, 1);
+			if (ch == L'.' || ch == L'!' || ch == L'?') startOfSentence = true;
+		}
+		break;
+	}
+	}
+	SendMessageW(textRichEdit_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+	SetFocus(textRichEdit_);
+}
+
+void FrameWindow::textPanelCopy()
+{
+	// Select-all + WM_COPY leans on the RichEdit control's own clipboard
+	// handling, which puts BOTH a plain-text and an RTF (formatted)
+	// rendering on the clipboard in one step -- no need to hand-generate RTF
+	// ourselves. The caret position is restored after so repeated copies
+	// while still editing don't leave the whole box visibly selected.
+	DWORD selStart = 0, selEnd = 0;
+	SendMessageW(textRichEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&selStart), reinterpret_cast<LPARAM>(&selEnd));
+	SendMessageW(textRichEdit_, EM_SETSEL, 0, -1);
+	SendMessageW(textRichEdit_, WM_COPY, 0, 0);
+	SendMessageW(textRichEdit_, EM_SETSEL, selStart, selEnd);
+	SetFocus(textRichEdit_);
 }
 
 void FrameWindow::applyRedactionsCmd()
@@ -5811,8 +6356,99 @@ void FrameWindow::layout()
 		MoveWindow(organizeDone_, x, y, bwDone, h, TRUE); x += bwDone + pad;
 		MoveWindow(organizeCancel_, x, y, bwCancel, h, TRUE);
 	}
+	// Print and text-editor panels are mutually exclusive (see
+	// showPrintPanel()/showTextEditorPanel()) and share one right-hand
+	// column width so switching between them doesn't jitter the canvas size.
+	int rightPanelW = (printPanelVisible_ || textPanelVisible_) ? Scale(300, dpi) : 0;
+	int printPanelW = rightPanelW;
+	if (printPanelVisible_) {
+		int pad = Scale(10, dpi);
+		int rowH = Scale(22, dpi);
+		int gap = Scale(6, dpi);
+		int px = fullW - printPanelW + pad;
+		int pw = printPanelW - pad * 2;
+		int y = top + pad;
+		auto row = [&](HWND h, int w = -1) {
+			MoveWindow(h, px, y, w < 0 ? pw : w, rowH, TRUE);
+			y += rowH + gap;
+		};
+		row(printTitle_);
+		y += gap;
+		row(printPrinterLabel_);
+		row(printPrinterCombo_);
+		y += gap;
+		int halfW = (pw - gap) / 2;
+		MoveWindow(printCopiesLabel_, px, y, pw, rowH, TRUE); y += rowH;
+		MoveWindow(printCopiesEdit_, px, y, Scale(70, dpi), rowH, TRUE); y += rowH + gap * 2;
+		row(printRangeLabel_);
+		row(printRangeAll_);
+		row(printRangeCurrent_);
+		row(printRangeCustom_);
+		row(printRangeEdit_);
+		y += gap;
+		row(printOrientLabel_);
+		MoveWindow(printOrientPortrait_, px, y, halfW, rowH, TRUE);
+		MoveWindow(printOrientLandscape_, px + halfW + gap, y, halfW, rowH, TRUE);
+		y += rowH + gap * 2;
+		row(printColorLabel_);
+		MoveWindow(printColorColor_, px, y, halfW, rowH, TRUE);
+		MoveWindow(printColorGray_, px + halfW + gap, y, halfW, rowH, TRUE);
+		y += rowH + gap * 3;
+		int navBtnW = Scale(32, dpi);
+		int navLabelW = std::max(0, pw - navBtnW * 2 - gap * 2);
+		MoveWindow(printPageNavPrev_, px, y, navBtnW, rowH, TRUE);
+		MoveWindow(printPageNavLabel_, px + navBtnW + gap, y, navLabelW, rowH, TRUE);
+		MoveWindow(printPageNavNext_, px + navBtnW + gap + navLabelW + gap, y, navBtnW, rowH, TRUE);
+		y += rowH + gap * 3;
+		int btnH = Scale(28, dpi);
+		MoveWindow(printGo_, px, y, halfW, btnH, TRUE);
+		MoveWindow(printCancel_, px + halfW + gap, y, halfW, btnH, TRUE);
+	}
+	int psw = printPanelVisible_ ? SW_SHOW : SW_HIDE;
+	for (HWND h : { printTitle_, printPrinterLabel_, printPrinterCombo_, printCopiesLabel_, printCopiesEdit_,
+		printRangeLabel_, printRangeAll_, printRangeCurrent_, printRangeCustom_, printRangeEdit_,
+		printOrientLabel_, printOrientPortrait_, printOrientLandscape_,
+		printColorLabel_, printColorColor_, printColorGray_,
+		printPageNavLabel_, printPageNavPrev_, printPageNavNext_, printGo_, printCancel_ })
+		ShowWindow(h, psw);
+
+	if (textPanelVisible_) {
+		int pad = Scale(10, dpi);
+		int rowH = Scale(22, dpi);
+		int gap = Scale(6, dpi);
+		int px = fullW - rightPanelW + pad;
+		int pw = rightPanelW - pad * 2;
+		int y = top + pad;
+		MoveWindow(textPanelTitle_, px, y, pw, rowH, TRUE);
+		y += rowH + gap;
+		int fmtBtnW = (pw - gap * 2) / 3;
+		MoveWindow(textBoldBtn_, px, y, fmtBtnW, rowH, TRUE);
+		MoveWindow(textItalicBtn_, px + fmtBtnW + gap, y, fmtBtnW, rowH, TRUE);
+		MoveWindow(textUnderlineBtn_, px + (fmtBtnW + gap) * 2, y, pw - (fmtBtnW + gap) * 2, rowH, TRUE);
+		y += rowH + gap * 2;
+		MoveWindow(textCaseLabel_, px, y, pw, rowH, TRUE);
+		y += rowH + gap;
+		MoveWindow(textCaseCombo_, px, y, pw, rowH * 6, TRUE); // extra height = dropdown list allowance
+		y += rowH + gap * 2;
+		int bottomH = Scale(28, dpi);
+		// Reserve room for BOTH bottom buttons (copy + close), not just one --
+		// this previously reserved only a single bottomH + pad*2, so the close
+		// button ended up drawn bottomH+gap-pad past the panel's bottom edge,
+		// overlapping the status bar and becoming unclickable.
+		int richH = std::max(0, midH - (y - top) - bottomH * 2 - gap - pad);
+		MoveWindow(textRichEdit_, px, y, pw, richH, TRUE);
+		y += richH + pad;
+		MoveWindow(textCopyBtn_, px, y, pw, bottomH, TRUE);
+		y += bottomH + gap;
+		MoveWindow(textCloseBtn_, px, y, pw, bottomH, TRUE);
+	}
+	int tsw = textPanelVisible_ ? SW_SHOW : SW_HIDE;
+	for (HWND h : { textPanelTitle_, textBoldBtn_, textItalicBtn_, textUnderlineBtn_,
+		textCaseLabel_, textCaseCombo_, textRichEdit_, textCopyBtn_, textCloseBtn_ })
+		ShowWindow(h, tsw);
+
 	if (canvas_)
-		MoveWindow(canvas_->hwnd(), thumbW, top, fullW - thumbW, midH, TRUE);
+		MoveWindow(canvas_->hwnd(), thumbW, top, fullW - thumbW - rightPanelW, midH, TRUE);
 }
 
 int FrameWindow::newTab()
@@ -5826,8 +6462,16 @@ int FrameWindow::newTab()
 	tab->thumbs->setCanvas(tab->canvas.get());
 	tab->canvas->setOnChanged([this] { updateTitle(); updateRedactBar(); });
 	tab->canvas->setOnExitTextTool([this] { selectTool(IDM_TOOL_SELECT); });
-	tab->canvas->setOnViewChanged([this] { updateZoomLabel(); updatePageEditBox(); });
+	tab->canvas->setOnViewChanged([this] {
+		updateZoomLabel();
+		updatePageEditBox();
+		// Wheel-driven print-preview paging (see CanvasView::onWheel) moves
+		// the preview cursor directly on the canvas; keep the panel's "Page
+		// N of M" readout and prev/next enabled-state in sync with it.
+		if (printPanelVisible_ && canvas_ && canvas_->printPreviewActive()) updatePrintPreviewFromPanel();
+	});
 	tab->canvas->setOnEmptyStateAction([this](int cmdId) { onCommand(cmdId); });
+	tab->canvas->setOnOpenTextEditor([this](const std::wstring& text) { showTextEditorPanel(true, text); });
 	tab->canvas->setDarkMode(isDark_);
 	tab->thumbs->setDarkMode(isDark_);
 	// Both start hidden; switchToTab() shows whichever becomes active.
@@ -5854,6 +6498,16 @@ void FrameWindow::switchToTab(int idx)
 	// Same for an in-progress Organize session: nothing was committed to
 	// doc_ yet, so this is a clean discard, not a lost-work situation.
 	if (thumbs_ && thumbs_->organizeMode()) organizeCancel();
+	// And the print panel -- its live preview lives on the CURRENT tab's
+	// CanvasView, which is about to stop being canvas_. Nothing was
+	// committed either (Print executes immediately, it doesn't leave
+	// pending state), so this is a clean discard too.
+	if (printPanelVisible_) showPrintPanel(false);
+	// Same for the text-editor panel: its content came from whichever tab's
+	// selection was active, so it doesn't make sense to carry it across a
+	// tab switch either (and nothing here is "in progress" -- Copy already
+	// happened if the user wanted it).
+	if (textPanelVisible_) showTextEditorPanel(false);
 	if (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size()) && activeTab_ != idx) {
 		ShowWindow(tabs_[activeTab_]->canvas->hwnd(), SW_HIDE);
 		ShowWindow(tabs_[activeTab_]->thumbs->hwnd(), SW_HIDE);
@@ -5896,6 +6550,14 @@ void FrameWindow::switchToTab(int idx)
 void FrameWindow::closeTab(int idx)
 {
 	if (idx < 0 || idx >= static_cast<int>(tabs_.size())) return;
+	// Tear the print panel down before anything else: it holds a live
+	// preview on canvas_'s CanvasView, and closing the tab that's CURRENTLY
+	// active (the common case) skips the switchToTab() call below entirely
+	// (activeTab_ == idx already), so that call's own printPanelVisible_
+	// guard would otherwise only run later, after this tab's canvas has
+	// already been DestroyWindow()'d -- a use-after-free on canvas_.
+	if (printPanelVisible_) showPrintPanel(false);
+	if (textPanelVisible_) showTextEditorPanel(false);
 	// Make it active first so promptSaveIfDirty()/saveDocument() (which
 	// operate on doc_/canvas_) see the right document.
 	if (activeTab_ != idx) switchToTab(idx);
@@ -6502,11 +7164,60 @@ void FrameWindow::onCommand(int id)
 	}
 	case IDM_FILE_EXIT: if (promptSaveIfDirty()) DestroyWindow(hwnd_); break;
 	case IDM_FILE_PRINT:
-		// The main window already shows the document, so go straight to the
-		// native Windows print dialog (no redundant in-app preview).
-		if (doc_ && doc_->isOpen())
-			PrintDocument(hwnd_, *doc_, canvas_ ? canvas_->currentPage() : 0);
+		if (doc_ && doc_->isOpen()) showPrintPanel(true);
 		break;
+	// BS_AUTORADIOBUTTON only auto-unchecks its siblings under a real dialog
+	// procedure (DefDlgProc) -- this frame is a plain window (DefWindowProc),
+	// so each radio group's exclusivity has to be done by hand here.
+	case IDC_PRINT_RANGE_ALL:
+	case IDC_PRINT_RANGE_CURRENT:
+	case IDC_PRINT_RANGE_CUSTOM:
+		for (HWND h : { printRangeAll_, printRangeCurrent_, printRangeCustom_ })
+			SendMessageW(h, BM_SETCHECK, h == GetDlgItem(hwnd_, id) ? BST_CHECKED : BST_UNCHECKED, 0);
+		// An empty custom-range box resolves to zero pages, which would blank
+		// the preview entirely until the user finishes typing -- pre-fill it
+		// with whatever page the preview is already showing so switching to
+		// Custom never itself blanks anything, and select the text so typing
+		// immediately replaces it.
+		if (id == IDC_PRINT_RANGE_CUSTOM && GetWindowTextLengthW(printRangeEdit_) == 0 && canvas_) {
+			wchar_t buf[16];
+			swprintf(buf, 16, L"%d", canvas_->printPreviewCursor() + 1);
+			SetWindowTextW(printRangeEdit_, buf);
+			SendMessageW(printRangeEdit_, EM_SETSEL, 0, -1);
+		}
+		updatePrintPreviewFromPanel();
+		if (id == IDC_PRINT_RANGE_CUSTOM) SetFocus(printRangeEdit_);
+		break;
+	case IDC_PRINT_ORIENT_PORTRAIT:
+	case IDC_PRINT_ORIENT_LANDSCAPE:
+		for (HWND h : { printOrientPortrait_, printOrientLandscape_ })
+			SendMessageW(h, BM_SETCHECK, h == GetDlgItem(hwnd_, id) ? BST_CHECKED : BST_UNCHECKED, 0);
+		updatePrintPreviewFromPanel();
+		break;
+	case IDC_PRINT_COLOR_COLOR:
+	case IDC_PRINT_COLOR_GRAY:
+		for (HWND h : { printColorColor_, printColorGray_ })
+			SendMessageW(h, BM_SETCHECK, h == GetDlgItem(hwnd_, id) ? BST_CHECKED : BST_UNCHECKED, 0);
+		updatePrintPreviewFromPanel();
+		break;
+	case IDC_PRINT_PRINTER_COMBO:
+	case IDC_PRINT_COPIES_EDIT:
+	case IDC_PRINT_RANGE_EDIT:
+		updatePrintPreviewFromPanel();
+		break;
+	case IDC_PRINT_PAGENAV_PREV:
+		if (canvas_) { canvas_->printPreviewGoTo(canvas_->printPreviewCursor() - 1); updatePrintPreviewFromPanel(); }
+		break;
+	case IDC_PRINT_PAGENAV_NEXT:
+		if (canvas_) { canvas_->printPreviewGoTo(canvas_->printPreviewCursor() + 1); updatePrintPreviewFromPanel(); }
+		break;
+	case IDC_PRINT_GO: doExecutePrint(); break;
+	case IDC_PRINT_CANCEL: showPrintPanel(false); break;
+	case IDC_TEXTPANEL_BOLD: textPanelToggleFormat(CFM_BOLD, CFE_BOLD); break;
+	case IDC_TEXTPANEL_ITALIC: textPanelToggleFormat(CFM_ITALIC, CFE_ITALIC); break;
+	case IDC_TEXTPANEL_UNDERLINE: textPanelToggleFormat(CFM_UNDERLINE, CFE_UNDERLINE); break;
+	case IDC_TEXTPANEL_COPY: textPanelCopy(); break;
+	case IDC_TEXTPANEL_CLOSE: showTextEditorPanel(false); break;
 	case IDM_EDIT_COPY: if (canvas_) canvas_->copySelectionToClipboard(); break;
 	case IDM_EDIT_SELECTALL: if (canvas_) canvas_->selectAll(); break;
 	case IDM_EDIT_FIND: showSearchBar(true); break;
@@ -6895,10 +7606,32 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		SetBkMode(dc, TRANSPARENT);
 		return reinterpret_cast<LRESULT>(self->ctrlBgBrush_);
 	}
+	case WM_CTLCOLORBTN:
+		// Same recoloring as WM_CTLCOLORSTATIC/EDIT above, but for the print
+		// panel's radio button labels specifically -- those had
+		// SetWindowTheme(h, L"", L"") applied at creation (see mkRadio's
+		// comment) precisely so this actually takes effect for them, unlike
+		// ordinary themed push buttons elsewhere in the app.
+		if (!self->isDark_) break;
+		SetTextColor(reinterpret_cast<HDC>(wp), kDarkTheme.ctrlText);
+		SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+		return reinterpret_cast<LRESULT>(self->ctrlBgBrush_);
 	case WM_COMMAND:
 		// Search-as-you-type: debounce edit changes so large docs stay smooth.
 		if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == IDC_SEARCH_EDIT) {
 			SetTimer(hwnd, 1 /*IDT_SEARCH*/, 150, nullptr);
+			return 0;
+		}
+		// onCommand only takes the id (see below), so the case-converter
+		// combo's notification code has to be checked here -- it must react
+		// only to an actual selection change, not every WM_COMMAND a combo
+		// box sends for that id (CBN_DROPDOWN/CBN_CLOSEUP too), or opening
+		// the dropdown alone would spuriously re-apply the case conversion.
+		if (LOWORD(wp) == IDC_TEXTPANEL_CASE_COMBO) {
+			if (HIWORD(wp) == CBN_SELCHANGE) {
+				int sel = static_cast<int>(SendMessageW(self->textCaseCombo_, CB_GETCURSEL, 0, 0));
+				if (sel >= 0) self->textPanelApplyCase(sel);
+			}
 			return 0;
 		}
 		self->onCommand(LOWORD(wp));
@@ -6912,11 +7645,32 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			self->switchToTab(static_cast<int>(SendMessageW(self->tabStrip_, TCM_GETCURSEL, 0, 0)));
 			return 0;
 		}
+		if (nm->hwndFrom == self->textRichEdit_ && nm->code == EN_SELCHANGE) {
+			self->updateTextFormatButtons();
+			return 0;
+		}
 		if (nm->code == TTN_GETDISPINFOW || nm->code == TTN_NEEDTEXTW) {
+			auto* di = reinterpret_cast<NMTTDISPINFOW*>(lp);
+			// Tab strip tooltips: owner-drawn tabs paint their own caption
+			// rather than relying on the control's own pszText, so there's
+			// nothing for the native truncation-tooltip behavior to show
+			// automatically. Serve the full file name on demand instead --
+			// idFrom here is the tab's own zero-based index (how
+			// TCS_TOOLTIPS registers each tab's hit-rect as its own
+			// "tool"), a completely different id space from the toolbar's
+			// command ids below, hence checking hwndFrom against the tab
+			// strip's own tooltip control first.
+			if (nm->hwndFrom == self->tabTooltip_) {
+				int idx = static_cast<int>(nm->idFrom);
+				if (idx >= 0 && idx < static_cast<int>(self->tabs_.size()) && !self->tabs_[idx]->name.empty())
+					di->lpszText = const_cast<LPWSTR>(self->tabs_[idx]->name.c_str());
+				else
+					di->lpszText = const_cast<LPWSTR>(L"");
+				return 0;
+			}
 			// Toolbar tooltips: our icon-only buttons have no iString (see
 			// toolbarTips_), so serve the text on demand here. idFrom is the
 			// button's command id for a toolbar-owned tooltip.
-			auto* di = reinterpret_cast<NMTTDISPINFOW*>(lp);
 			int ttId = static_cast<int>(nm->idFrom);
 			// The zoom-%/page-number placeholders are a live, constantly-
 			// relevant readout, not a button that needs an explanatory
