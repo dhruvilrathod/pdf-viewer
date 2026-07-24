@@ -1122,6 +1122,20 @@ private:
 	void closeTab(int idx);                   // prompts save-if-dirty, then removes the tab
 	void detachTabToNewWindow(int idx);       // closes the tab here, reopens its file in a brand-new window
 	void detachTabsToNewWindow(std::vector<int> indices); // same, for a whole multi-selected group at once
+	// Tab right-click menu, multi-selected group only. Both preserve the
+	// group's given order (selection/click order, NOT left-to-right tab
+	// position -- see multiSelectedTabs_) and leave the source tabs open and
+	// untouched; each prompts save-if-dirty per tab first (aborting the
+	// whole operation on Cancel) and skips any tab that's never been saved
+	// (no path yet), with a warning.
+	void mergeSelectedTabs(std::vector<int> indices); // merges into a fresh tab via the Organize panel, like doMerge()
+	void zipSelectedTabs(std::vector<int> indices);   // prompts for a .zip destination, writes via PdfDocument::ZipFiles
+	// Shared by the two above: switches to each tab in `indices` (in the
+	// given order) to flush/prompt-save any dirty edits, then collects its
+	// on-disk path into `paths`. Returns false if the user cancelled a save
+	// prompt (caller should abort). A tab that's never been saved (no path
+	// yet) is silently left out of `paths`, counted in `skippedUnsaved`.
+	bool collectTabPathsInOrder(const std::vector<int>& indices, std::vector<std::wstring>& paths, int& skippedUnsaved);
 	void cycleTab(int dir);                   // +1 = Ctrl+Tab, -1 = Ctrl+Shift+Tab
 	void updateTabLabel(int idx);
 	void reorderTab(int from, int to);        // drag-to-reorder: moves the DocTab and mirrors it in tabStrip_
@@ -6573,6 +6587,26 @@ void FrameWindow::closeTab(int idx)
 	tabs_.erase(tabs_.begin() + idx);
 	clearTabMultiSelect(); // indices below would otherwise drift out of sync
 
+	// tabs_[idx] just closing is the COMMON case (activeTab_ == idx already,
+	// so the switchToTab() above never ran) -- thumbs_/canvas_/doc_ still
+	// point at the DocTab whose unique_ptrs erase() just destructed. Null
+	// them before the fallback switchToTab() below: its very first line is
+	// `if (thumbs_ && thumbs_->organizeMode()) organizeCancel();`, which
+	// would otherwise read organizeMode_ off freed memory. That's normally
+	// harmless-but-still-UB (a plain tab was never organizeMode_==true, so
+	// the stale read usually still comes back false) -- except right after
+	// a tab that WAS just in Organize mode (e.g. a fresh Merge result closed
+	// without saving), where the freed ThumbPanel's memory reads back true
+	// (in a Debug build, freed memory is CRT-filled with 0xDD, which is
+	// non-zero), calling organizeCancel() on an ALSO-dangling doc_ and
+	// hanging forever trying to lock its freed (garbage-filled) mutex_.
+	// Confirmed via WinDbg on a hung repro: the blocked thread's stack was
+	// closeTab -> switchToTab -> organizeCancel -> PdfDocument::closeExternalFiles's
+	// std::lock_guard, stuck acquiring an SRWLOCK that will never be released.
+	thumbs_ = nullptr;
+	canvas_ = nullptr;
+	doc_ = nullptr;
+
 	if (tabs_.empty()) {
 		// Closing the last tab closes this window (browser-tab convention
 		// would leave a blank tab behind; a single-purpose document app
@@ -6642,6 +6676,101 @@ void FrameWindow::detachTabsToNewWindow(std::vector<int> indices)
 	switchToTab(std::min(indices[0], static_cast<int>(tabs_.size()) - 1));
 
 	SpawnNewWindow(hInst_, paths);
+}
+
+bool FrameWindow::collectTabPathsInOrder(const std::vector<int>& indices, std::vector<std::wstring>& paths, int& skippedUnsaved)
+{
+	skippedUnsaved = 0;
+	for (int idx : indices) {
+		if (idx < 0 || idx >= static_cast<int>(tabs_.size())) continue;
+		switchToTab(idx);
+		if (tabs_[idx]->path.empty()) { ++skippedUnsaved; continue; }
+		if (!promptSaveIfDirty()) return false; // user cancelled -- abort the whole operation
+		paths.push_back(tabs_[idx]->path);
+	}
+	return true;
+}
+
+void FrameWindow::mergeSelectedTabs(std::vector<int> indices)
+{
+	std::vector<std::wstring> paths;
+	int skippedUnsaved = 0;
+	if (!collectTabPathsInOrder(indices, paths, skippedUnsaved)) return;
+	if (skippedUnsaved > 0) {
+		wchar_t msg[192];
+		swprintf(msg, 192, L"%d unsaved tab(s) don't have a file yet and were left out of the merge. Save them first to include them.",
+			skippedUnsaved);
+		MessageBoxW(hwnd_, msg, L"Merge Selected Tabs", MB_OK | MB_ICONINFORMATION);
+	}
+	if (paths.size() < 2) { MessageBeep(MB_ICONWARNING); return; }
+
+	// Like doMerge(): never disturb an already-open document -- merge always
+	// lands in a fresh tab, seeded with the selected tabs' pages in order.
+	switchToTab(newTab());
+	if (!thumbs_ || !doc_) return;
+
+	std::vector<PdfDocument::PagePlanEntry> seed;
+	int skippedUnreadable = 0;
+	for (auto& p : paths) {
+		std::string err;
+		int idx = doc_->openExternalFile(p.c_str(), err);
+		if (idx < 0) { ++skippedUnreadable; continue; }
+		int n = doc_->externalPageCount(idx);
+		for (int pg = 0; pg < n; ++pg) seed.push_back({ idx, pg, 0 });
+	}
+	if (skippedUnreadable > 0) {
+		wchar_t msg[160];
+		swprintf(msg, 160, L"%d file(s) could not be added (password-protected or unreadable).", skippedUnreadable);
+		MessageBoxW(hwnd_, msg, L"Merge Selected Tabs", MB_OK | MB_ICONWARNING);
+	}
+	if (seed.empty()) return;
+	organizeShownThumbsBefore_ = showThumbs_;
+	// Same reason as doMerge(): this tab's doc_ was never doc_->open()'d, so
+	// ThumbPanel needs an explicit setDocument() to have anything to render
+	// external-file thumbnails from.
+	thumbs_->setDocument(doc_);
+	thumbs_->enterOrganizeMode(std::move(seed));
+	layout();
+}
+
+void FrameWindow::zipSelectedTabs(std::vector<int> indices)
+{
+	std::vector<std::wstring> paths;
+	int skippedUnsaved = 0;
+	if (!collectTabPathsInOrder(indices, paths, skippedUnsaved)) return;
+	if (skippedUnsaved > 0) {
+		wchar_t msg[192];
+		swprintf(msg, 192, L"%d unsaved tab(s) don't have a file yet and were left out of the zip. Save them first to include them.",
+			skippedUnsaved);
+		MessageBoxW(hwnd_, msg, L"Zip Selected Tabs", MB_OK | MB_ICONINFORMATION);
+	}
+	if (paths.empty()) { MessageBeep(MB_ICONWARNING); return; }
+
+	wchar_t file[MAX_PATH] = L"Documents.zip";
+	OPENFILENAMEW ofn = {};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd_;
+	ofn.lpstrFilter = L"Zip Archive (*.zip)\0*.zip\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrDefExt = L"zip";
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+	ofn.lpstrTitle = L"Zip Selected Tabs";
+	if (!GetSaveFileNameW(&ofn)) return;
+
+	std::string err;
+	std::vector<std::wstring> skipped;
+	if (!PdfDocument::ZipFiles(paths, file, err, &skipped)) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to create the zip file." : wmsg.c_str(),
+			L"Zip Selected Tabs", MB_OK | MB_ICONERROR);
+		return;
+	}
+	if (!skipped.empty()) {
+		wchar_t msg[160];
+		swprintf(msg, 160, L"%d file(s) could not be added to the zip.", static_cast<int>(skipped.size()));
+		MessageBoxW(hwnd_, msg, L"Zip Selected Tabs", MB_OK | MB_ICONWARNING);
+	}
 }
 
 void FrameWindow::cycleTab(int dir)
@@ -6926,6 +7055,17 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 				if (asGroup) swprintf(openLabel, 48, L"Open %d Tabs in New Window", static_cast<int>(group.size()));
 				else wcscpy_s(openLabel, L"Open in New Window");
 				AppendMenuW(m, MF_STRING, IDM_TAB_OPEN_NEW_WINDOW, openLabel);
+				// Merge/Zip only make sense for an actual multi-selected group
+				// (a lone tab has nothing to combine with) -- group.size() is
+				// always exactly 1 when !asGroup, so gate on asGroup itself.
+				if (asGroup) {
+					AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+					wchar_t mergeLabel[48], zipLabel[48];
+					swprintf(mergeLabel, 48, L"Merge %d Tabs...", static_cast<int>(group.size()));
+					AppendMenuW(m, MF_STRING, IDM_TAB_MERGE_SELECTED, mergeLabel);
+					swprintf(zipLabel, 48, L"Zip %d Tabs...", static_cast<int>(group.size()));
+					AppendMenuW(m, MF_STRING, IDM_TAB_ZIP_SELECTED, zipLabel);
+				}
 				POINT pt = hit.pt;
 				ClientToScreen(hwnd, &pt);
 				self->switchToTab(idx);
@@ -6933,6 +7073,8 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 				DestroyMenu(m);
 				if (sel == IDM_TAB_CLOSE) self->closeTab(idx);
 				else if (sel == IDM_TAB_OPEN_NEW_WINDOW) self->detachTabsToNewWindow(group);
+				else if (sel == IDM_TAB_MERGE_SELECTED) self->mergeSelectedTabs(group);
+				else if (sel == IDM_TAB_ZIP_SELECTED) self->zipSelectedTabs(group);
 			}
 			return 0;
 		}

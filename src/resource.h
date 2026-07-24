@@ -23,6 +23,8 @@
 #define IDM_TAB_PREV         1023  // Ctrl+Shift+Tab
 #define IDM_TAB_CLOSE        1024  // Ctrl+W
 #define IDM_TAB_OPEN_NEW_WINDOW 1025  // tab right-click menu: detach into its own top-level window
+#define IDM_TAB_MERGE_SELECTED  1026  // tab right-click menu, multi-selected group only: merge in selection order
+#define IDM_TAB_ZIP_SELECTED    1027  // tab right-click menu, multi-selected group only: zip the underlying files
 
 #define IDM_EDIT_FIND        1040
 #define IDM_EDIT_FINDNEXT    1041

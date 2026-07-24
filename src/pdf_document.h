@@ -242,6 +242,21 @@ public:
 	static bool ConvertFilesToPdf(const std::vector<std::wstring>& paths, const wchar_t* outPath,
 		std::string& err, std::vector<std::wstring>* skipped = nullptr);
 
+	// Writes `paths` (arbitrary existing files, not necessarily PDFs) into a
+	// new zip archive at `outPath`, one entry per file named after its own
+	// filename (deduplicated with " (2)", " (3)", ... on a collision -- e.g.
+	// two tabs with the same file name open from different folders).
+	// Static, like ConvertFilesToPdf: owns its own throwaway fz_context,
+	// doesn't touch any existing PdfDocument's state. Entries are stored
+	// uncompressed -- the vendored MuPDF zip writer doesn't implement
+	// deflate (see fz_write_zip_entry in third_party/mupdf/source/fitz/zip.c),
+	// which is fine here since PDFs are already internally compressed and
+	// gain little from a second pass anyway. Skips files that can't be read
+	// and appends them to `skipped` if given, unless EVERY file fails, in
+	// which case it returns false (via `err`) with no output written.
+	static bool ZipFiles(const std::vector<std::wstring>& paths, const wchar_t* outPath,
+		std::string& err, std::vector<std::wstring>* skipped = nullptr);
+
 	// Rewraps every page's content in a scale/translate matrix and rewrites
 	// its MediaBox to A4 (landscape if the source page is wider than tall),
 	// fitting the original content fully inside, centered. Best-effort: also

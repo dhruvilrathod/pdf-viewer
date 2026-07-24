@@ -12,6 +12,6 @@
 // ===========================================================================
 #define APP_VERSION_MAJOR 1
 #define APP_VERSION_MINOR 6
-#define APP_VERSION_PATCH 5
+#define APP_VERSION_PATCH 6
 
-#define APP_VERSION_STR "1.6.5"
+#define APP_VERSION_STR "1.6.6"

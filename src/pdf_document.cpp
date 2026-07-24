@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -2098,6 +2099,88 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 		return false;
 	}
 	fz_drop_context(ctx);
+	if (!MoveFileExW(wtemp.c_str(), wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+		err = "could not write the output file (it may be open elsewhere)";
+		DeleteFileW(wtemp.c_str());
+		return false;
+	}
+	return true;
+}
+
+bool PdfDocument::ZipFiles(const std::vector<std::wstring>& paths, const wchar_t* outPath,
+	std::string& err, std::vector<std::wstring>* skipped)
+{
+	if (paths.empty()) { err = "no files selected"; return false; }
+
+	fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+	if (!ctx) { err = "MuPDF context not initialized"; return false; }
+
+	// Same write-to-temp-then-rename discipline as ConvertFilesToPdf() --
+	// a half-written zip never becomes the visible output file.
+	std::wstring wtarget(outPath);
+	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
+	std::string utemp = toUtf8(wtemp.c_str());
+
+	fz_zip_writer* zip = nullptr;
+	fz_try(ctx) { zip = fz_new_zip_writer(ctx, utemp.c_str()); }
+	fz_catch(ctx) {
+		err = fz_caught_message(ctx);
+		fz_drop_context(ctx);
+		return false;
+	}
+
+	// Zip entry names are just the source files' own base names, deduped
+	// with a " (2)", " (3)", ... suffix on a collision (case-insensitive,
+	// matching Windows' own filename semantics) -- e.g. two tabs open from
+	// different folders that happen to share a file name.
+	std::unordered_map<std::wstring, int> nameCounts;
+	auto entryNameFor = [&](const std::wstring& path) {
+		size_t slash = path.find_last_of(L"/\\");
+		std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
+		std::wstring key = base;
+		std::transform(key.begin(), key.end(), key.begin(), [](wchar_t c) { return std::towlower(c); });
+		int n = ++nameCounts[key];
+		if (n == 1) return base;
+		size_t dot = base.find_last_of(L'.');
+		std::wstring stem = dot == std::wstring::npos ? base : base.substr(0, dot);
+		std::wstring ext = dot == std::wstring::npos ? std::wstring() : base.substr(dot);
+		wchar_t suffix[16];
+		swprintf(suffix, 16, L" (%d)", n);
+		return stem + suffix + ext;
+	};
+
+	bool anyOk = false;
+	for (const auto& path : paths) {
+		std::string upath = toUtf8(path.c_str());
+		std::string entryName = toUtf8(entryNameFor(path).c_str());
+		fz_buffer* buf = nullptr;
+		fz_try(ctx) {
+			buf = fz_read_file(ctx, upath.c_str());
+			fz_write_zip_entry(ctx, zip, entryName.c_str(), buf, /*compress=*/1);
+			anyOk = true;
+		}
+		fz_always(ctx) { if (buf) fz_drop_buffer(ctx, buf); }
+		fz_catch(ctx) { if (skipped) skipped->push_back(path); }
+	}
+
+	if (!anyOk) {
+		err = "no files could be added";
+		fz_drop_zip_writer(ctx, zip);
+		fz_drop_context(ctx);
+		DeleteFileW(wtemp.c_str());
+		return false;
+	}
+
+	bool wrote = false;
+	fz_try(ctx) { fz_close_zip_writer(ctx, zip); wrote = true; }
+	fz_always(ctx) { fz_drop_zip_writer(ctx, zip); }
+	fz_catch(ctx) { err = fz_caught_message(ctx); }
+	fz_drop_context(ctx);
+	if (!wrote) {
+		DeleteFileW(wtemp.c_str());
+		return false;
+	}
+
 	if (!MoveFileExW(wtemp.c_str(), wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		err = "could not write the output file (it may be open elsewhere)";
 		DeleteFileW(wtemp.c_str());
