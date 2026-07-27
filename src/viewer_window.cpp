@@ -6671,6 +6671,15 @@ void FrameWindow::detachTabsToNewWindow(std::vector<int> indices)
 		tabs_.erase(tabs_.begin() + idx);
 	}
 	clearTabMultiSelect();
+	// Same dangling-pointer hazard as closeTab() (see its comment at the
+	// equivalent point): thumbs_/canvas_/doc_ still point at whichever tab
+	// the save-prompt loop above last switched to -- which the erase loop
+	// above just destructed (it's exactly the first, highest-index tab that
+	// loop removes). Null them before the fallback switchToTab() below, or
+	// its first line reads organizeMode_ off freed memory.
+	thumbs_ = nullptr;
+	canvas_ = nullptr;
+	doc_ = nullptr;
 	if (tabs_.empty()) { DestroyWindow(hwnd_); return; }
 	activeTab_ = -1;
 	switchToTab(std::min(indices[0], static_cast<int>(tabs_.size()) - 1));
