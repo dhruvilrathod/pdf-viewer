@@ -6,6 +6,7 @@
 #include "print_document.h"
 #include "resource.h"
 #include "updater.h"
+#include "package_info.h"
 #include "version.h"
 #include "webview_convert.h"
 
@@ -4764,8 +4765,9 @@ HWND FrameWindow::create(int nCmdShow, bool checkForUpdates)
 	// result comes back via WM_APP_UPDATE_RESULT once the message loop runs.
 	// Skipped for extra windows (drag-a-tab-out / "Open in New Window") --
 	// one check per process launch is enough, and a second window shouldn't
-	// pop its own redundant "update available" prompt.
-	if (checkForUpdates) {
+	// pop its own redundant "update available" prompt. Also skipped entirely
+	// for the packaged (MSIX/Store) build -- see startUpdateCheck().
+	if (checkForUpdates && !pkginfo::IsPackaged()) {
 		updater::CleanupAfterUpdate();
 		startUpdateCheck(/*manual=*/false);
 	}
@@ -5504,6 +5506,17 @@ void FrameWindow::runSetPassword()
 
 void FrameWindow::startUpdateCheck(bool manual)
 {
+	// The MSIX/Store build can't rewrite its own package files (installed to
+	// a locked, read-only location) -- updates for it come through the Store
+	// instead. This also covers the "Check for Updates" menu item, so a
+	// packaged build never hits the GitHub API at all.
+	if (pkginfo::IsPackaged()) {
+		if (manual)
+			MessageBoxW(hwnd_,
+				L"This copy of PDFast was installed from the Microsoft Store and updates automatically through the Store.",
+				L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+		return;
+	}
 	HWND hwnd = hwnd_;
 	// Detached worker: the GitHub API round-trip must not block the UI. It
 	// hands the result back via a posted message so all UI happens on the
@@ -8643,16 +8656,24 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 
 	if (optionalPath && *optionalPath) frame->openDocument(optionalPath);
 
-	// Plant/refresh the Start Menu shortcut (no installer does it for us) so
-	// PDFast is reachable from Start and search. Cheap + idempotent per launch.
-	EnsureStartMenuShortcut();
+	// Both of the below are portable-build-only: a packaged (MSIX/Store)
+	// install gets its Start Menu tile and its file-type association
+	// declaratively from Package.appxmanifest, so hand-writing a shortcut or
+	// HKCU\Software\Classes\... entries at runtime would just duplicate (or
+	// conflict with) what the OS already set up from the manifest.
+	if (!pkginfo::IsPackaged()) {
+		// Plant/refresh the Start Menu shortcut (no installer does it for us)
+		// so PDFast is reachable from Start and search. Cheap + idempotent
+		// per launch.
+		EnsureStartMenuShortcut();
 
-	// One-time (per user) offer to register as the default .pdf handler.
-	// Registers the file association candidate unconditionally (cheap,
-	// idempotent, HKCU-only) -- this also populates the right-click "Open with"
-	// list; the actual "make it default" confirmation always goes through
-	// Windows' own UI, never silently.
-	OfferSetAsDefault(frame->hwnd());
+		// One-time (per user) offer to register as the default .pdf handler.
+		// Registers the file association candidate unconditionally (cheap,
+		// idempotent, HKCU-only) -- this also populates the right-click
+		// "Open with" list; the actual "make it default" confirmation always
+		// goes through Windows' own UI, never silently.
+		OfferSetAsDefault(frame->hwnd());
+	}
 
 	HACCEL accel = LoadAcceleratorsW(hInstance, MAKEINTRESOURCEW(IDR_ACCEL));
 

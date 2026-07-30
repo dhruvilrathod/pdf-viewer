@@ -53,6 +53,7 @@ add_executable(pdfviewer WIN32
 	src/pdf_document.cpp
 	src/print_document.cpp
 	src/updater.cpp
+	src/package_info.cpp
 	src/word_convert.cpp
 	src/webview_convert.cpp
 	resources/app.rc
