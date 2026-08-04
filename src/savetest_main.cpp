@@ -377,6 +377,102 @@ int wmain(int argc, wchar_t** argv)
 		return failures == 0 ? 0 : 1;
 	}
 
+	// --textfit mode: exercises the "Add text" auto-fit sizing. For each sample
+	// string it sizes a box exactly the way CanvasView::autoFitTextRect does
+	// (measureFreeText + slack), adds the free-text annotation, bakes it into
+	// page content and reads the result back, so the lines MuPDF actually laid
+	// out can be compared with the lines the box was sized for. A mismatch is
+	// the "last word jumps to its own line" bug. `input` is ignored; `output`
+	// is used as a filename prefix for the scratch files this needs (the text
+	// is laid out on a blank page, so the only characters on it are the
+	// annotation's own).
+	if (argc > 3 && wcscmp(argv[3], L"--textfit") == 0) {
+		std::wstring txtPath = std::wstring(output) + L"_blank.txt";
+		std::wstring blankPath = std::wstring(output) + L"_blank.pdf";
+		if (FILE* f = _wfopen(txtPath.c_str(), L"wb")) { std::fclose(f); } // empty -> blank page
+		{
+			std::string e;
+			std::vector<std::wstring> src{ txtPath };
+			if (!PdfDocument::ConvertFilesToPdf(src, blankPath.c_str(), e, nullptr)) {
+				std::printf("could not make a blank page: %s\n", e.c_str());
+				return 1;
+			}
+		}
+		input = blankPath.c_str();
+
+		struct Sample { const char* text; const char* what; };
+		const Sample samples[] = {
+			{ "asdf sadf 465798  321 654 654 9879879  asdfasdf asdf 321 654 987", "reported OK case" },
+			{ "asdf sadf 465798  asdf asdf987 asdfasdf asdf 321 654 987", "reported wrapping case" },
+			{ "David Mark Cornish of 15 TAUNTON Avenue ENFIELD SA 5085", "reported wrapping case 2" },
+			{ "VIKTAR15 GROUP PTY. LTD. (ACN: 689 047 087 asdf mustnotinnewline)", "reported wrapping case 3" },
+			{ "Line one\nLine two is quite a bit longer than the first\nThird", "explicit newlines" },
+			{ "Line one\r\nLine two is quite a bit longer\r\nThird", "CRLF newlines (as an EDIT hands them over)" },
+			{ "Line one\rLine two\rThird", "CR newlines" },
+			{ "WWWWWWWWWW MMMMMMMMMM", "wide glyphs" },
+			{ "iiiiiiiiii llllllllll", "narrow glyphs" },
+			{ "Trailing spaces here   ", "trailing spaces" },
+			{ "", "empty" },
+		};
+		const float sizes[] = { 9.0f, 12.0f, 18.0f, 28.0f };
+		int failures = 0;
+		for (float fontSize : sizes) {
+			for (const auto& s : samples) {
+				PdfDocument doc;
+				std::string e; bool npw = false;
+				if (!doc.open(input, e, npw)) { std::printf("open failed: %s\n", e.c_str()); return 1; }
+				PageRectPt bound = doc.pageBound(0);
+
+				// --- identical to CanvasView::autoFitTextRect ---
+				float maxWPt = (bound.x1 - bound.x0) * 0.9f;
+				PageSizePt sz = doc.measureFreeText(s.text, "Helv", fontSize, 0.0f);
+				if (maxWPt > 0 && sz.w > maxWPt) sz = doc.measureFreeText(s.text, "Helv", fontSize, maxWPt);
+				const float slack = 2.0f;
+				float x0 = bound.x0 + 10, y0 = bound.y0 + 10;
+				PageRectPt rect{ x0, y0, x0 + (sz.w > 20.0f ? sz.w : 20.0f) + slack,
+					y0 + (sz.h > 14.0f ? sz.h : 14.0f) + slack };
+				int wantLines = static_cast<int>(sz.h / (1.2f * fontSize) + 0.5f);
+
+				if (!doc.addTextBox(0, rect, s.text, "Helv", fontSize, 0x000000, e)) {
+					std::printf("  FAIL addTextBox (%s): %s\n", s.what, e.c_str());
+					++failures;
+					continue;
+				}
+				if (!doc.flattenAnnotationsToContent(e)) {
+					std::printf("  FAIL flatten (%s): %s\n", s.what, e.c_str());
+					++failures;
+					continue;
+				}
+				// Count the laid-out lines, and how far down/right the glyphs
+				// reached. A wrapped line ends on the space it broke at, so
+				// lines have to be counted over spaces too -- but a trailing
+				// space is allowed to sit outside the box, so only visible
+				// glyphs count towards the extents.
+				int gotLines = 0;
+				float lowest = y0, widest = x0;
+				bool sawChar = false;
+				for (const auto& c : doc.pageChars(0)) {
+					if (c.lineBreakAfter) ++gotLines;
+					if (c.unicode == ' ') continue;
+					sawChar = true;
+					if (c.quad.y1 > lowest) lowest = c.quad.y1;
+					if (c.quad.x1 > widest) widest = c.quad.x1;
+				}
+
+				bool textEmpty = s.text[0] == '\0';
+				bool linesOk = textEmpty ? (!sawChar && gotLines == 0) : (gotLines == wantLines);
+				bool fitsBox = !sawChar || (lowest <= rect.y1 + 0.5f && widest <= rect.x1 + 0.5f);
+				std::printf("  [%s @%.0fpt] box=%.1fx%.1f lines want=%d got=%d bottom=%.1f/%.1f right=%.1f/%.1f %s\n",
+					s.what, fontSize, rect.x1 - rect.x0, rect.y1 - rect.y0, wantLines, gotLines,
+					lowest, rect.y1, widest, rect.x1,
+					(linesOk && fitsBox) ? "OK" : "FAIL");
+				if (!linesOk || !fitsBox) ++failures;
+			}
+		}
+		std::printf("=== %s ===\n", failures == 0 ? "ALL TEXTFIT CHECKS PASSED" : "TEXTFIT FAILURES PRESENT");
+		return failures == 0 ? 0 : 1;
+	}
+
 	// --pwtest mode: exercises open(needsPassword)/authenticate()/isEncrypted()/
 	// removeProtection() instead of the widget-editing flow below, which
 	// assumes an unencrypted, form-bearing PDF.

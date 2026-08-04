@@ -289,6 +289,35 @@ std::wstring Utf8ToWide(const std::string& s)
 	return w;
 }
 
+// Newline conversions between a native multi-line EDIT control (which wants
+// CRLF) and PDF annotation/field text (which wants a single line-break
+// character). MuPDF's appearance layout breaks a line on EITHER '\r' or '\n'
+// and then resumes at the very next character, so a CRLF pair lays out as two
+// breaks -- every typed newline would render as a blank line, pushing the rest
+// of the text down and out of the (clipped) box.
+std::wstring ToEditNewlines(const std::wstring& s)
+{
+	std::wstring out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); ++i) {
+		if (s[i] == L'\r' && i + 1 < s.size() && s[i + 1] == L'\n') continue; // already CRLF
+		if (s[i] == L'\n' || s[i] == L'\r') out += L"\r\n";
+		else out += s[i];
+	}
+	return out;
+}
+
+std::wstring FromEditNewlines(const std::wstring& s)
+{
+	std::wstring out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); ++i) {
+		if (s[i] == L'\r' && i + 1 < s.size() && s[i + 1] == L'\n') continue; // drop the CR of CRLF
+		out += (s[i] == L'\r') ? L'\n' : s[i];
+	}
+	return out;
+}
+
 // Alpha-blend a solid color over a rect (for translucent search highlights).
 void FillAlpha(HDC dc, const RECT& r, COLORREF color, BYTE alpha)
 {
@@ -745,10 +774,10 @@ private:
 	void adjustInlineFontSize(float deltaPt);
 	void deleteInlineAnnotAndClose();
 	void beginExistingAnnotEdit(int page, const AnnotInfo& ai);
-	// Natural (shrink-to-fit) box size for `text` at `fontSizePt`, anchored
+	// Natural (shrink-to-fit) box size for `utf8` at `fontSizePt`, anchored
 	// at (x0,y0) -- used on commit so the saved box always fits its content
 	// with a small margin, regardless of any manual resize while editing.
-	PageRectPt autoFitTextRect(int page, const std::wstring& text, float x0, float y0, float fontSizePt) const;
+	PageRectPt autoFitTextRect(int page, const std::string& utf8, float x0, float y0, float fontSizePt) const;
 
 	// Resize/move handles for free-text annotation boxes (not shown for form widgets).
 	void createResizeHandles();
@@ -1909,7 +1938,7 @@ void CanvasView::onLButtonUp(int mx, int my)
 				// Auto-fit to the final text, anchored at wherever the box's
 				// top-left ended up, ignoring whatever size was dragged
 				// during editing -- the saved box always shrink-wraps.
-				PageRectPt finalRect = autoFitTextRect(page, Utf8ToWide(text),
+				PageRectPt finalRect = autoFitTextRect(page, text,
 					inlineEditRectPt_.x0, inlineEditRectPt_.y0, inlineFontSize_);
 				std::string err2;
 				if (doc_->addTextBox(page, finalRect, text, "Helv", inlineFontSize_, textColor_, err2)) {
@@ -2714,7 +2743,10 @@ void CanvasView::updateInlineEditFont()
 	lf.lfHeight = -static_cast<int>(std::lround(sizePx));
 	lf.lfWeight = FW_NORMAL;
 	lf.lfCharSet = DEFAULT_CHARSET;
-	wcscpy_s(lf.lfFaceName, L"Segoe UI");
+	// Arial, not the UI font: it is metrically identical to the Helvetica the
+	// annotation is actually written in, so what's being typed occupies the
+	// same width on screen as it will once committed.
+	wcscpy_s(lf.lfFaceName, L"Arial");
 	HFONT f = CreateFontIndirectW(&lf);
 	SendMessageW(inlineEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(f), TRUE);
 	if (inlineEditFont_) DeleteObject(inlineEditFont_);
@@ -2760,7 +2792,7 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 			inlineEditFont_ = f;
 		}
 	}
-	SetWindowTextW(inlineEdit_, Utf8ToWide(utf8).c_str());
+	SetWindowTextW(inlineEdit_, ToEditNewlines(Utf8ToWide(utf8)).c_str());
 	SetWindowSubclass(inlineEdit_, InlineEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
 
 	if (inlineShowPopup_) {
@@ -2794,6 +2826,7 @@ void CanvasView::commitInlineEdit(bool commit)
 	std::wstring buf(static_cast<size_t>(n) + 1, L'\0');
 	GetWindowTextW(edit, buf.data(), n + 1);
 	buf.resize(n);
+	buf = FromEditNewlines(buf);
 	DestroyWindow(edit);
 	if (colorPopup_) { DestroyWindow(colorPopup_); colorPopup_ = nullptr; }
 	destroyResizeHandles();
@@ -2830,46 +2863,32 @@ void CanvasView::deleteInlineAnnotAndClose()
 	}
 }
 
-PageRectPt CanvasView::autoFitTextRect(int page, const std::wstring& text, float x0, float y0, float fontSizePt) const
+PageRectPt CanvasView::autoFitTextRect(int page, const std::string& utf8, float x0, float y0, float fontSizePt) const
 {
-	float sc = effScale();
-	float sizePx = std::max(6.0f, fontSizePt * sc);
-	LOGFONTW lf = {};
-	lf.lfHeight = -static_cast<int>(std::lround(sizePx));
-	lf.lfWeight = FW_NORMAL;
-	lf.lfCharSet = DEFAULT_CHARSET;
-	wcscpy_s(lf.lfFaceName, L"Segoe UI");
-	HFONT f = CreateFontIndirectW(&lf);
-
-	HDC screenDC = GetDC(nullptr);
-	HDC memDC = CreateCompatibleDC(screenDC);
-	HFONT oldFont = static_cast<HFONT>(SelectObject(memDC, f));
-
-	std::wstring t = text.empty() ? L" " : text;
-	RECT rc = { 0, 0, 0, 0 };
-	DrawTextW(memDC, t.c_str(), -1, &rc, DT_CALCRECT | DT_NOPREFIX);
-
-	// Clamp width to a sane fraction of the page (a single very long typed
-	// line shouldn't blow the box off the page); if that clips the natural
-	// width, re-measure height with wrapping at the clamped width so the two
-	// numbers stay consistent with each other.
+	// Measure through the engine, with the base-14 metrics MuPDF itself will
+	// use to lay this annotation out. Measuring with a GDI screen font (which
+	// is not Helvetica, and is generally a little narrower) yields a box that
+	// looks right but is a hair too narrow for the real glyph widths, so the
+	// last word of a line silently wraps onto a line of its own.
 	PageRectPt pageBound = doc_ ? doc_->pageBound(page) : PageRectPt{ 0, 0, 612, 792 };
-	int maxWidthPx = static_cast<int>((pageBound.x1 - pageBound.x0) * 0.9f * sc);
-	if (maxWidthPx > 0 && rc.right > maxWidthPx) {
-		RECT wrc = { 0, 0, maxWidthPx, 0 };
-		DrawTextW(memDC, t.c_str(), -1, &wrc, DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK);
-		rc.right = maxWidthPx;
-		rc.bottom = wrc.bottom;
+	float maxWPt = (pageBound.x1 - pageBound.x0) * 0.9f;
+	PageSizePt sz{};
+	if (doc_) {
+		sz = doc_->measureFreeText(utf8, "Helv", fontSizePt, 0.0f);
+		// A single very long typed line shouldn't blow the box off the page:
+		// clamp, then re-measure so width and line count stay consistent.
+		// Re-measuring returns the widest line that wrapping actually
+		// produced, and greedy wrapping at exactly that width reproduces the
+		// same breaks -- so the saved box still shrink-wraps the text.
+		if (maxWPt > 0 && sz.w > maxWPt)
+			sz = doc_->measureFreeText(utf8, "Helv", fontSizePt, maxWPt);
 	}
 
-	SelectObject(memDC, oldFont);
-	DeleteObject(f);
-	DeleteDC(memDC);
-	ReleaseDC(nullptr, screenDC);
-
-	constexpr float kMarginPt = 4.0f; // "a few pixels" of margin, in PDF points
-	float wPt = std::max(20.0f, rc.right / sc + kMarginPt * 2);
-	float hPt = std::max(14.0f, rc.bottom / sc + kMarginPt * 2);
+	// Slack absorbs float-rounding differences between this measurement and
+	// MuPDF's own accumulation, which would otherwise cost a wrapped word.
+	constexpr float kSlackPt = 2.0f;
+	float wPt = std::max(20.0f, sz.w + kSlackPt);
+	float hPt = std::max(14.0f, sz.h + kSlackPt);
 	return { x0, y0, x0 + wPt, y0 + hPt };
 }
 
@@ -2888,7 +2907,7 @@ void CanvasView::beginExistingAnnotEdit(int page, const AnnotInfo& ai)
 			// Auto-fit to the final text, anchored at wherever the box's
 			// top-left ended up (move handled), ignoring whatever size was
 			// dragged during editing -- the saved box always shrink-wraps.
-			PageRectPt finalRect = autoFitTextRect(page, Utf8ToWide(text),
+			PageRectPt finalRect = autoFitTextRect(page, text,
 				inlineEditRectPt_.x0, inlineEditRectPt_.y0, inlineFontSize_);
 			std::string err;
 			doc_->setFreeTextAnnot(page, idx, text, inlineFontSize_, textColor_, finalRect, err);

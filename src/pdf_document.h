@@ -167,6 +167,14 @@ public:
 		unsigned long color, float widthPt, std::string& err);
 	bool addTextBox(int page, PageRectPt rect, const std::string& utf8,
 		const std::string& font, float sizePt, unsigned long color, std::string& err);
+	// Size (in points) a free-text box must have for MuPDF's appearance
+	// generator to lay `utf8` out exactly as typed -- same base-14 metrics,
+	// same greedy word-wrap and same 1.2x line height it uses internally.
+	// `maxWidthPt` <= 0 means "never wrap" (only explicit newlines break a
+	// line). Callers must use this, not GDI text measurement: the on-screen
+	// UI font is not Helvetica, so its widths don't predict MuPDF's wrapping.
+	PageSizePt measureFreeText(const std::string& utf8, const std::string& font,
+		float sizePt, float maxWidthPt) const;
 	// Marks a region for redaction (shown as a solid black box). Nothing is
 	// actually removed from the page until applyRedactions().
 	bool addRedaction(int page, PageRectPt rect, std::string& err);

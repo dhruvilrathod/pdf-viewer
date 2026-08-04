@@ -721,6 +721,26 @@ bool PdfDocument::addInk(int page, const std::vector<std::vector<PagePointF>>& s
 	return ok;
 }
 
+namespace {
+
+// MuPDF's appearance layout starts a new line on EITHER '\r' or '\n' and
+// resumes at the very next character, so a CRLF pair (what a Win32 multi-line
+// EDIT hands back) lays out as two breaks -- one typed newline would render as
+// a blank line, pushing the rest of the text down and out of the box, which
+// clips its contents. Store one break character per line instead.
+std::string normalizeNewlines(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); ++i) {
+		if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n') continue;
+		out += (s[i] == '\r') ? '\n' : s[i];
+	}
+	return out;
+}
+
+} // namespace
+
 bool PdfDocument::addTextBox(int page, PageRectPt rect, const std::string& utf8,
 	const std::string& font, float sizePt, unsigned long color, std::string& err)
 {
@@ -728,6 +748,7 @@ bool PdfDocument::addTextBox(int page, PageRectPt rect, const std::string& utf8,
 	if (!pdf) { err = "not a PDF"; return false; }
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	const std::string contents = normalizeNewlines(utf8);
 	pdf_page* pg = nullptr;
 	pdf_annot* annot = nullptr;
 	bool ok = false;
@@ -738,7 +759,7 @@ bool PdfDocument::addTextBox(int page, PageRectPt rect, const std::string& utf8,
 		float col[3]; colorToFloat(color, col);
 		const char* f = font.empty() ? "Helv" : font.c_str();
 		pdf_set_annot_default_appearance(ctx_, annot, f, sizePt, 3, col);
-		pdf_set_annot_contents(ctx_, annot, utf8.c_str());
+		pdf_set_annot_contents(ctx_, annot, contents.c_str());
 		pdf_update_annot(ctx_, annot);
 		ok = true;
 	}
@@ -751,6 +772,94 @@ bool PdfDocument::addTextBox(int page, PageRectPt rect, const std::string& utf8,
 	}
 	if (ok) dirty_ = true;
 	return ok;
+}
+
+namespace {
+
+// The base-14 face MuPDF's appearance generator resolves a /DA font name to
+// (mirrors full_font_name() in pdf-appearance.c -- anything unknown is
+// Helvetica).
+const char* base14ForDA(const std::string& name)
+{
+	if (name == "Cour") return "Courier";
+	if (name == "TiRo") return "Times-Roman";
+	if (name == "Symb") return "Symbol";
+	if (name == "ZaDb") return "ZapfDingbats";
+	return "Helvetica";
+}
+
+// Advance of one codepoint in multiples of the font size, mirroring MuPDF's
+// text walk (next_text_walk in pdf-appearance.c): every non-CJK character is
+// measured with the base-14 font's own glyph advance -- including Greek and
+// Cyrillic, which are written with a different font but measured with this
+// one -- while CJK is treated as full width.
+float codepointAdvance(fz_context* ctx, fz_font* font, int u)
+{
+	if ((u >= 0x1100 && u <= 0x11FF) || (u >= 0x2E80 && u <= 0xD7FF) ||
+		(u >= 0xF900 && u <= 0xFAFF) || (u >= 0x20000 && u <= 0x3FFFF))
+		return 1.0f;
+	return fz_advance_glyph(ctx, font, fz_encode_character(ctx, font, u), 0);
+}
+
+} // namespace
+
+PageSizePt PdfDocument::measureFreeText(const std::string& utf8, const std::string& font,
+	float sizePt, float maxWidthPt) const
+{
+	PageSizePt out;
+	if (!ctx_ || sizePt <= 0) return out;
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_font* f = nullptr;
+	fz_try(ctx_) { f = fz_new_base14_font(ctx_, base14ForDA(font)); }
+	fz_catch(ctx_) { return out; }
+
+	// Greedy word-wrap identical to break_string(): a line is only broken at
+	// the last space seen once the running width passes the limit, so a line
+	// survives intact exactly while its full width stays within maxWidthPt.
+	float widest = 0.0f;
+	int lines = 0;
+	float x = 0.0f;      // width of the current line so far
+	float spaceX = 0.0f; // width up to (not including) the last space on it
+	bool haveSpace = false;
+	const std::string text = normalizeNewlines(utf8); // as addTextBox will store it
+	fz_try(ctx_) {
+		const float spaceAdv = codepointAdvance(ctx_, f, ' ') * sizePt;
+		const char* p = text.c_str();
+		while (*p) {
+			int u = 0;
+			p += fz_chartorune(&u, p);
+			if (u == '\n' || u == '\r') {
+				widest = std::max(widest, x);
+				++lines;
+				x = spaceX = 0.0f;
+				haveSpace = false;
+				continue;
+			}
+			if (u == ' ') { haveSpace = true; spaceX = x; }
+			x += codepointAdvance(ctx_, f, u) * sizePt;
+			if (haveSpace && maxWidthPt > 0 && x > maxWidthPt) {
+				// Break at that space: the line keeps everything before it,
+				// and whatever came after it moves down with us.
+				widest = std::max(widest, spaceX);
+				++lines;
+				x = std::max(0.0f, x - spaceX - spaceAdv);
+				spaceX = 0.0f;
+				haveSpace = false;
+			}
+		}
+		widest = std::max(widest, x); // trailing (or only) line
+		++lines;
+	}
+	fz_always(ctx_) { fz_drop_font(ctx_, f); }
+	fz_catch(ctx_) { return out; }
+
+	// Line n's baseline sits 0.8*size below the box top plus n*1.2*size; the
+	// box also clips its contents, so a full 1.2*size line box per line is
+	// what keeps descenders on the last line from being cut off.
+	out.w = widest;
+	out.h = std::max(1, lines) * 1.2f * sizePt;
+	return out;
 }
 
 bool PdfDocument::addRedaction(int page, PageRectPt rect, std::string& err)
@@ -1117,6 +1226,7 @@ bool PdfDocument::setFreeTextAnnot(int page, int annotIndex, const std::string& 
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	const std::string contents = normalizeNewlines(utf8);
 	pdf_page* pg = nullptr;
 	bool ok = false;
 	fz_try(ctx_) {
@@ -1124,9 +1234,18 @@ bool PdfDocument::setFreeTextAnnot(int page, int annotIndex, const std::string& 
 		pdf_annot* a = annotByIndex(ctx_, pg, annotIndex);
 		if (a && pdf_annot_type(ctx_, a) == PDF_ANNOT_FREE_TEXT) {
 			float col[3]; colorToFloat(color, col);
-			pdf_set_annot_rect(ctx_, a, normRect(rect));
+			// The caller sized `rect` to the text itself, but MuPDF lays a
+			// free text annotation out inside a 2*border-width padding on
+			// each side (borders are 0 on the ones this app creates, but not
+			// necessarily on one authored elsewhere that's being re-edited).
+			// Grow the box by that padding rather than dropping the border,
+			// so the text still fits without re-wrapping.
+			float pad = 2.0f * pdf_annot_border_width(ctx_, a);
+			fz_rect r = normRect(rect);
+			r.x1 += pad * 2; r.y1 += pad * 2;
+			pdf_set_annot_rect(ctx_, a, r);
 			pdf_set_annot_default_appearance(ctx_, a, "Helv", fontSize, 3, col);
-			pdf_set_annot_contents(ctx_, a, utf8.c_str());
+			pdf_set_annot_contents(ctx_, a, contents.c_str());
 			pdf_update_annot(ctx_, a);
 			ok = true;
 		}
