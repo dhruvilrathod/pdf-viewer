@@ -628,6 +628,14 @@ public:
 	int currentPage() const { return currentPage_; }
 	Mode mode() const { return mode_; }
 
+	// Temporary (view-only) page rotation, in quarter turns clockwise. This
+	// never touches the document -- nothing is marked dirty, nothing is saved,
+	// and it resets when another file is loaded into this tab. Page/text/
+	// annotation coordinates stay in the page's own upright space; only where
+	// they land on screen changes (see pageRectToView).
+	void rotateView(int deltaDeg);
+	int viewRotation() const { return viewRotation_; }
+
 	// Annotation tools
 	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact };
 	void setTool(Tool t) {
@@ -732,6 +740,13 @@ private:
 	// Tool interaction
 	bool pageScreenOrigin(int page, int& sx, int& sy) const;
 	bool hitTestPage(int mx, int my, int& page, float& px, float& py) const;
+	// The two directions of the page-space <-> on-screen mapping, and the only
+	// place viewRotation_ is applied to coordinates. Both work in pixels
+	// relative to the page's top-left corner AS DRAWN, so callers just add the
+	// page's screen origin (pageScreenOrigin) to get client coordinates.
+	POINT pageToView(int page, float px, float py) const;
+	RECT pageRectToView(int page, const PageRectPt& r) const;
+	void viewToPage(int page, int dx, int dy, float& px, float& py) const;
 	void onLButtonDown(int mx, int my);
 	void onRButtonDown(int mx, int my);
 	void onMouseMove(int mx, int my);
@@ -832,6 +847,7 @@ private:
 	Fit fit_ = Fit::None; // default zoom is 100%, not fit-to-width
 	int currentPage_ = 0;
 	int scrollX_ = 0, scrollY_ = 0;
+	int viewRotation_ = 0; // 0/90/180/270, clockwise -- view only (see rotateView)
 
 	// Smooth-scroll animation (keyboard arrows / Page Up-Down only; wheel
 	// and scrollbar-drag stay instant to track the input 1:1).
@@ -932,8 +948,7 @@ private:
 	int dragStartX_ = 0, dragStartY_ = 0; // screen
 	int dragCurX_ = 0, dragCurY_ = 0;     // screen
 	int pageOrgX_ = 0, pageOrgY_ = 0;     // screen coords of page top-left at drag start
-	float dragScale_ = 1.0f;
-	PageRectPt dragBound_;
+	float dragScale_ = 1.0f;              // effScale() at drag start, for the live pen-width preview
 	std::vector<PagePointF> curStroke_;   // page-space (draw tool)
 	std::function<void()> onChanged_;
 	std::function<void()> onExitTextTool_;
@@ -1165,6 +1180,14 @@ private:
 	// prompt (caller should abort). A tab that's never been saved (no path
 	// yet) is silently left out of `paths`, counted in `skippedUnsaved`.
 	bool collectTabPathsInOrder(const std::vector<int>& indices, std::vector<std::wstring>& paths, int& skippedUnsaved);
+	// Recently-closed tabs (this window, this run only -- deliberately not
+	// persisted; see closedTabs_). rememberClosedTab() is called from
+	// closeTab(); reopenClosedTab(0) is the Ctrl+Shift+T / "Reopen Closed
+	// Tab" path, and appendReopenMenuItems() builds the tab-bar right-click
+	// entries for the whole list.
+	void rememberClosedTab(const std::wstring& path);
+	void reopenClosedTab(int listIndex);
+	void appendReopenMenuItems(HMENU menu);
 	void cycleTab(int dir);                   // +1 = Ctrl+Tab, -1 = Ctrl+Shift+Tab
 	void updateTabLabel(int idx);
 	void reorderTab(int from, int to);        // drag-to-reorder: moves the DocTab and mirrors it in tabStrip_
@@ -1193,6 +1216,14 @@ private:
 	HWND tabTooltip_ = nullptr;
 	std::vector<std::unique_ptr<DocTab>> tabs_;
 	int activeTab_ = -1;
+	// Paths of tabs closed in THIS window during THIS run, most recent first,
+	// for the tab bar's "Reopen Closed Tab" menu (and Ctrl+Shift+T). Kept in
+	// memory only -- deliberately not written to disk, so quitting the app
+	// wipes the list; it's an undo for a misclicked close, not a history
+	// feature. Tabs that were never saved anywhere (no path) can't be
+	// reopened and are not recorded.
+	std::vector<std::wstring> closedTabs_;
+	static constexpr int kMaxClosedTabs = 10;
 	// Drag-to-reorder state for the tab strip (see TabStripSubclass).
 	int tabDragIndex_ = -1;
 	bool tabDragArmed_ = false;
@@ -1327,6 +1358,7 @@ private:
 		printRangeCustom_ = nullptr, printRangeEdit_ = nullptr;
 	HWND printOrientLabel_ = nullptr, printOrientPortrait_ = nullptr, printOrientLandscape_ = nullptr;
 	HWND printColorLabel_ = nullptr, printColorColor_ = nullptr, printColorGray_ = nullptr;
+	HWND printQualityLabel_ = nullptr, printQualityCombo_ = nullptr;
 	HWND printPageNavLabel_ = nullptr, printPageNavPrev_ = nullptr, printPageNavNext_ = nullptr;
 	HWND printGo_ = nullptr, printCancel_ = nullptr;
 	bool printPanelVisible_ = false;
@@ -1591,6 +1623,7 @@ void CanvasView::setDocument(PdfDocument* doc)
 	doc_ = doc;
 	currentPage_ = 0;
 	scrollX_ = scrollY_ = 0;
+	viewRotation_ = 0; // a turn belongs to the document that was being read
 	hits_.clear();
 	currentHit_ = -1;
 	needleUtf8_.clear();
@@ -1694,10 +1727,10 @@ void CanvasView::scrollToHit(int hitIdx)
 	if (mode_ == Mode::SinglePage) {
 		if (h.page != currentPage_) { currentPage_ = h.page; relayout(); }
 	}
-	// Position the hit roughly one third down the viewport.
-	PageRectPt b = doc_->pageBound(h.page);
-	float sc = effScale();
-	int hitTopPx = static_cast<int>((h.rc.y0 - b.y0) * sc);
+	// Position the hit roughly one third down the viewport. Measured in view
+	// space, so this still lands on the hit when the view is rotated (where a
+	// match's page-space y says nothing about how far down the screen it is).
+	int hitTopPx = pageRectToView(h.page, h.rc).top;
 	RECT rc; GetClientRect(hwnd_, &rc);
 	int ch = rc.bottom - rc.top;
 	int pageTop = (mode_ == Mode::Continuous && h.page < static_cast<int>(layout_.size()))
@@ -1713,16 +1746,10 @@ void CanvasView::scrollToHit(int hitIdx)
 void CanvasView::drawHighlights(HDC dc, int pageIndex, int pageX, int pageY)
 {
 	if (hits_.empty()) return;
-	PageRectPt b = doc_->pageBound(pageIndex);
-	float sc = effScale();
 	for (size_t i = 0; i < hits_.size(); ++i) {
 		if (hits_[i].page != pageIndex) continue;
-		const PageRectPt& r = hits_[i].rc;
-		RECT dr;
-		dr.left = pageX + static_cast<int>((r.x0 - b.x0) * sc);
-		dr.top = pageY + static_cast<int>((r.y0 - b.y0) * sc);
-		dr.right = pageX + static_cast<int>((r.x1 - b.x0) * sc);
-		dr.bottom = pageY + static_cast<int>((r.y1 - b.y0) * sc);
+		RECT dr = pageRectToView(pageIndex, hits_[i].rc);
+		OffsetRect(&dr, pageX, pageY);
 		bool cur = (static_cast<int>(i) == currentHit_);
 		FillAlpha(dc, dr, cur ? RGB(255, 150, 0) : RGB(255, 230, 0), cur ? 140 : 90);
 	}
@@ -1748,15 +1775,12 @@ bool CanvasView::pageScreenOrigin(int page, int& sx, int& sy) const
 bool CanvasView::hitTestPage(int mx, int my, int& page, float& px, float& py) const
 {
 	if (!doc_ || !doc_->isOpen()) return false;
-	float sc = effScale();
 	auto test = [&](int i) -> bool {
 		int sx, sy; if (!pageScreenOrigin(i, sx, sy)) return false;
 		int w, h; pagePixelSize(i, w, h);
 		if (mx < sx || mx >= sx + w || my < sy || my >= sy + h) return false;
-		PageRectPt b = doc_->pageBound(i);
 		page = i;
-		px = b.x0 + (mx - sx) / sc;
-		py = b.y0 + (my - sy) / sc;
+		viewToPage(i, mx - sx, my - sy, px, py);
 		return true;
 	};
 	if (mode_ == Mode::Continuous) {
@@ -1838,7 +1862,6 @@ void CanvasView::onLButtonDown(int mx, int my)
 	dragStartX_ = dragCurX_ = mx;
 	dragStartY_ = dragCurY_ = my;
 	dragScale_ = effScale();
-	dragBound_ = doc_->pageBound(page);
 	pageScreenOrigin(page, pageOrgX_, pageOrgY_);
 	curStroke_.clear();
 	if (tool_ == Tool::Draw) curStroke_.push_back({ px, py });
@@ -1867,8 +1890,8 @@ void CanvasView::onMouseMove(int mx, int my)
 	if (tool_ == Tool::Erase) { eraseAt(mx, my); return; }
 	dragCurX_ = mx; dragCurY_ = my;
 	if (tool_ == Tool::Draw) {
-		float px = dragBound_.x0 + (mx - pageOrgX_) / dragScale_;
-		float py = dragBound_.y0 + (my - pageOrgY_) / dragScale_;
+		float px, py;
+		viewToPage(dragPage_, mx - pageOrgX_, my - pageOrgY_, px, py);
 		curStroke_.push_back({ px, py });
 	}
 	invalidate();
@@ -1894,8 +1917,7 @@ void CanvasView::onLButtonUp(int mx, int my)
 	bool changed = false;
 
 	auto toPage = [&](int sx, int sy, float& px, float& py) {
-		px = dragBound_.x0 + (sx - pageOrgX_) / dragScale_;
-		py = dragBound_.y0 + (sy - pageOrgY_) / dragScale_;
+		viewToPage(dragPage_, sx - pageOrgX_, sy - pageOrgY_, px, py);
 	};
 
 	if (tool_ == Tool::Highlight) {
@@ -2037,7 +2059,6 @@ void CanvasView::drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY
 	if (!doc_ || !doc_->isPdf()) return;
 	const auto& widgets = widgetsForPage(pageIndex);
 	if (widgets.empty()) return;
-	float sc = effScale();
 	for (const auto& w : widgets) {
 		if (w.kind == WidgetKind::Button || w.kind == WidgetKind::Signature) continue;
 		// Skip the field currently being edited inline -- the live edit
@@ -2046,11 +2067,8 @@ void CanvasView::drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY
 			std::abs(w.rect.x0 - inlineEditRectPt_.x0) < 0.5f &&
 			std::abs(w.rect.y0 - inlineEditRectPt_.y0) < 0.5f)
 			continue;
-		RECT r;
-		r.left = pageX + static_cast<int>(w.rect.x0 * sc);
-		r.top = pageY + static_cast<int>(w.rect.y0 * sc);
-		r.right = pageX + static_cast<int>(w.rect.x1 * sc);
-		r.bottom = pageY + static_cast<int>(w.rect.y1 * sc);
+		RECT r = pageRectToView(pageIndex, w.rect);
+		OffsetRect(&r, pageX, pageY);
 		// Subtle pale-blue fill with no border, matching Chrome's PDF viewer
 		// (the old saturated fill + solid blue outline read as "too highlighted").
 		FillAlpha(dc, r, RGB(140, 165, 235), 34);
@@ -2407,7 +2425,6 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 	int lo, hi;
 	if (!selectionRangeForPage(pageIndex, lo, hi)) return;
 	const auto& chars = charsForPage(pageIndex);
-	float sc = effScale();
 	// Merge consecutive characters on the same line into one filled rect,
 	// instead of alpha-blending each glyph's own quad separately -- doing it
 	// per-glyph double-blends the shared edges between adjacent quads
@@ -2421,12 +2438,8 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 		haveRun = false;
 	};
 	for (int i = lo; i <= hi && i < static_cast<int>(chars.size()); ++i) {
-		const auto& q = chars[i].quad;
-		RECT r;
-		r.left = pageX + static_cast<int>(q.x0 * sc);
-		r.top = pageY + static_cast<int>(q.y0 * sc);
-		r.right = pageX + static_cast<int>(q.x1 * sc);
-		r.bottom = pageY + static_cast<int>(q.y1 * sc);
+		RECT r = pageRectToView(pageIndex, chars[i].quad);
+		OffsetRect(&r, pageX, pageY);
 		if (!haveRun) { run = r; haveRun = true; }
 		else {
 			run.left = std::min(run.left, r.left);
@@ -2765,6 +2778,15 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 {
 	commitInlineEdit(false); // clean up any previous session first
 
+	// Typing happens in a real Win32 EDIT control laid over the page, and
+	// those can't be drawn on their side -- with the view rotated it would sit
+	// at right angles to the text it is supposed to be editing. Say so instead
+	// of placing a nonsense box.
+	if (viewRotation_ != 0) {
+		if (status_) SetWindowTextW(status_, L"Reset the rotation (View: Rotate) to edit text on the page.");
+		return;
+	}
+
 	HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
 	DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_BORDER | ES_AUTOHSCROLL;
 	if (opts.multiline) style |= ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN;
@@ -3029,6 +3051,69 @@ void CanvasView::pagePixelSize(int i, int& w, int& h) const
 	float sc = effScale();
 	w = std::max(1, static_cast<int>(std::lround(s.w * sc)));
 	h = std::max(1, static_cast<int>(std::lround(s.h * sc)));
+	// A quarter turn swaps the box the page occupies on screen; the render
+	// (PdfDocument::renderPage with the same rotation) comes back the same way
+	// round, so the two always agree.
+	if (viewRotation_ == 90 || viewRotation_ == 270) std::swap(w, h);
+}
+
+POINT CanvasView::pageToView(int page, float px, float py) const
+{
+	PageRectPt b = doc_ ? doc_->pageBound(page) : PageRectPt{};
+	float sc = effScale();
+	float x = (px - b.x0) * sc, y = (py - b.y0) * sc;
+	float w = (b.x1 - b.x0) * sc, h = (b.y1 - b.y0) * sc;
+	auto R = [](float v) { return static_cast<int>(std::lround(v)); };
+	switch (viewRotation_) {
+	case 90:  return { R(h - y), R(x) };     // page top-left lands top-right
+	case 180: return { R(w - x), R(h - y) };
+	case 270: return { R(y), R(w - x) };     // page top-left lands bottom-left
+	default:  return { R(x), R(y) };
+	}
+}
+
+RECT CanvasView::pageRectToView(int page, const PageRectPt& r) const
+{
+	POINT a = pageToView(page, r.x0, r.y0);
+	POINT c = pageToView(page, r.x1, r.y1);
+	// The turned rect's corners swap roles, so normalize rather than assuming
+	// a stays top-left.
+	return { std::min(a.x, c.x), std::min(a.y, c.y), std::max(a.x, c.x), std::max(a.y, c.y) };
+}
+
+void CanvasView::viewToPage(int page, int dx, int dy, float& px, float& py) const
+{
+	PageRectPt b = doc_ ? doc_->pageBound(page) : PageRectPt{};
+	float sc = effScale();
+	if (sc <= 0) { px = b.x0; py = b.y0; return; }
+	float w = (b.x1 - b.x0) * sc, h = (b.y1 - b.y0) * sc;
+	float x, y;
+	switch (viewRotation_) { // inverse of pageToView
+	case 90:  x = static_cast<float>(dy); y = h - dx; break;
+	case 180: x = w - dx; y = h - dy; break;
+	case 270: x = w - dy; y = static_cast<float>(dx); break;
+	default:  x = static_cast<float>(dx); y = static_cast<float>(dy); break;
+	}
+	px = b.x0 + x / sc;
+	py = b.y0 + y / sc;
+}
+
+void CanvasView::rotateView(int deltaDeg)
+{
+	if (!doc_ || !doc_->isOpen()) return;
+	// A native EDIT control can't be turned on its side, so any in-progress
+	// inline edit is committed before the view moves out from under it (see
+	// beginInlineEdit, which refuses to start one while rotated at all).
+	if (inlineEdit_) commitInlineEdit(true);
+	int next = ((viewRotation_ + deltaDeg) % 360 + 360) % 360;
+	if (next == viewRotation_) return;
+	viewRotation_ = next;
+	invalidateCache();
+	if (fit_ != Fit::None) applyFit(); // the fitted aspect ratio just changed
+	relayout();
+	invalidate();
+	updateStatus();
+	if (onViewChanged_) onViewChanged_();
 }
 
 void CanvasView::relayout()
@@ -3038,7 +3123,8 @@ void CanvasView::relayout()
 	if (!doc_ || !doc_->isOpen()) { updateScrollbars(); return; }
 
 	int gap = Scale(kBasePageGap, dpi_);
-	long long newKey = std::llround(effScale() * 1000.0f);
+	// Rotation is part of the key: the cached bitmaps are rendered turned.
+	long long newKey = std::llround(effScale() * 1000.0f) * 4 + viewRotation_ / 90;
 	if (newKey != cacheKey_) { invalidateCache(); cacheKey_ = newKey; }
 
 	if (mode_ == Mode::Continuous) {
@@ -3078,13 +3164,21 @@ void CanvasView::applyFit()
 	float dpiScale = dpi_ / 72.0f;
 
 	// Reference page: in single mode the current page; in continuous the widest.
+	// Measured as the page will be DRAWN, so a rotated view fits its rotated
+	// footprint (otherwise Fit Width on a sideways page overshoots the window).
+	bool turned = (viewRotation_ == 90 || viewRotation_ == 270);
+	auto drawnSize = [&](int i) {
+		PageSizePt s = doc_->pageSize(i);
+		if (turned) std::swap(s.w, s.h);
+		return s;
+	};
 	float refWpt = 0, refHpt = 0;
 	if (mode_ == Mode::SinglePage) {
-		PageSizePt s = doc_->pageSize(currentPage_);
+		PageSizePt s = drawnSize(currentPage_);
 		refWpt = s.w; refHpt = s.h;
 	} else {
 		for (int i = 0; i < doc_->pageCount(); ++i) {
-			PageSizePt s = doc_->pageSize(i);
+			PageSizePt s = drawnSize(i);
 			if (s.w > refWpt) { refWpt = s.w; refHpt = s.h; }
 		}
 	}
@@ -3251,7 +3345,7 @@ HBITMAP CanvasView::ensureRendered(int i, int& w, int& h)
 		return it->second.hbmp;
 	}
 	if (!doc_) return nullptr;
-	PageBitmap bmp = doc_->renderPage(i, effScale());
+	PageBitmap bmp = doc_->renderPage(i, effScale(), viewRotation_);
 	HBITMAP hb = bmp.hbmp;
 	w = bmp.width; h = bmp.height;
 	// Bound cache growth: clear if it gets large (visible pages re-render fast).
@@ -3352,10 +3446,9 @@ void CanvasView::onPaint()
 			HPEN pen = CreatePen(PS_SOLID, wpen, drawColor_);
 			HGDIOBJ oldPen = SelectObject(mem, pen);
 			for (size_t i = 0; i < curStroke_.size(); ++i) {
-				int sx = pageOrgX_ + static_cast<int>((curStroke_[i].x - dragBound_.x0) * dragScale_);
-				int sy = pageOrgY_ + static_cast<int>((curStroke_[i].y - dragBound_.y0) * dragScale_);
-				if (i == 0) MoveToEx(mem, sx, sy, nullptr);
-				else LineTo(mem, sx, sy);
+				POINT p = pageToView(dragPage_, curStroke_[i].x, curStroke_[i].y);
+				if (i == 0) MoveToEx(mem, pageOrgX_ + p.x, pageOrgY_ + p.y, nullptr);
+				else LineTo(mem, pageOrgX_ + p.x, pageOrgY_ + p.y);
 			}
 			SelectObject(mem, oldPen);
 			DeleteObject(pen);
@@ -3554,8 +3647,12 @@ void CanvasView::updateStatus()
 	if (doc_ && doc_->isOpen()) {
 		int cur = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
 		currentPage_ = cur;
-		swprintf(buf, 128, L"Page %d / %d      Zoom %d%%",
-			cur + 1, doc_->pageCount(), static_cast<int>(std::lround(zoom_ * 100)));
+		// The rotation readout is what tells the user the page is turned
+		// on screen only -- nothing about the file itself changed.
+		wchar_t rot[32] = L"";
+		if (viewRotation_ != 0) swprintf(rot, 32, L"      Rotated %d°", viewRotation_);
+		swprintf(buf, 128, L"Page %d / %d      Zoom %d%%%s",
+			cur + 1, doc_->pageCount(), static_cast<int>(std::lround(zoom_ * 100)), rot);
 	} else {
 		swprintf(buf, 128, L"No document");
 	}
@@ -4438,6 +4535,18 @@ void DrawFlattenTool(Gdiplus::Graphics& g, float s)
 	p.line(0.62f, 0.46f, 0.50f, 0.58f);
 }
 
+// A page with a curved arrow sweeping over its top-right corner -- reads as
+// "turn this page", for the view-only rotate button.
+void DrawRotateView(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.rect(0.18f, 0.34f, 0.52f, 0.52f);
+	// Three-quarter arc, open at the top-right where the arrowhead goes.
+	Gdiplus::RectF arc(s * 0.30f, s * 0.10f, s * 0.52f, s * 0.52f);
+	g.DrawArc(&p.pen, arc, 150, 200);
+	p.polyline({ {0.68f,0.06f}, {0.82f,0.15f}, {0.70f,0.26f} });
+}
+
 // A minimal sun (core + 8 rays) for the light/dark theme toggle button --
 // one fixed glyph regardless of which mode is active, like most apps' theme
 // toggles.
@@ -4694,6 +4803,7 @@ const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
 		icons::DrawRedactTool, icons::DrawColorTool, icons::DrawWidthTool, icons::DrawOpacityTool,
 		icons::DrawZoomOut, icons::DrawZoomIn, icons::DrawFitWidth, icons::DrawFitPage,
 		icons::DrawToolsMenu, icons::DrawThemeToggle, icons::DrawEraseTool,
+		icons::DrawRotateView,
 	};
 	return fns;
 }
@@ -4762,7 +4872,7 @@ void FrameWindow::createChildren()
 	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
 		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
 		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18,
-		iErase = 19;
+		iErase = 19, iRotate = 20;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -4832,6 +4942,9 @@ void FrameWindow::createChildren()
 	btn(IDM_VIEW_ZOOMIN, iZoomIn, L"Zoom In");
 	btn(IDM_VIEW_FITWIDTH, iFitWidth, L"Fit Width");
 	btn(IDM_VIEW_FITPAGE, iFitPage, L"Fit Page");
+	// Turns the view 90 degrees clockwise per click; the other direction and
+	// reset live in the Tools menu. View only -- never written to the file.
+	btn(IDM_VIEW_ROTATE_CW, iRotate, L"Rotate View 90° Clockwise (Ctrl+Shift+Plus) — view only, not saved");
 	sep();
 	// "9999 of 9999" purely to reserve enough width for a realistically huge
 	// page count -- pageLabelText_ is drawn directly onto this reserved rect
@@ -5072,6 +5185,21 @@ void FrameWindow::createChildren()
 	printColorLabel_ = mkStatic(L"Color", IDC_PRINT_COLOR_LABEL);
 	printColorColor_ = mkRadio(L"Color", IDC_PRINT_COLOR_COLOR, true);
 	printColorGray_ = mkRadio(L"Grayscale", IDC_PRINT_COLOR_GRAY, false);
+	printQualityLabel_ = mkStatic(L"Quality", IDC_PRINT_QUALITY_LABEL);
+	printQualityCombo_ = CreateWindowExW(0, L"COMBOBOX", L"",
+		WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_PRINT_QUALITY_COMBO), hInst_, nullptr);
+	for (int dpiChoice : kPrintDpiChoices) {
+		wchar_t item[48];
+		// Name the trade-off, not just the number -- "600 DPI" alone doesn't
+		// tell anyone it's the slow, memory-hungry one.
+		const wchar_t* note = dpiChoice <= 150 ? L" (draft)" : dpiChoice <= 200 ? L" (normal)"
+			: dpiChoice <= 300 ? L" (high)" : dpiChoice <= 600 ? L" (very high)"
+			: L" (maximum, slow)";
+		swprintf(item, 48, L"%d DPI%s", dpiChoice, note);
+		SendMessageW(printQualityCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+	}
+	SendMessageW(printQualityCombo_, CB_SETCURSEL, kPrintDpiDefaultIndex, 0);
 	printPageNavLabel_ = mkStatic(L"", IDC_PRINT_PAGENAV_LABEL);
 	printPageNavPrev_ = CreateWindowExW(0, L"BUTTON", L"◀", WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
 		reinterpret_cast<HMENU>(IDC_PRINT_PAGENAV_PREV), hInst_, nullptr);
@@ -5085,11 +5213,13 @@ void FrameWindow::createChildren()
 		reinterpret_cast<HMENU>(IDC_PRINT_CANCEL), hInst_, nullptr);
 	SendMessageW(printRangeAll_, BM_SETCHECK, BST_CHECKED, 0);
 	SendMessageW(printOrientPortrait_, BM_SETCHECK, BST_CHECKED, 0);
-	SendMessageW(printColorColor_, BM_SETCHECK, BST_CHECKED, 0);
+	// Grayscale by default (see showPrintPanel, which resets to the same).
+	SendMessageW(printColorGray_, BM_SETCHECK, BST_CHECKED, 0);
 	for (HWND h : { printTitle_, printPrinterLabel_, printPrinterCombo_, printCopiesLabel_, printCopiesEdit_,
 		printRangeLabel_, printRangeAll_, printRangeCurrent_, printRangeCustom_, printRangeEdit_,
 		printOrientLabel_, printOrientPortrait_, printOrientLandscape_,
 		printColorLabel_, printColorColor_, printColorGray_,
+		printQualityLabel_, printQualityCombo_,
 		printPageNavLabel_, printPageNavPrev_, printPageNavNext_, printGo_, printCancel_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 
@@ -5561,8 +5691,11 @@ void FrameWindow::showPrintPanel(bool show)
 		EnableWindow(printRangeEdit_, FALSE);
 		SendMessageW(printOrientPortrait_, BM_SETCHECK, BST_CHECKED, 0);
 		SendMessageW(printOrientLandscape_, BM_SETCHECK, BST_UNCHECKED, 0);
-		SendMessageW(printColorColor_, BM_SETCHECK, BST_CHECKED, 0);
-		SendMessageW(printColorGray_, BM_SETCHECK, BST_UNCHECKED, 0);
+		// Grayscale, not color: the common case for a document printer, and
+		// what the app defaults to (PrintSettings::grayscale).
+		SendMessageW(printColorColor_, BM_SETCHECK, BST_UNCHECKED, 0);
+		SendMessageW(printColorGray_, BM_SETCHECK, BST_CHECKED, 0);
+		SendMessageW(printQualityCombo_, CB_SETCURSEL, kPrintDpiDefaultIndex, 0);
 		printPanelVisible_ = true;
 		layout();
 		updatePrintPreviewFromPanel();
@@ -5596,6 +5729,9 @@ PrintSettings FrameWindow::readPrintSettingsFromPanel() const
 	s.customRange = rangeBuf;
 	s.landscape = SendMessageW(printOrientLandscape_, BM_GETCHECK, 0, 0) == BST_CHECKED;
 	s.grayscale = SendMessageW(printColorGray_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	int q = static_cast<int>(SendMessageW(printQualityCombo_, CB_GETCURSEL, 0, 0));
+	if (q < 0 || q >= kPrintDpiChoiceCount) q = kPrintDpiDefaultIndex;
+	s.renderDpi = kPrintDpiChoices[q];
 	return s;
 }
 
@@ -6426,6 +6562,9 @@ void FrameWindow::layout()
 		row(printColorLabel_);
 		MoveWindow(printColorColor_, px, y, halfW, rowH, TRUE);
 		MoveWindow(printColorGray_, px + halfW + gap, y, halfW, rowH, TRUE);
+		y += rowH + gap * 2;
+		row(printQualityLabel_);
+		MoveWindow(printQualityCombo_, px, y, pw, rowH * 6, TRUE); // extra height = dropdown list allowance
 		y += rowH + gap * 3;
 		int navBtnW = Scale(32, dpi);
 		int navLabelW = std::max(0, pw - navBtnW * 2 - gap * 2);
@@ -6442,6 +6581,7 @@ void FrameWindow::layout()
 		printRangeLabel_, printRangeAll_, printRangeCurrent_, printRangeCustom_, printRangeEdit_,
 		printOrientLabel_, printOrientPortrait_, printOrientLandscape_,
 		printColorLabel_, printColorColor_, printColorGray_,
+		printQualityLabel_, printQualityCombo_,
 		printPageNavLabel_, printPageNavPrev_, printPageNavNext_, printGo_, printCancel_ })
 		ShowWindow(h, psw);
 
@@ -6596,6 +6736,8 @@ void FrameWindow::closeTab(int idx)
 	if (activeTab_ != idx) switchToTab(idx);
 	if (!promptSaveIfDirty()) return; // user cancelled
 
+	rememberClosedTab(tabs_[idx]->path);
+
 	// Destroy the child windows before the tab's unique_ptrs go away --
 	// CanvasView/ThumbPanel don't destroy their own HWND in their
 	// destructor, and a lingering window whose GWLP_USERDATA now points at
@@ -6638,6 +6780,50 @@ void FrameWindow::closeTab(int idx)
 	}
 	activeTab_ = -1; // force switchToTab to treat this as a real switch
 	switchToTab(std::min(idx, static_cast<int>(tabs_.size()) - 1));
+}
+
+void FrameWindow::rememberClosedTab(const std::wstring& path)
+{
+	if (path.empty()) return; // never saved -- there's no file to reopen
+	// Most recent first, no duplicates: closing the same file twice should
+	// leave one entry at the top, not two entries in different places.
+	closedTabs_.erase(std::remove_if(closedTabs_.begin(), closedTabs_.end(),
+		[&](const std::wstring& p) { return _wcsicmp(p.c_str(), path.c_str()) == 0; }),
+		closedTabs_.end());
+	closedTabs_.insert(closedTabs_.begin(), path);
+	if (static_cast<int>(closedTabs_.size()) > kMaxClosedTabs) closedTabs_.resize(kMaxClosedTabs);
+}
+
+void FrameWindow::reopenClosedTab(int listIndex)
+{
+	if (listIndex < 0 || listIndex >= static_cast<int>(closedTabs_.size())) return;
+	std::wstring path = closedTabs_[listIndex];
+	// Drop it from the list before opening: openDocument() may fail (the file
+	// could have been moved or deleted since it was closed), and either way a
+	// reopened tab isn't "recently closed" any more. It goes back on the list
+	// by the normal route if it's closed again.
+	closedTabs_.erase(closedTabs_.begin() + listIndex);
+	openDocument(path.c_str());
+}
+
+// Shared by both tab-bar right-click menus (on a tab, and on empty strip).
+void FrameWindow::appendReopenMenuItems(HMENU menu)
+{
+	if (closedTabs_.empty()) {
+		AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"No Recently Closed Tabs");
+		return;
+	}
+	AppendMenuW(menu, MF_STRING, IDM_TAB_REOPEN_BASE, L"Reopen Closed Tab\tCtrl+Shift+T");
+	if (closedTabs_.size() > 1) {
+		HMENU sub = CreatePopupMenu();
+		for (size_t i = 0; i < closedTabs_.size(); ++i) {
+			const std::wstring& p = closedTabs_[i];
+			size_t slash = p.find_last_of(L"\\/");
+			std::wstring label = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+			AppendMenuW(sub, MF_STRING, IDM_TAB_REOPEN_BASE + static_cast<int>(i), label.c_str());
+		}
+		AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"Recently Closed Tabs");
+	}
 }
 
 void FrameWindow::detachTabToNewWindow(int idx)
@@ -7094,6 +7280,8 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 					swprintf(zipLabel, 48, L"Zip %d Tabs...", static_cast<int>(group.size()));
 					AppendMenuW(m, MF_STRING, IDM_TAB_ZIP_SELECTED, zipLabel);
 				}
+				AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+				self->appendReopenMenuItems(m);
 				POINT pt = hit.pt;
 				ClientToScreen(hwnd, &pt);
 				self->switchToTab(idx);
@@ -7103,7 +7291,21 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 				else if (sel == IDM_TAB_OPEN_NEW_WINDOW) self->detachTabsToNewWindow(group);
 				else if (sel == IDM_TAB_MERGE_SELECTED) self->mergeSelectedTabs(group);
 				else if (sel == IDM_TAB_ZIP_SELECTED) self->zipSelectedTabs(group);
+				else if (sel >= IDM_TAB_REOPEN_BASE) self->reopenClosedTab(sel - IDM_TAB_REOPEN_BASE);
 			}
+			return 0;
+		}
+		// Right-click on the empty part of the strip (past the last tab) still
+		// offers the reopen list -- that blank space is exactly where a
+		// browser user right-clicks looking for it.
+		if (msg == WM_RBUTTONUP) {
+			HMENU m = CreatePopupMenu();
+			self->appendReopenMenuItems(m);
+			POINT pt = hit.pt;
+			ClientToScreen(hwnd, &pt);
+			int sel = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, self->hwnd_, nullptr);
+			DestroyMenu(m);
+			if (sel >= IDM_TAB_REOPEN_BASE) self->reopenClosedTab(sel - IDM_TAB_REOPEN_BASE);
 			return 0;
 		}
 	}
@@ -7468,6 +7670,10 @@ void FrameWindow::onCommand(int id)
 	case IDM_TAB_NEXT: cycleTab(+1); break;
 	case IDM_TAB_PREV: cycleTab(-1); break;
 	case IDM_TAB_CLOSE: closeTab(activeTab_); break;
+	case IDM_TAB_REOPEN_LAST: reopenClosedTab(0); break;
+	case IDM_VIEW_ROTATE_CW: if (canvas_) canvas_->rotateView(90); break;
+	case IDM_VIEW_ROTATE_CCW: if (canvas_) canvas_->rotateView(-90); break;
+	case IDM_VIEW_ROTATE_RESET: if (canvas_) canvas_->rotateView(-canvas_->viewRotation()); break;
 	case IDM_GO_PREV: if (canvas_) canvas_->goToPage(canvas_->currentPage() - 1); break;
 	case IDM_GO_NEXT: if (canvas_) canvas_->goToPage(canvas_->currentPage() + 1); break;
 	case IDM_HELP_ABOUT:
@@ -7522,6 +7728,16 @@ int FrameWindow::popupUnderButton(int buttonId, HMENU menu)
 void FrameWindow::showToolsMenu()
 {
 	HMENU m = CreatePopupMenu();
+	// View rotation sits at the top: it's the one entry here that changes
+	// nothing in the file, so it's grouped away from the editing tools below.
+	{
+		int rot = canvas_ ? canvas_->viewRotation() : 0;
+		AppendMenuW(m, MF_STRING, IDM_VIEW_ROTATE_CW, L"Rotate View Clockwise\tCtrl+Shift++");
+		AppendMenuW(m, MF_STRING, IDM_VIEW_ROTATE_CCW, L"Rotate View Counter-clockwise\tCtrl+Shift+-");
+		AppendMenuW(m, MF_STRING | (rot == 0 ? MF_GRAYED : 0), IDM_VIEW_ROTATE_RESET,
+			rot == 0 ? L"Reset Rotation" : L"Reset Rotation (view only, not saved)");
+		AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	}
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_ORGANIZE, L"Organize Pages");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_MERGE, L"Merge PDFs...");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_SPLIT, L"Split PDF...");
@@ -7644,7 +7860,9 @@ void FrameWindow::layoutStatusParts()
 {
 	if (!status_) return;
 	UINT dpi = GetDpiForWindow(status_);
-	int leftW = Scale(240, dpi);
+	// Wide enough for the longest form of part 0's text, which now includes
+	// the view-rotation readout ("Page 9 / 99   Zoom 1200%   Rotated 270°").
+	int leftW = Scale(300, dpi);
 	int parts[2] = { leftW, -1 };
 	SendMessageW(status_, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
 }

@@ -17,8 +17,26 @@ struct PrintSettings {
 	PrintRangeMode rangeMode = PrintRangeMode::All;
 	std::wstring customRange;      // e.g. "1-3,5" -- only used when rangeMode == Custom
 	bool landscape = false;
-	bool grayscale = false;
+	bool grayscale = true;
+	// Rasterization resolution for the page bitmap handed to the printer, in
+	// DPI. Higher is sharper (the driver no longer has to scale a coarse
+	// bitmap up to its own device resolution) at the cost of memory and time:
+	// one A4 page is ~35 MB at 300 DPI, ~140 MB at 600 and ~560 MB at 1200,
+	// plus MuPDF's own pixmap while it renders. Never rendered above the
+	// printer's own resolution -- past that there is nothing left to gain --
+	// and printOnePage() steps down if the allocation fails rather than
+	// dropping the page. See kPrintDpiChoices for the values the panel offers.
+	int renderDpi = 600;
 };
+
+// The DPI values the print panel's Quality combo offers, and the default one
+// (index into this list). 600 is the default: it's the native resolution of
+// most office lasers, so nothing gets scaled for them -- the old fixed 200 DPI
+// cap is what visibly softened printed text. 1200 is there for commercial
+// printers that really do mark at that resolution.
+constexpr int kPrintDpiChoiceCount = 5;
+extern const int kPrintDpiChoices[kPrintDpiChoiceCount];
+constexpr int kPrintDpiDefaultIndex = 3;
 
 // Installed printer names (EnumPrintersW), for the panel's printer combo box.
 std::vector<std::wstring> ListPrinterNames();

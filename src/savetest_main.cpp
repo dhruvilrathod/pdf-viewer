@@ -473,6 +473,74 @@ int wmain(int argc, wchar_t** argv)
 		return failures == 0 ? 0 : 1;
 	}
 
+	// --rotatetest mode: verifies PdfDocument::renderPage()'s view rotation is
+	// a real quarter turn CLOCKWISE, which is what CanvasView's coordinate
+	// mapping (pageRectToView/viewToPage) assumes. Renders page 0 upright and
+	// at each of 90/180/270, checks the pixel dimensions swap where they
+	// should, and samples a grid of pixels through the same mapping the canvas
+	// uses -- if the render turned the other way (or not at all), the sampled
+	// colors won't line up.
+	if (argc > 3 && wcscmp(argv[3], L"--rotatetest") == 0) {
+		PdfDocument doc;
+		std::string e; bool npw = false;
+		if (!doc.open(input, e, npw)) { std::printf("open failed: %s\n", e.c_str()); return 1; }
+
+		auto pixels = [](const PageBitmap& b, int x, int y, unsigned char* out) -> bool {
+			DIBSECTION ds{};
+			if (!GetObjectW(b.hbmp, sizeof(ds), &ds) || !ds.dsBm.bmBits) return false;
+			if (x < 0 || y < 0 || x >= b.width || y >= b.height) return false;
+			const auto* p = static_cast<const unsigned char*>(ds.dsBm.bmBits)
+				+ static_cast<ptrdiff_t>(y) * b.width * 4 + static_cast<ptrdiff_t>(x) * 4;
+			out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+			return true;
+		};
+
+		const float scale = 2.0f; // above the 1.5 supersampling threshold; see renderPage
+		PageBitmap up = doc.renderPage(0, scale, 0);
+		if (!up.hbmp) { std::printf("FAIL: upright render failed\n"); return 1; }
+		std::printf("upright: %dx%d\n", up.width, up.height);
+		int failures = 0;
+		for (int rot : { 90, 180, 270 }) {
+			PageBitmap r = doc.renderPage(0, scale, rot);
+			if (!r.hbmp) { std::printf("  [%d] FAIL: render failed\n", rot); ++failures; continue; }
+			int wantW = (rot == 180) ? up.width : up.height;
+			int wantH = (rot == 180) ? up.height : up.width;
+			bool sizeOk = std::abs(r.width - wantW) <= 1 && std::abs(r.height - wantH) <= 1;
+
+			// Same mapping as CanvasView::pageRectToView, in pixels:
+			//   90:  (x,y) -> (H-1-y, x)      180: (x,y) -> (W-1-x, H-1-y)
+			//   270: (x,y) -> (y, W-1-x)
+			int sampled = 0, matched = 0;
+			for (int y = 4; y < up.height - 4; y += std::max(1, up.height / 40)) {
+				for (int x = 4; x < up.width - 4; x += std::max(1, up.width / 40)) {
+					int rx, ry;
+					if (rot == 90) { rx = up.height - 1 - y; ry = x; }
+					else if (rot == 180) { rx = up.width - 1 - x; ry = up.height - 1 - y; }
+					else { rx = y; ry = up.width - 1 - x; }
+					unsigned char a[3], b[3];
+					if (!pixels(up, x, y, a) || !pixels(r, rx, ry, b)) continue;
+					++sampled;
+					// Anti-aliasing is recomputed per orientation, so glyph
+					// edges won't be bit-identical -- a loose tolerance still
+					// separates "same page turned the right way" from "turned
+					// the wrong way", which mismatches wildly.
+					if (std::abs(a[0] - b[0]) <= 24 && std::abs(a[1] - b[1]) <= 24 && std::abs(a[2] - b[2]) <= 24)
+						++matched;
+				}
+			}
+			double pct = sampled ? (100.0 * matched / sampled) : 0.0;
+			bool pixelsOk = sampled > 100 && pct >= 97.0;
+			std::printf("  [%d] %dx%d (want %dx%d) pixels matched %.1f%% of %d %s\n",
+				rot, r.width, r.height, wantW, wantH, pct, sampled,
+				(sizeOk && pixelsOk) ? "OK" : "FAIL");
+			if (!sizeOk || !pixelsOk) ++failures;
+			if (r.hbmp) DeleteObject(r.hbmp);
+		}
+		if (up.hbmp) DeleteObject(up.hbmp);
+		std::printf("=== %s ===\n", failures == 0 ? "ROTATION IS CLOCKWISE AS EXPECTED" : "ROTATETEST FAILURES PRESENT");
+		return failures == 0 ? 0 : 1;
+	}
+
 	// --pwtest mode: exercises open(needsPassword)/authenticate()/isEncrypted()/
 	// removeProtection() instead of the widget-editing flow below, which
 	// assumes an unencrypted, form-bearing PDF.

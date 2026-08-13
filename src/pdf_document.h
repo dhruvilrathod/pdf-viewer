@@ -317,7 +317,12 @@ public:
 
 	// Render page `index` at `scale` device-pixels-per-point into a BGRA DIB.
 	// Thread-safe against other renders on this document (serialized).
-	PageBitmap renderPage(int index, float scale);
+	// `rotate` is a view-only quarter turn clockwise (0/90/180/270) baked into
+	// the render matrix -- it does NOT touch the document, so page/annotation/
+	// text coordinates stay in the page's own upright space and callers that
+	// mix rendered pixels with those coordinates must rotate them themselves
+	// (see CanvasView::pageRectToView).
+	PageBitmap renderPage(int index, float scale, int rotate = 0);
 	// Same, but with annotation `annotIndex` temporarily hidden for this one
 	// render (flag is restored immediately after) -- used to build the
 	// "transparent" background behind an in-progress edit of that annotation

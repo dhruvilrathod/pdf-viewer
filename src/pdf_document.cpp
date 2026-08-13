@@ -428,12 +428,17 @@ std::vector<PageRectPt> PdfDocument::searchPage(int index, const char* needle, i
 	return out;
 }
 
-PageBitmap PdfDocument::renderPage(int index, float scale)
+PageBitmap PdfDocument::renderPage(int index, float scale, int rotate)
 {
 	PageBitmap result;
 	if (!ctx_ || !doc_ || !authed_) return result;
 	if (index < 0 || index >= pageCount_) return result;
 	if (scale <= 0.0f) return result;
+
+	// Normalize to one of the four quarter turns; anything else is a caller
+	// bug and is treated as "upright" rather than producing a skewed page.
+	rotate = ((rotate % 360) + 360) % 360;
+	if (rotate % 90 != 0) rotate = 0;
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	fz_page* page = nullptr;
@@ -445,7 +450,13 @@ PageBitmap PdfDocument::renderPage(int index, float scale)
 		// Target (final) pixel box -- exactly what a direct render at `scale`
 		// produces (fz_new_pixmap_from_page uses this same round_rect, see
 		// util.c) and the size the on-screen layout (pagePixelSize) expects.
-		fz_irect targetBox = fz_round_rect(fz_transform_rect(fz_bound_page(ctx_, page), fz_scale(scale, scale)));
+		// Rotation goes into the matrix rather than being applied to the
+		// finished bitmap, so glyphs are rasterized in their final orientation
+		// (a post-hoc bitmap rotation would resample already-anti-aliased
+		// pixels). fz_pre_rotate turns clockwise on screen, since the page
+		// space MuPDF renders into already has y pointing down.
+		fz_matrix baseCtm = fz_pre_rotate(fz_scale(scale, scale), static_cast<float>(rotate));
+		fz_irect targetBox = fz_round_rect(fz_transform_rect(fz_bound_page(ctx_, page), baseCtm));
 		int targetW = std::max(1, targetBox.x1 - targetBox.x0);
 		int targetH = std::max(1, targetBox.y1 - targetBox.y0);
 
@@ -466,7 +477,7 @@ PageBitmap PdfDocument::renderPage(int index, float scale)
 			// the ctm goes to the draw device, the page runs with fz_identity,
 			// opaque pixmap => white clear.
 			fz_irect ssBox = { targetBox.x0 * 2, targetBox.y0 * 2, targetBox.x1 * 2, targetBox.y1 * 2 };
-			fz_matrix ctm = fz_scale(scale * 2.0f, scale * 2.0f);
+			fz_matrix ctm = fz_pre_rotate(fz_scale(scale * 2.0f, scale * 2.0f), static_cast<float>(rotate));
 			pix = fz_new_pixmap_with_bbox(ctx_, fz_device_rgb(ctx_), ssBox, nullptr, 0);
 			fz_clear_pixmap_with_value(ctx_, pix, 0xFF);
 			dev = fz_new_draw_device(ctx_, ctm, pix);
@@ -478,8 +489,7 @@ PageBitmap PdfDocument::renderPage(int index, float scale)
 		} else {
 			// At/above 150% zoom a glyph stem already spans several device
 			// pixels, so supersampling wouldn't help -- render straight.
-			fz_matrix ctm = fz_scale(scale, scale);
-			pix = fz_new_pixmap_from_page(ctx_, page, ctm, fz_device_rgb(ctx_), 0);
+			pix = fz_new_pixmap_from_page(ctx_, page, baseCtm, fz_device_rgb(ctx_), 0);
 			int w = 0, h = 0;
 			HBITMAP hbmp = pixmapToDIB(ctx_, pix, w, h);
 			if (hbmp) { result.hbmp = hbmp; result.width = w; result.height = h; }

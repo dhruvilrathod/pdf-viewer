@@ -13,6 +13,9 @@
 #define IDM_VIEW_CONTINUOUS  1015
 #define IDM_VIEW_SINGLEPAGE  1016
 #define IDM_VIEW_THUMBS      1017
+#define IDM_VIEW_ROTATE_CW   1050  // temporary (view-only) 90-degree turn clockwise
+#define IDM_VIEW_ROTATE_CCW  1051  // ... counter-clockwise
+#define IDM_VIEW_ROTATE_RESET 1052 // back to upright
 #define IDM_VIEW_ZOOMLABEL   1018  // toolbar-only: shows current zoom %, click resets to 100%
 #define IDM_VIEW_PAGELABEL   1019  // toolbar-only: reserves width for the page-number jump box (pageEdit_/pageOfLabel_ overlay it)
 
@@ -25,6 +28,7 @@
 #define IDM_TAB_OPEN_NEW_WINDOW 1025  // tab right-click menu: detach into its own top-level window
 #define IDM_TAB_MERGE_SELECTED  1026  // tab right-click menu, multi-selected group only: merge in selection order
 #define IDM_TAB_ZIP_SELECTED    1027  // tab right-click menu, multi-selected group only: zip the underlying files
+#define IDM_TAB_REOPEN_LAST     1028  // Ctrl+Shift+T / tab bar right-click: reopen the most recently closed tab
 
 #define IDM_EDIT_FIND        1040
 #define IDM_EDIT_FINDNEXT    1041
@@ -50,6 +54,7 @@
 #define IDM_WIDTH_BASE       1300  // + index
 #define IDM_OPACITY_BASE     1320  // + index
 #define IDM_FORMOPT_BASE     1400  // + option index for combo/list widgets
+#define IDM_TAB_REOPEN_BASE  1500  // + index into the recently-closed-tab list (kMaxClosedTabs entries)
 
 // Search-bar child control IDs
 #define IDC_SEARCH_EDIT      1100
@@ -158,6 +163,8 @@
 #define IDC_PRINT_PAGENAV_NEXT   1156
 #define IDC_PRINT_GO             1157
 #define IDC_PRINT_CANCEL         1158
+#define IDC_PRINT_QUALITY_LABEL  1168
+#define IDC_PRINT_QUALITY_COMBO  1169
 
 // Rich-text-editor side panel (right-docked, mutually exclusive with the
 // print panel -- "Edit as Rich Text..." on a text selection's right-click menu)

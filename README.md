@@ -54,13 +54,23 @@ not run on macOS or Linux.
 - Opens **maximized** by default, with Windows 11 native chrome (rounded corners,
   Mica backdrop) where available.
 - Smooth continuous scroll, zoom, **Fit Width**, **Fit Page**, page drop shadows.
+- **Rotate the view** 90° at a time (toolbar button, or Ctrl+Shift+**+** /
+  Ctrl+Shift+**−**) for sideways scans. This is a *view* setting — the file is
+  never modified and the rotation resets when the tab loads another document.
+  To rotate pages permanently, use **Organize pages** instead.
 - Multiple documents in **tabs** (drag to reorder, tabs shrink to fit).
+- **Reopen a closed tab** with Ctrl+Shift+T, or right-click the tab bar for the
+  last few closed files. The list is per window and lasts only until you quit.
 - Crisp rendering on HiDPI displays (per-monitor DPI aware).
 
 **Search & Print**
 - **Find** text (Ctrl+F): incremental highlight of all matches, live counter,
   jump between matches (Enter / F3 / Shift+F3).
-- **Print** (Ctrl+P): standard Windows print dialog, page-range printing.
+- **Print** (Ctrl+P): side panel with live preview, printer/copies/page range,
+  orientation, color or grayscale (grayscale by default), and a **Quality**
+  setting for how finely pages are rasterized for the printer — 150 to 1200
+  DPI, defaulting to 600. Pages are never rendered above the printer's own
+  resolution.
 
 **Annotate & fill forms**
 - Highlight, freehand draw, and free-text boxes — all edited **inline**, no modal

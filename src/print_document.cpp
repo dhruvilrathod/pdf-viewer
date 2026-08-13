@@ -83,7 +83,7 @@ void blitPageContent(HDC hdc, HBITMAP hbmp, int bmpW, int bmpH,
 // Render one page onto the printer DC, scaled to fill the printable area
 // while preserving aspect ratio and centering (rotated into place first for
 // landscape -- see blitPageContent).
-void printOnePage(HDC hdc, PdfDocument& doc, int pageIndex, bool grayscale, bool landscape)
+void printOnePage(HDC hdc, PdfDocument& doc, int pageIndex, bool grayscale, bool landscape, int renderDpiSetting)
 {
 	PageSizePt s = doc.pageSize(pageIndex);
 	if (s.w <= 0 || s.h <= 0) return;
@@ -103,11 +103,20 @@ void printOnePage(HDC hdc, PdfDocument& doc, int pageIndex, bool grayscale, bool
 	if (landscape) fitCentered(srcH, srcW, paperW, paperH, destX, destY, destW, destH);
 	else fitCentered(srcW, srcH, paperW, paperH, destX, destY, destW, destH);
 
-	// Render at up to 200 DPI to keep bitmap memory sane; the printer driver
-	// scales it up to full device resolution during StretchBlt.
-	double renderDpi = std::min<double>(std::max(dpiX, dpiY), 200.0);
-	float scale = static_cast<float>(renderDpi / 72.0);
-	PageBitmap bmp = doc.renderPage(pageIndex, scale);
+	// Rasterize at the chosen quality, but never above the printer's own
+	// resolution -- rendering finer than the device can mark is pure cost.
+	// Anything below the device DPI still gets scaled up by StretchBlt, which
+	// is what made the old fixed 200 DPI cap look soft on a 600 DPI printer.
+	double renderDpi = std::min<double>(std::max(dpiX, dpiY),
+		std::max(72, renderDpiSetting));
+	PageBitmap bmp;
+	// A full-page bitmap at 600 DPI is ~140 MB; if the allocation fails, step
+	// down rather than dropping the page from the printout entirely.
+	while (true) {
+		bmp = doc.renderPage(pageIndex, static_cast<float>(renderDpi / 72.0));
+		if (bmp.hbmp || renderDpi <= 96.0) break;
+		renderDpi = std::max(96.0, renderDpi / 2.0);
+	}
 	if (!bmp.hbmp) return;
 
 	if (grayscale) {
@@ -120,6 +129,8 @@ void printOnePage(HDC hdc, PdfDocument& doc, int pageIndex, bool grayscale, bool
 }
 
 } // namespace
+
+const int kPrintDpiChoices[kPrintDpiChoiceCount] = { 150, 200, 300, 600, 1200 };
 
 std::vector<std::wstring> ListPrinterNames()
 {
@@ -299,7 +310,7 @@ bool ExecutePrintJob(HWND owner, PdfDocument& doc, const PrintSettings& settings
 		for (int c = 0; c < copies && ok; ++c) {
 			for (int p : pages) {
 				if (StartPage(hdc) <= 0) { ok = false; break; }
-				printOnePage(hdc, doc, p, settings.grayscale, settings.landscape);
+				printOnePage(hdc, doc, p, settings.grayscale, settings.landscape, settings.renderDpi);
 				if (EndPage(hdc) <= 0) { ok = false; break; }
 			}
 		}
