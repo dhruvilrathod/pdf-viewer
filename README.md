@@ -66,11 +66,15 @@ not run on macOS or Linux.
 **Search & Print**
 - **Find** text (Ctrl+F): incremental highlight of all matches, live counter,
   jump between matches (Enter / F3 / Shift+F3).
-- **Print** (Ctrl+P): side panel with live preview, printer/copies/page range,
-  orientation, color or grayscale (grayscale by default), and a **Quality**
-  setting for how finely pages are rasterized for the printer — 150 to 1200
-  DPI, defaulting to 600. Pages are never rendered above the printer's own
-  resolution.
+- **Print** (Ctrl+P): side panel with live preview, destination/copies/page
+  range, orientation, color or grayscale (grayscale by default), and a
+  **Quality** setting for how finely pages are rasterized for the printer —
+  150 to 1200 DPI, defaulting to 600. Pages are never rendered above the
+  printer's own resolution.
+- **Save as PDF** — the first entry in the print panel's destination list.
+  Writes the selected page (or range) out as a new PDF with the pages copied
+  across as pages: text stays selectable and annotations stay editable, unlike
+  a print-to-PDF driver, which flattens everything to an image.
 
 **Annotate & fill forms**
 - Highlight, freehand draw, and free-text boxes — all edited **inline**, no modal

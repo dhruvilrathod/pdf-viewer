@@ -140,13 +140,18 @@ int wmain(int argc, wchar_t** argv)
 			}
 		}
 
-		// --- exportPages (backs Split) -------------------------------------
+		// --- exportPages (backs Split and the print panel's Save as PDF) ----
 		{
 			std::printf("[exportPages]\n");
 			PdfDocument doc;
 			if (!openFresh(doc)) return 1;
+			// Export a MIDDLE page on its own where possible, not just the
+			// first N: that's the "save this one page as its own PDF" case,
+			// and it catches a grafting bug that copying from page 0 wouldn't.
 			std::vector<int> pages;
-			for (int p = 0; p < doc.pageCount() && p < 2; ++p) pages.push_back(p);
+			if (doc.pageCount() >= 2) pages.push_back(doc.pageCount() / 2);
+			else pages.push_back(0);
+			auto charsBefore = doc.pageChars(pages[0]);
 			std::wstring splitPath = outPath(L"_split.pdf");
 			std::string e;
 			if (!doc.exportPages(pages, splitPath.c_str(), e)) {
@@ -159,13 +164,20 @@ int wmain(int argc, wchar_t** argv)
 					std::printf("  FAIL: reopen split output: %s\n", e2.c_str());
 					++failures;
 				} else {
-					std::printf("  exportPages OK: pageCount=%d (expect %d)\n",
-						doc2.pageCount(), static_cast<int>(pages.size()));
+					std::printf("  exportPages OK: page %d -> pageCount=%d (expect %d)\n",
+						pages[0], doc2.pageCount(), static_cast<int>(pages.size()));
 					if (doc2.pageCount() != static_cast<int>(pages.size())) ++failures;
 					for (int p = 0; p < doc2.pageCount(); ++p) {
 						PageBitmap b = doc2.renderPage(p, 1.0f);
 						if (!b.hbmp) { std::printf("  RENDER FAILED on split page %d\n", p); ++failures; }
 					}
+					// The point of exporting instead of printing to a PDF
+					// driver: the page arrives as a page, with its text intact
+					// rather than rasterized into an image.
+					auto charsAfter = doc2.pageChars(0);
+					std::printf("  text preserved: %d chars in, %d chars out (expect equal, non-zero)\n",
+						static_cast<int>(charsBefore.size()), static_cast<int>(charsAfter.size()));
+					if (charsAfter.size() != charsBefore.size() || charsAfter.empty()) ++failures;
 				}
 			}
 		}

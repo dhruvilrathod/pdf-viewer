@@ -732,7 +732,7 @@ private:
 	void onHScroll(WPARAM);
 	void onWheel(short delta, bool ctrl, bool horiz, POINT screenPt);
 	void updateStatus();
-	int firstVisiblePage() const;
+	int dominantVisiblePage() const;
 	void stepHit(int dir);
 	void scrollToHit(int hitIdx);
 	void drawHighlights(HDC dc, int pageIndex, int pageX, int pageY);
@@ -1365,6 +1365,11 @@ private:
 	void showPrintPanel(bool show);
 	void updatePrintPreviewFromPanel();
 	void doExecutePrint();
+	// The destination combo's first entry (kSaveAsPdfIndex) writes the chosen
+	// pages out as a PDF instead of printing -- see doSaveRangeAsPdf().
+	static constexpr int kSaveAsPdfIndex = 0;
+	bool printSaveAsPdfSelected() const;
+	void doSaveRangeAsPdf();
 	PrintSettings readPrintSettingsFromPanel() const;
 
 	// Rich-text-editor side panel -- right-docked like the print panel (and
@@ -1682,7 +1687,7 @@ int CanvasView::search(const std::wstring& text)
 	}
 	if (!hits_.empty()) {
 		// Jump to the first hit on or after the current page.
-		int start = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
+		int start = (mode_ == Mode::Continuous) ? dominantVisiblePage() : currentPage_;
 		int idx = 0;
 		for (size_t i = 0; i < hits_.size(); ++i) {
 			if (hits_[i].page >= start) { idx = static_cast<int>(i); break; }
@@ -2378,7 +2383,7 @@ void CanvasView::selectLineAt(int page, float px, float py)
 void CanvasView::selectAll()
 {
 	if (!doc_ || !doc_->isOpen()) return;
-	int page = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
+	int page = (mode_ == Mode::Continuous) ? dominantVisiblePage() : currentPage_;
 	const auto& chars = charsForPage(page);
 	selAnchorPage_ = selFocusPage_ = page;
 	if (chars.empty()) { clearTextSelection(); return; }
@@ -3354,14 +3359,28 @@ HBITMAP CanvasView::ensureRendered(int i, int& w, int& h)
 	return hb;
 }
 
-int CanvasView::firstVisiblePage() const
+// The page a reader would call "the page I'm on": the one covering the most of
+// the viewport. Not simply the first page with a pixel on screen -- scrolling
+// continuously almost always leaves a sliver of the previous page at the top,
+// and counting that sliver as the current page left the page readout (and
+// Print's "Current page", which is what made this visible) one page behind
+// whatever was actually filling the screen.
+int CanvasView::dominantVisiblePage() const
 {
 	if (mode_ == Mode::SinglePage) return currentPage_;
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int ch = rc.bottom - rc.top;
+	int best = 0, bestCover = std::numeric_limits<int>::min();
 	for (size_t i = 0; i < layout_.size(); ++i) {
-		if (layout_[i].y + layout_[i].h - scrollY_ > 0)
-			return static_cast<int>(i);
+		int top = layout_[i].y - scrollY_;
+		// Height of this page's intersection with the viewport. Negative for a
+		// page entirely off-screen, so an empty viewport (scrolled into the gap
+		// between two pages) still resolves to the nearest one.
+		int cover = std::min(top + layout_[i].h, ch) - std::max(top, 0);
+		if (cover > bestCover) { bestCover = cover; best = static_cast<int>(i); }
+		if (top > ch) break; // pages are laid out top-down: the rest can only do worse
 	}
-	return 0;
+	return best;
 }
 
 void CanvasView::onPaint()
@@ -3645,7 +3664,7 @@ void CanvasView::updateStatus()
 	}
 	wchar_t buf[128];
 	if (doc_ && doc_->isOpen()) {
-		int cur = (mode_ == Mode::Continuous) ? firstVisiblePage() : currentPage_;
+		int cur = (mode_ == Mode::Continuous) ? dominantVisiblePage() : currentPage_;
 		currentPage_ = cur;
 		// The rotation readout is what tells the user the page is turned
 		// on screen only -- nothing about the file itself changed.
@@ -5164,7 +5183,9 @@ void FrameWindow::createChildren()
 		return h;
 	};
 	printTitle_ = mkStatic(L"Print", IDC_PRINT_TITLE);
-	printPrinterLabel_ = mkStatic(L"Printer", IDC_PRINT_PRINTER_LABEL);
+	// "Destination", not "Printer": the list's first entry is Save as PDF,
+	// which writes a file instead of printing (see showPrintPanel).
+	printPrinterLabel_ = mkStatic(L"Destination", IDC_PRINT_PRINTER_LABEL);
 	printPrinterCombo_ = CreateWindowExW(0, L"COMBOBOX", L"",
 		WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd_,
 		reinterpret_cast<HMENU>(IDC_PRINT_PRINTER_COMBO), hInst_, nullptr);
@@ -5674,14 +5695,20 @@ void FrameWindow::showPrintPanel(bool show)
 		// Populate the printer list fresh every time the panel opens (cheap,
 		// and picks up printers installed/removed since last time).
 		SendMessageW(printPrinterCombo_, CB_RESETCONTENT, 0, 0);
+		// Index 0 is always the Save-as-PDF destination (kSaveAsPdfIndex), the
+		// way a browser's print dialog offers it: it exports the chosen pages
+		// as a real PDF -- pages copied across as pages, text still text --
+		// rather than sending anything to a printer.
+		SendMessageW(printPrinterCombo_, CB_ADDSTRING, 0,
+			reinterpret_cast<LPARAM>(L"Save as PDF (keeps text, no printer)"));
 		std::vector<std::wstring> printers = ListPrinterNames();
 		std::wstring def = DefaultPrinterName();
-		int defIndex = 0;
+		int defIndex = printers.empty() ? kSaveAsPdfIndex : 1;
 		for (size_t i = 0; i < printers.size(); ++i) {
 			SendMessageW(printPrinterCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(printers[i].c_str()));
-			if (printers[i] == def) defIndex = static_cast<int>(i);
+			if (printers[i] == def) defIndex = static_cast<int>(i) + 1;
 		}
-		if (!printers.empty()) SendMessageW(printPrinterCombo_, CB_SETCURSEL, defIndex, 0);
+		SendMessageW(printPrinterCombo_, CB_SETCURSEL, defIndex, 0);
 		// Reset the rest of the panel to sensible defaults each time it opens.
 		SetWindowTextW(printCopiesEdit_, L"1");
 		SendMessageW(printRangeAll_, BM_SETCHECK, BST_CHECKED, 0);
@@ -5706,9 +5733,19 @@ void FrameWindow::showPrintPanel(bool show)
 	}
 }
 
+bool FrameWindow::printSaveAsPdfSelected() const
+{
+	return printPrinterCombo_ &&
+		static_cast<int>(SendMessageW(printPrinterCombo_, CB_GETCURSEL, 0, 0)) == kSaveAsPdfIndex;
+}
+
 PrintSettings FrameWindow::readPrintSettingsFromPanel() const
 {
 	PrintSettings s;
+	// printerName deliberately still picks up the Save-as-PDF entry's own text
+	// when that's selected: doExecutePrint() branches before ever using it, and
+	// leaving it empty would instead make a stray print job silently go to the
+	// default printer -- much worse than failing loudly on a bogus name.
 	int sel = static_cast<int>(SendMessageW(printPrinterCombo_, CB_GETCURSEL, 0, 0));
 	if (sel >= 0) {
 		wchar_t buf[512];
@@ -5740,6 +5777,18 @@ void FrameWindow::updatePrintPreviewFromPanel()
 	if (!printPanelVisible_ || !doc_ || !doc_->isOpen() || !canvas_) return;
 	EnableWindow(printRangeEdit_, SendMessageW(printRangeCustom_, BM_GETCHECK, 0, 0) == BST_CHECKED);
 	PrintSettings s = readPrintSettingsFromPanel();
+
+	// Saving as PDF copies the chosen pages across as they are, so everything
+	// about how they'd be rasterized for a printer -- copies, orientation,
+	// color, quality -- has nothing to act on. Disable those rather than let
+	// them look like they apply, and say so on the button.
+	bool toPdf = printSaveAsPdfSelected();
+	for (HWND h : { printCopiesEdit_, printOrientPortrait_, printOrientLandscape_,
+		printColorColor_, printColorGray_, printQualityCombo_ })
+		EnableWindow(h, !toPdf);
+	SetWindowTextW(printGo_, toPdf ? L"Save as PDF..." : L"Print");
+	if (toPdf) { s.grayscale = false; s.landscape = false; } // preview what will actually be written
+
 	int curPage = canvas_->currentPage();
 	std::vector<int> pages = ResolvePrintPages(s, doc_->pageCount(), curPage);
 	if (!canvas_->printPreviewActive())
@@ -5756,9 +5805,65 @@ void FrameWindow::updatePrintPreviewFromPanel()
 	EnableWindow(printGo_, n > 0);
 }
 
+// The Save-as-PDF destination: writes the selected page range out as a real
+// PDF via PdfDocument::exportPages (the same page-grafting Split uses), so
+// pages arrive as pages -- text still selectable, annotations still
+// annotations -- instead of the flattened image a print-to-PDF driver
+// produces. Nothing here touches the open document.
+void FrameWindow::doSaveRangeAsPdf()
+{
+	if (!doc_ || !doc_->isOpen() || !canvas_) return;
+	if (!doc_->isPdf()) {
+		MessageBoxW(hwnd_, L"Only PDF files can be saved as a page range.", L"Save as PDF", MB_OK | MB_ICONINFORMATION);
+		return;
+	}
+	canvas_->flushPendingEdit(); // in-progress typing belongs in the exported pages
+
+	PrintSettings s = readPrintSettingsFromPanel();
+	std::vector<int> pages = ResolvePrintPages(s, doc_->pageCount(), canvas_->currentPage());
+	if (pages.empty()) {
+		MessageBoxW(hwnd_, L"No pages selected -- check the page range.", L"Save as PDF", MB_OK | MB_ICONWARNING);
+		return;
+	}
+
+	// Default name: the original's, with a "-pages" suffix, so it can't be
+	// confused with (or overwrite) the file it came from.
+	std::wstring stem = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size()))
+		? tabs_[activeTab_]->name : std::wstring();
+	size_t dot = stem.find_last_of(L'.');
+	if (dot != std::wstring::npos) stem = stem.substr(0, dot);
+	if (stem.empty()) stem = L"Document";
+	wchar_t file[MAX_PATH] = L"";
+	wcsncpy_s(file, (stem + L"-pages.pdf").c_str(), _TRUNCATE);
+	OPENFILENAMEW ofn = {};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hwnd_;
+	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrDefExt = L"pdf";
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+	ofn.lpstrTitle = L"Save Pages as PDF";
+	if (!GetSaveFileNameW(&ofn)) return; // cancelled -- panel stays open
+
+	std::string err;
+	if (!doc_->exportPages(pages, file, err)) {
+		std::wstring werr(err.begin(), err.end());
+		MessageBoxW(hwnd_, werr.empty() ? L"Could not save the selected pages." : werr.c_str(),
+			L"Save as PDF", MB_OK | MB_ICONERROR);
+		return; // leave the panel open so the user can retry
+	}
+	wchar_t msg[MAX_PATH + 96];
+	swprintf(msg, MAX_PATH + 96, L"Saved %d page%s to:\n%s",
+		static_cast<int>(pages.size()), pages.size() == 1 ? L"" : L"s", file);
+	MessageBoxW(hwnd_, msg, L"Save as PDF", MB_OK | MB_ICONINFORMATION);
+	showPrintPanel(false);
+}
+
 void FrameWindow::doExecutePrint()
 {
 	if (!doc_ || !doc_->isOpen() || !canvas_) return;
+	if (printSaveAsPdfSelected()) { doSaveRangeAsPdf(); return; }
 	PrintSettings s = readPrintSettingsFromPanel();
 	std::vector<int> pages = ResolvePrintPages(s, doc_->pageCount(), canvas_->currentPage());
 	if (pages.empty()) {
