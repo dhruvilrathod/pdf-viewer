@@ -161,6 +161,14 @@
 #define IDC_SIG_GALLERY      1188
 #define IDC_SIG_LOCK         1189
 #define IDC_SIG_CLOSE        1190
+// Optional date, composed into the same stamp as the signature (see
+// signature.h). Always an explicit picked date, never "today" resolved later.
+#define IDC_SIG_DATE_CHECK     1191
+#define IDC_SIG_DATE_PICKER    1192
+#define IDC_SIG_DATE_FORMAT    1193
+#define IDC_SIG_DATE_POS_LABEL 1194
+#define IDC_SIG_DATE_BELOW     1195
+#define IDC_SIG_DATE_RIGHT     1196
 
 // Web-to-PDF bar (URL text box + Convert button)
 #define IDC_WEBPDF_LABEL   1134

@@ -22,19 +22,44 @@
 // pad can be any size/DPI and a saved signature still replays correctly).
 struct SigPoint { float x = 0.0f; float y = 0.0f; };
 
+// How an accompanying date is written out. Fixed picture strings rather than
+// the machine's locale default, so a saved signature renders identically
+// everywhere -- and so day/month order is never ambiguous on a signed form.
+enum class SigDateFormat { DMY, MDY, DMonthY, ISO };
+// Where the date sits relative to the signature in the composed stamp.
+enum class SigDatePos { Below, Right };
+
 struct Signature {
 	enum class Kind { Typed, Drawn };
 	Kind kind = Kind::Typed;
 
 	// Typed
 	std::wstring text;  // what to render
-	std::wstring font;  // handwriting font face (one of SignatureFontFaces())
+	// Handwriting font face (one of SignatureFontFaces()). Set for BOTH kinds:
+	// a drawn signature still uses it to render its date, so the date looks
+	// hand-written rather than typeset next to it.
+	std::wstring font;
 
 	// Drawn
 	std::vector<std::vector<SigPoint>> strokes;
 	float padAspect = 3.0f; // width/height of the pad the strokes were drawn in
 
 	COLORREF color = RGB(0, 0, 0);
+
+	// Optional date, composed into the SAME stamp as the signature so the two
+	// place as one unit. Always an explicit date the user picked -- never
+	// "today" resolved at stamping time, which would silently change what a
+	// saved signature means from one day to the next.
+	bool hasDate = false;
+	int dateYear = 0, dateMonth = 0, dateDay = 0;
+	SigDateFormat dateFormat = SigDateFormat::DMY;
+	SigDatePos datePos = SigDatePos::Below;
+
+	bool hasValidDate() const
+	{
+		return hasDate && dateYear >= 1 && dateYear <= 9999 &&
+			dateMonth >= 1 && dateMonth <= 12 && dateDay >= 1 && dateDay <= 31;
+	}
 
 	bool empty() const
 	{
@@ -45,6 +70,13 @@ struct Signature {
 	// A short human label for the gallery / status text.
 	std::wstring label() const;
 };
+
+// The signature's date rendered per its dateFormat; empty if it has none.
+std::wstring FormatSignatureDate(const Signature& s);
+// Human-readable names for the SigDateFormat choices, in enum order, each
+// showing that format applied to a sample date -- so the chooser previews the
+// actual result instead of naming an abstract pattern.
+const std::vector<std::wstring>& SignatureDateFormatLabels();
 
 // Handwriting-style faces offered for a typed signature, filtered down to the
 // ones actually installed on this machine (the list spans Windows-shipped and

@@ -1191,6 +1191,14 @@ public:
 	// would just make black ink invisible in dark mode.
 	void setInkColor(COLORREF c) { ink_ = c; InvalidateRect(hwnd_, nullptr, FALSE); }
 	void clear() { strokes_.clear(); InvalidateRect(hwnd_, nullptr, TRUE); if (onChanged_) onChanged_(); }
+	// Replays a saved signature's strokes back into the pad, so picking one
+	// out of the gallery leaves the panel showing what's actually armed.
+	void setStrokes(std::vector<std::vector<SigPoint>> s) {
+		strokes_ = std::move(s);
+		drawing_ = false;
+		InvalidateRect(hwnd_, nullptr, TRUE);
+		if (onChanged_) onChanged_();
+	}
 	bool empty() const {
 		for (const auto& s : strokes_) if (!s.empty()) return false;
 		return true;
@@ -1515,6 +1523,15 @@ private:
 	HWND sigFontList_ = nullptr;
 	HWND sigPadLabel_ = nullptr, sigClear_ = nullptr;
 	HWND sigColorLabel_ = nullptr, sigColorBlack_ = nullptr, sigColorBlue_ = nullptr;
+	// Optional date, rendered into the SAME stamp as the signature so the pair
+	// places as one unit and can be saved as one reusable entry. The sub-rows
+	// only occupy layout space while the checkbox is ticked.
+	HWND sigDateCheck_ = nullptr, sigDatePicker_ = nullptr, sigDateFormat_ = nullptr;
+	HWND sigDatePosLabel_ = nullptr, sigDateBelow_ = nullptr, sigDateRight_ = nullptr;
+	bool sigDateOn_ = false;
+	SigDatePos sigDatePos_ = SigDatePos::Below;
+	void sigSetDatePos(SigDatePos p);
+	void sigToggleDate();
 	HWND sigUse_ = nullptr;
 	HWND sigSavedLabel_ = nullptr;
 	HWND sigLock_ = nullptr, sigClose_ = nullptr;
@@ -1532,6 +1549,10 @@ private:
 	// Builds a Signature from whatever the panel currently holds for the
 	// active mode. Returns false if there's nothing usable yet.
 	bool sigFromPanel(Signature& out) const;
+	// The inverse: drives every panel control from `sig`, so picking a saved
+	// signature out of the gallery leaves the panel showing what's armed
+	// (and lets it be tweaked from there rather than rebuilt from scratch).
+	void sigLoadIntoPanel(const Signature& sig);
 	void sigUseCurrent();
 	// Arms the canvas with `sig` and remembers it; shared by "Use This
 	// Signature" and picking an existing one out of the gallery.
@@ -6626,6 +6647,30 @@ void FrameWindow::createChildren()
 		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_COLOR_BLACK), hInst_, nullptr);
 	sigColorBlue_ = CreateWindowExW(0, L"BUTTON", L"Blue", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
 		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_COLOR_BLUE), hInst_, nullptr);
+	sigDateCheck_ = CreateWindowExW(0, L"BUTTON", L"Include a date",
+		WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_DATE_CHECK), hInst_, nullptr);
+	// Opt this one out of visual styles so WM_CTLCOLORBTN can recolor its
+	// label in dark mode -- same trick, and same reason, as mkRadio's.
+	SetWindowTheme(sigDateCheck_, L"", L"");
+	// A real calendar picker rather than a text field: every date is
+	// reachable, and none of them can be mistyped into something invalid.
+	// It starts on today purely as a convenient starting point -- whatever
+	// date it ends up showing is what gets stamped, now and on every reuse.
+	sigDatePicker_ = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
+		WS_CHILD | DTS_SHORTDATEFORMAT, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_DATE_PICKER), hInst_, nullptr);
+	sigDateFormat_ = CreateWindowExW(0, L"COMBOBOX", L"",
+		WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_DATE_FORMAT), hInst_, nullptr);
+	for (const auto& lbl : SignatureDateFormatLabels())
+		SendMessageW(sigDateFormat_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(lbl.c_str()));
+	SendMessageW(sigDateFormat_, CB_SETCURSEL, 0, 0);
+	sigDatePosLabel_ = mkStatic(L"Put it", IDC_SIG_DATE_POS_LABEL);
+	sigDateBelow_ = CreateWindowExW(0, L"BUTTON", L"Below", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_DATE_BELOW), hInst_, nullptr);
+	sigDateRight_ = CreateWindowExW(0, L"BUTTON", L"Right", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_DATE_RIGHT), hInst_, nullptr);
 	sigUse_ = CreateWindowExW(0, L"BUTTON", L"Use This Signature",
 		WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd_,
 		reinterpret_cast<HMENU>(IDC_SIG_USE), hInst_, nullptr);
@@ -6638,13 +6683,20 @@ void FrameWindow::createChildren()
 		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_CLOSE), hInst_, nullptr);
 	for (HWND h : { sigTitle_, sigModeType_, sigModeDraw_, sigTextLabel_, sigTextEdit_,
 		sigPadLabel_, sigClear_, sigColorLabel_, sigColorBlack_, sigColorBlue_,
+		sigDateCheck_, sigDatePicker_, sigDateFormat_, sigDatePosLabel_,
+		sigDateBelow_, sigDateRight_,
 		sigUse_, sigSavedLabel_, sigLock_, sigClose_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+	SendMessageW(sigDateBelow_, BM_SETCHECK, BST_CHECKED, 0);
 	SetWindowSubclass(sigTextEdit_, SigTextEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
 	sigPad_->setOnChanged([this] { sigUpdateEnabled(); });
 	sigGallery_->setOnPick([this](int i) {
-		if (i >= 0 && i < static_cast<int>(savedSignatures_.size()))
-			sigArm(savedSignatures_[i], /*remember=*/true); // promotes it to most-recent
+		if (i < 0 || i >= static_cast<int>(savedSignatures_.size())) return;
+		// Copy first: sigArm -> RememberSignature reorders savedSignatures_,
+		// which would invalidate a reference into it mid-call.
+		Signature picked = savedSignatures_[i];
+		sigLoadIntoPanel(picked); // so the panel shows what's now armed
+		sigArm(picked, /*remember=*/true); // promotes it to most-recent
 	});
 	sigGallery_->setOnDelete([this](int i) { sigDeleteSaved(i); });
 	savedSignatures_ = LoadSignatures();
@@ -7686,21 +7738,90 @@ bool FrameWindow::sigFromPanel(Signature& out) const
 {
 	out = Signature();
 	out.color = sigColor_;
+	// The face is recorded for BOTH kinds: a drawn signature still needs one
+	// to render its date in, so the date looks hand-written next to it.
+	{
+		int sel = static_cast<int>(SendMessageW(sigFontList_, LB_GETCURSEL, 0, 0));
+		const auto& faces = SignatureFontFaces();
+		out.font = faces[(sel >= 0 && sel < static_cast<int>(faces.size())) ? sel : 0];
+	}
 	if (sigMode_ == SigMode::Type) {
 		wchar_t buf[256] = {};
 		GetWindowTextW(sigTextEdit_, buf, 256);
 		out.kind = Signature::Kind::Typed;
 		out.text = buf;
-		int sel = static_cast<int>(SendMessageW(sigFontList_, LB_GETCURSEL, 0, 0));
-		const auto& faces = SignatureFontFaces();
-		out.font = faces[(sel >= 0 && sel < static_cast<int>(faces.size())) ? sel : 0];
 	} else {
 		if (!sigPad_) return false;
 		out.kind = Signature::Kind::Drawn;
 		out.strokes = sigPad_->strokes();
 		out.padAspect = sigPad_->aspect();
 	}
+	if (sigDateOn_) {
+		SYSTEMTIME st = {};
+		// GDT_VALID is the only result that means a real date; anything else
+		// (a picker showing "none") leaves the signature dateless rather than
+		// stamping a garbage one.
+		if (SendMessageW(sigDatePicker_, DTM_GETSYSTEMTIME, 0,
+				reinterpret_cast<LPARAM>(&st)) == GDT_VALID) {
+			out.hasDate = true;
+			out.dateYear = st.wYear;
+			out.dateMonth = st.wMonth;
+			out.dateDay = st.wDay;
+			int fmt = static_cast<int>(SendMessageW(sigDateFormat_, CB_GETCURSEL, 0, 0));
+			out.dateFormat = (fmt >= 0 && fmt <= 3) ? static_cast<SigDateFormat>(fmt) : SigDateFormat::DMY;
+			out.datePos = sigDatePos_;
+		}
+	}
 	return !out.empty();
+}
+
+void FrameWindow::sigLoadIntoPanel(const Signature& sig)
+{
+	sigSetColor(sig.color);
+	// Select the saved face even for a drawn signature -- it's what its date
+	// is rendered in, so it has to survive the round trip.
+	const auto& faces = SignatureFontFaces();
+	for (size_t i = 0; i < faces.size(); ++i) {
+		if (faces[i] == sig.font) {
+			SendMessageW(sigFontList_, LB_SETCURSEL, i, 0);
+			SendMessageW(sigFontList_, LB_SETTOPINDEX, i, 0);
+			break;
+		}
+	}
+	if (sig.kind == Signature::Kind::Typed) {
+		SetWindowTextW(sigTextEdit_, sig.text.c_str());
+		if (sigPad_) sigPad_->clear();
+	} else if (sigPad_) {
+		sigPad_->setStrokes(sig.strokes);
+	}
+	sigDateOn_ = sig.hasValidDate();
+	SendMessageW(sigDateCheck_, BM_SETCHECK, sigDateOn_ ? BST_CHECKED : BST_UNCHECKED, 0);
+	if (sigDateOn_) {
+		SYSTEMTIME st = {};
+		st.wYear = static_cast<WORD>(sig.dateYear);
+		st.wMonth = static_cast<WORD>(sig.dateMonth);
+		st.wDay = static_cast<WORD>(sig.dateDay);
+		SendMessageW(sigDatePicker_, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&st));
+		SendMessageW(sigDateFormat_, CB_SETCURSEL, static_cast<int>(sig.dateFormat), 0);
+		sigSetDatePos(sig.datePos);
+	}
+	// sigSetMode() ends with its own layout(), which also re-lays the date
+	// rows for the sigDateOn_ just set above.
+	sigSetMode(sig.kind == Signature::Kind::Typed ? SigMode::Type : SigMode::Draw);
+	InvalidateRect(sigFontList_, nullptr, TRUE); // previews follow the loaded name
+}
+
+void FrameWindow::sigToggleDate()
+{
+	sigDateOn_ = SendMessageW(sigDateCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	layout(); // the date rows only occupy space while it's on
+}
+
+void FrameWindow::sigSetDatePos(SigDatePos p)
+{
+	sigDatePos_ = p;
+	SendMessageW(sigDateBelow_, BM_SETCHECK, p == SigDatePos::Below ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW(sigDateRight_, BM_SETCHECK, p == SigDatePos::Right ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void FrameWindow::sigUpdateEnabled()
@@ -8409,6 +8530,24 @@ void FrameWindow::layout()
 		MoveWindow(sigColorBlue_, px + inkLabelW + gap * 2 + swatchW, y,
 			pw - inkLabelW - gap * 2 - swatchW, rowH, TRUE);
 		y += rowH + gap * 2;
+		MoveWindow(sigDateCheck_, px, y, pw, rowH, TRUE);
+		y += rowH + gap;
+		if (sigDateOn_) {
+			MoveWindow(sigDatePicker_, px, y, pw, rowH, TRUE);
+			y += rowH + gap;
+			// Extra height on a combo is the dropdown-list allowance, not the
+			// closed control's height (same as the print panel's combos).
+			MoveWindow(sigDateFormat_, px, y, pw, rowH * 6, TRUE);
+			y += rowH + gap;
+			int posLabelW = Scale(38, dpi);
+			int posBtnW = std::max(0, (pw - posLabelW - gap * 2) / 2);
+			MoveWindow(sigDatePosLabel_, px, y, posLabelW, rowH, TRUE);
+			MoveWindow(sigDateBelow_, px + posLabelW + gap, y, posBtnW, rowH, TRUE);
+			MoveWindow(sigDateRight_, px + posLabelW + gap * 2 + posBtnW, y,
+				pw - posLabelW - gap * 2 - posBtnW, rowH, TRUE);
+			y += rowH + gap;
+		}
+		y += gap;
 		MoveWindow(sigUse_, px, y, pw, btnH, TRUE);
 		y += btnH + gap * 2;
 		MoveWindow(sigSavedLabel_, px, y, pw, rowH, TRUE);
@@ -8426,8 +8565,11 @@ void FrameWindow::layout()
 	}
 	int ssw = sigPanelVisible_ ? SW_SHOW : SW_HIDE;
 	for (HWND h : { sigTitle_, sigModeType_, sigModeDraw_, sigColorLabel_, sigColorBlack_,
-		sigColorBlue_, sigUse_, sigSavedLabel_, sigLock_, sigClose_ })
+		sigColorBlue_, sigDateCheck_, sigUse_, sigSavedLabel_, sigLock_, sigClose_ })
 		ShowWindow(h, ssw);
+	int dsw = (sigPanelVisible_ && sigDateOn_) ? SW_SHOW : SW_HIDE;
+	for (HWND h : { sigDatePicker_, sigDateFormat_, sigDatePosLabel_, sigDateBelow_, sigDateRight_ })
+		ShowWindow(h, dsw);
 	for (HWND h : { sigTextLabel_, sigTextEdit_, sigFontList_ })
 		ShowWindow(h, sigTyping ? SW_SHOW : SW_HIDE);
 	for (HWND h : { sigPadLabel_, sigClear_ })
@@ -9485,6 +9627,10 @@ void FrameWindow::onCommand(int id)
 	// against a white page, where 0000FF looks like a screen color.
 	case IDC_SIG_COLOR_BLUE: sigSetColor(RGB(16, 42, 140)); break;
 	case IDC_SIG_CLEAR: if (sigPad_) sigPad_->clear(); break;
+	// BS_AUTOCHECKBOX flips its own state before notifying, so just read it.
+	case IDC_SIG_DATE_CHECK: sigToggleDate(); break;
+	case IDC_SIG_DATE_BELOW: sigSetDatePos(SigDatePos::Below); break;
+	case IDC_SIG_DATE_RIGHT: sigSetDatePos(SigDatePos::Right); break;
 	case IDC_SIG_USE: sigUseCurrent(); break;
 	case IDC_SIG_LOCK:
 	case IDM_TOOLS_SIGN_LOCK: sigLockDocument(); break;
@@ -10392,7 +10538,11 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 		return 0;
 	}
 
-	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES };
+	// ICC_DATE_CLASSES registers SysDateTimePick32 -- the signature panel's
+	// date picker (a real calendar dropdown, so any date is reachable and
+	// always valid, rather than a free-text field that can be mistyped).
+	INITCOMMONCONTROLSEX icc = { sizeof(icc),
+		ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_DATE_CLASSES };
 	InitCommonControlsEx(&icc);
 
 	CanvasView::Register(hInstance);

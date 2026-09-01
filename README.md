@@ -85,7 +85,12 @@ not run on macOS or Linux.
   mouse — then click anywhere on the page to place it (drag instead to size it).
 - Placed signatures can be **moved and resized** afterwards: click one with the
   Select tool for drag handles (corners keep the aspect ratio), or press Delete.
-- Signatures are **remembered** between sessions, so signing again is one click.
+- Optionally **add a date**, chosen from a calendar — any date you like, never
+  just "today". Four unambiguous formats, placed below or beside the signature
+  and written in the same handwriting font so the two read as one.
+- Signatures are **remembered** between sessions, so signing again is one click —
+  and a signature is saved *together with its date*, so signing and dating
+  several spots across a document is one click each time.
 - **Finish & Lock** bakes the signature, every annotation and all form-field
   values into the page: nothing stays fillable or editable, while page text
   stays selectable. Irreversible, so it asks first.

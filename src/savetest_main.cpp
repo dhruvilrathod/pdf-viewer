@@ -762,11 +762,32 @@ int wmain(int argc, wchar_t** argv)
 		std::printf("handwriting fonts installed: %zu\n", faces.size());
 		for (const auto& f : faces) std::printf("  %ls\n", f.c_str());
 
+		// Every date format, applied to one sample date -- confirms the
+		// picture strings resolve and that the chooser's labels match what
+		// actually renders.
+		std::printf("date formats:\n");
+		for (int i = 0; i < 4; ++i) {
+			Signature d;
+			d.hasDate = true; d.dateYear = 2026; d.dateMonth = 9; d.dateDay = 1;
+			d.dateFormat = static_cast<SigDateFormat>(i);
+			std::wstring got = FormatSignatureDate(d);
+			std::wstring label = SignatureDateFormatLabels()[i];
+			std::printf("  [%d] %ls%s\n", i, got.c_str(),
+				got == label ? "" : "   MISMATCH vs chooser label!");
+			if (got.empty() || got != label) { std::printf("FAIL: date format %d\n", i); return 17; }
+		}
+
 		Signature typed;
 		typed.kind = Signature::Kind::Typed;
 		typed.text = argc > 4 ? argv[4] : L"Jane Q. Sample";
 		typed.font = faces.front();
 		typed.color = RGB(0, 0, 0);
+		// Signature + date as one composed stamp: date below, the common
+		// signature-block layout on a paper form.
+		typed.hasDate = true;
+		typed.dateYear = 2026; typed.dateMonth = 9; typed.dateDay = 1;
+		typed.dateFormat = SigDateFormat::DMY;
+		typed.datePos = SigDatePos::Below;
 
 		// A simple two-stroke scribble, in the same normalized pad space the
 		// signature pad captures into.
@@ -782,6 +803,88 @@ int wmain(int argc, wchar_t** argv)
 		for (int i = 0; i <= 10; ++i) s2.push_back({ 0.70f + i * 0.02f, 0.30f + i * 0.03f });
 		drawn.strokes.push_back(s1);
 		drawn.strokes.push_back(s2);
+		// A drawn signature dates itself in the chosen handwriting face too,
+		// laid out to the right this time to exercise the other position.
+		drawn.font = faces.front();
+		drawn.hasDate = true;
+		drawn.dateYear = 2026; drawn.dateMonth = 9; drawn.dateDay = 1;
+		drawn.dateFormat = SigDateFormat::DMonthY;
+		drawn.datePos = SigDatePos::Right;
+
+		// A dated signature must render WIDER or TALLER than the same
+		// signature without one -- proof the date actually got composed in
+		// rather than silently dropped.
+		{
+			Signature bare = typed;
+			bare.hasDate = false;
+			std::vector<BYTE> b1, b2;
+			int w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+			if (!RenderSignature(bare, 320, b1, w1, h1) ||
+				!RenderSignature(typed, 320, b2, w2, h2)) {
+				std::printf("FAIL: could not render dated/undated pair\n");
+				return 18;
+			}
+			std::printf("undated: %dx%d   dated(below): %dx%d\n", w1, h1, w2, h2);
+			if (h2 <= h1) { std::printf("FAIL: date below did not add height\n"); return 19; }
+		}
+
+		// --- Saved-signature round trip, incl. backward compatibility -------
+		// Touches the REAL registry (that's where signatures live), so the
+		// user's own saved list is backed up first and restored at the end.
+		{
+			std::vector<Signature> backup = LoadSignatures();
+			std::printf("saved signatures currently stored: %zu (backed up)\n", backup.size());
+
+			// A pre-dates-existed value, written raw in the legacy "T|" form,
+			// must still load rather than being silently dropped.
+			HKEY key = nullptr;
+			bool legacyOk = false;
+			if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PDFast\\Signatures", 0, nullptr, 0,
+					KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+				std::wstring legacy = L"T|123456|" + faces.front() + L"|Legacy Sample";
+				RegSetValueExW(key, L"Sig0", 0, REG_SZ,
+					reinterpret_cast<const BYTE*>(legacy.c_str()),
+					static_cast<DWORD>((legacy.size() + 1) * sizeof(wchar_t)));
+				for (int i = 1; i < 5; ++i) {
+					wchar_t n[16]; swprintf(n, 16, L"Sig%d", i);
+					RegDeleteValueW(key, n);
+				}
+				RegCloseKey(key);
+				auto loaded = LoadSignatures();
+				legacyOk = loaded.size() == 1 &&
+					loaded[0].kind == Signature::Kind::Typed &&
+					loaded[0].text == L"Legacy Sample" &&
+					!loaded[0].hasDate;
+				std::printf("legacy \"T|\" value still loads: %s\n", legacyOk ? "yes" : "NO");
+			}
+			if (!legacyOk) { SaveSignatures(backup); std::printf("FAIL: legacy parse\n"); return 20; }
+
+			// New form: signature + date must survive a full save/load cycle
+			// with every date field intact.
+			std::vector<Signature> list;
+			Signature rt;
+			rt.kind = Signature::Kind::Typed;
+			rt.text = L"Round Trip";
+			rt.font = faces.front();
+			rt.color = RGB(16, 42, 140);
+			rt.hasDate = true;
+			rt.dateYear = 2027; rt.dateMonth = 3; rt.dateDay = 14;
+			rt.dateFormat = SigDateFormat::ISO;
+			rt.datePos = SigDatePos::Right;
+			RememberSignature(list, rt);
+			auto back = LoadSignatures();
+			bool rtOk = !back.empty() && back[0].text == rt.text && back[0].font == rt.font &&
+				back[0].color == rt.color && back[0].hasDate &&
+				back[0].dateYear == 2027 && back[0].dateMonth == 3 && back[0].dateDay == 14 &&
+				back[0].dateFormat == SigDateFormat::ISO && back[0].datePos == SigDatePos::Right;
+			std::printf("signature+date round trip: %s (date reads back as \"%ls\")\n",
+				rtOk ? "ok" : "MISMATCH",
+				back.empty() ? L"" : FormatSignatureDate(back[0]).c_str());
+
+			SaveSignatures(backup); // restore the user's real list either way
+			if (!rtOk) { std::printf("FAIL: signature+date round trip\n"); return 21; }
+			std::printf("restored %zu saved signature(s)\n", backup.size());
+		}
 
 		PdfDocument doc;
 		std::string e; bool npw = false;
