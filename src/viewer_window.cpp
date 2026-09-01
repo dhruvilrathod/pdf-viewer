@@ -187,6 +187,7 @@ namespace {
 constexpr wchar_t kFrameClass[] = L"PdfViewerFrame";
 constexpr wchar_t kCanvasClass[] = L"PdfViewerCanvas";
 constexpr wchar_t kThumbClass[] = L"PdfViewerThumbs";
+constexpr wchar_t kFileListClass[] = L"PdfViewerFileList";
 
 // Count of live top-level FrameWindow instances (normally 1, but dragging a
 // tab out or "Open in New Window" can create more) -- PostQuitMessage only
@@ -570,6 +571,22 @@ std::vector<std::wstring> PickFilesAcrossFolders(HWND owner, const wchar_t* filt
 	}
 	return all;
 }
+
+// Filter/title strings shared between each tool's initial file picker
+// (doMerge/doConvertToPdf) and the "Add Files..." button on the file list
+// panel shown after picking (FrameWindow::fileListAddFiles) -- both need the
+// exact same picker for a given tool.
+constexpr wchar_t kMergeFilter[] = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
+constexpr wchar_t kMergeTitle[] = L"Select PDF Files";
+constexpr wchar_t kConvertFilter[] =
+	L"Convertible Files (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf)\0"
+	L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf\0"
+	L"Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff)\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff\0"
+	L"Text/Markdown (*.txt;*.md)\0*.txt;*.md\0"
+	L"Word Documents (*.docx)\0*.docx\0"
+	L"PDF Documents (*.pdf)\0*.pdf\0"
+	L"All Files (*.*)\0*.*\0";
+constexpr wchar_t kConvertTitle[] = L"Select Files to Convert to PDF";
 
 } // namespace
 
@@ -1025,6 +1042,56 @@ private:
 	bool dark_ = false;
 };
 
+// ---------------------------------------------------------------------------
+// FileListPanel: a reorderable list of file paths, shown between "pick files"
+// and "do the thing" for Merge and Convert to PDF. Deliberately a thin
+// file-only sibling of ThumbPanel's organize-mode drag machinery -- it isn't
+// tied to a PdfDocument/PagePlanEntry at all, just an ordered vector of
+// paths -- with a matching drag-to-reorder feel (live erase/insert on
+// WM_MOUSEMOVE while the mouse is captured, no floating drag ghost) and its
+// own OS drag-and-drop target so files can be dropped in from Explorer.
+// ---------------------------------------------------------------------------
+class FileListPanel {
+public:
+	static void Register(HINSTANCE hInst);
+	FileListPanel(HWND parent, HINSTANCE hInst);
+	HWND hwnd() const { return hwnd_; }
+	void setDarkMode(bool dark) { dark_ = dark; InvalidateRect(hwnd_, nullptr, FALSE); }
+	void setFiles(std::vector<std::wstring> files);
+	void addFiles(const std::vector<std::wstring>& toAdd);
+	const std::vector<std::wstring>& files() const { return files_; }
+	// Fires whenever the file COUNT changes (add/remove, not reorder) -- lets
+	// the owner keep e.g. an "enabled while non-empty" action button in sync.
+	void setOnChanged(std::function<void()> cb) { onChanged_ = std::move(cb); }
+	static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
+
+private:
+	void relayout();
+	void clampScroll();
+	void updateScrollbar();
+	void onPaint();
+	void onSize();
+	void onVScroll(WPARAM);
+	void onWheel(short delta);
+	int slotAt(int y) const;
+	RECT deleteRectFor(int i) const;
+	void onLButtonDown(int x, int y);
+	void onMouseMove(int x, int y);
+	void onLButtonUp();
+	void onDropFiles(HDROP);
+
+	HWND hwnd_ = nullptr;
+	UINT dpi_ = 96;
+	int scrollY_ = 0;
+	int rowH_ = 0;
+	int contentH_ = 0;
+	std::vector<std::wstring> files_;
+	bool dragArmed_ = false;
+	int dragIndex_ = -1;
+	bool dark_ = false;
+	std::function<void()> onChanged_;
+};
+
 class FrameWindow;
 // Creates a brand-new top-level window (its own FrameWindow, own tab strip)
 // and opens each of `paths` as its own tab (first one lands in the window's
@@ -1258,6 +1325,26 @@ private:
 	HWND organizeCancel_ = nullptr;
 	bool organizeShownThumbsBefore_ = false; // showThumbs_ value to restore on exit
 	int organizeBarH_ = 0;
+
+	// File list panel -- shown between the file picker and the actual action
+	// for Merge and Convert to PDF, so the user can see, reorder, add to, or
+	// remove from the picked file set (including by dragging more files onto
+	// it) before committing. Not per-tab like ThumbPanel: it's a transient
+	// picker step, not tied to any document.
+	enum class FileListMode { Merge, Convert };
+	std::unique_ptr<FileListPanel> fileListPanel_;
+	HWND fileListTitle_ = nullptr;
+	HWND fileListAdd_ = nullptr;
+	HWND fileListCancel_ = nullptr;
+	HWND fileListAction_ = nullptr;
+	bool fileListPanelVisible_ = false;
+	FileListMode fileListMode_ = FileListMode::Merge;
+	void showFileListPanel(bool show, FileListMode mode);
+	void fileListAddFiles();
+	void fileListCancel();
+	void fileListAction();
+	void finishMerge(const std::vector<std::wstring>& files);
+	void finishConvertToPdf(const std::vector<std::wstring>& files);
 
 	// Search bar
 	HWND searchEdit_ = nullptr;
@@ -4200,6 +4287,276 @@ LRESULT CALLBACK ThumbPanel::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+void FileListPanel::Register(HINSTANCE hInst)
+{
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc = FileListPanel::Proc;
+	wc.hInstance = hInst;
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wc.hbrBackground = nullptr;
+	wc.lpszClassName = kFileListClass;
+	wc.style = CS_VREDRAW;
+	RegisterClassW(&wc);
+}
+
+FileListPanel::FileListPanel(HWND parent, HINSTANCE hInst)
+{
+	hwnd_ = CreateWindowExW(0, kFileListClass, L"",
+		WS_CHILD | WS_VSCROLL, 0, 0, 100, 100, parent, nullptr, hInst, this);
+	dpi_ = GetDpiForWindow(hwnd_);
+	rowH_ = Scale(46, dpi_);
+	DragAcceptFiles(hwnd_, TRUE);
+}
+
+void FileListPanel::setFiles(std::vector<std::wstring> files)
+{
+	files_ = std::move(files);
+	dragArmed_ = false;
+	dragIndex_ = -1;
+	scrollY_ = 0;
+	relayout();
+	InvalidateRect(hwnd_, nullptr, TRUE);
+	if (onChanged_) onChanged_();
+}
+
+void FileListPanel::addFiles(const std::vector<std::wstring>& toAdd)
+{
+	if (toAdd.empty()) return;
+	files_.insert(files_.end(), toAdd.begin(), toAdd.end());
+	relayout();
+	InvalidateRect(hwnd_, nullptr, TRUE);
+	if (onChanged_) onChanged_();
+}
+
+void FileListPanel::relayout()
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int pad = Scale(8, dpi_);
+	contentH_ = pad * 2 + static_cast<int>(files_.size()) * rowH_;
+	clampScroll();
+	updateScrollbar();
+}
+
+void FileListPanel::clampScroll()
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int ch = rc.bottom - rc.top;
+	scrollY_ = std::clamp(scrollY_, 0, std::max(0, contentH_ - ch));
+}
+
+void FileListPanel::updateScrollbar()
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int ch = rc.bottom - rc.top;
+	SCROLLINFO si = {}; si.cbSize = sizeof(si); si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+	si.nMin = 0; si.nMax = std::max(0, contentH_ - 1); si.nPage = ch; si.nPos = scrollY_;
+	SetScrollInfo(hwnd_, SB_VERT, &si, TRUE);
+}
+
+int FileListPanel::slotAt(int y) const
+{
+	int pad = Scale(8, dpi_);
+	int docY = y + scrollY_ - pad;
+	if (docY < 0) return -1;
+	int i = docY / rowH_;
+	return (i >= 0 && i < static_cast<int>(files_.size())) ? i : -1;
+}
+
+RECT FileListPanel::deleteRectFor(int i) const
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int pad = Scale(8, dpi_);
+	int top = pad + i * rowH_ - scrollY_;
+	int delW = Scale(24, dpi_);
+	return { rc.right - pad - delW, top, rc.right - pad, top + rowH_ };
+}
+
+void FileListPanel::onPaint()
+{
+	PAINTSTRUCT ps;
+	HDC hdc = BeginPaint(hwnd_, &ps);
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+
+	HDC mem = CreateCompatibleDC(hdc);
+	HBITMAP back = CreateCompatibleBitmap(hdc, cw, ch);
+	HBITMAP oldBack = static_cast<HBITMAP>(SelectObject(mem, back));
+	const ThemeColors& th = Theme(dark_);
+	HBRUSH bg = CreateSolidBrush(th.thumbBg);
+	FillRect(mem, &rc, bg); DeleteObject(bg);
+
+	SetBkMode(mem, TRANSPARENT);
+	int pad = Scale(8, dpi_);
+
+	if (files_.empty()) {
+		HFONT hintFont = CreateFontW(-Scale(12, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		HGDIOBJ oldFont = SelectObject(mem, hintFont);
+		SetTextColor(mem, th.thumbSelBorder);
+		RECT hr = { pad, pad, cw - pad, ch - pad };
+		DrawTextW(mem, L"No files added yet.\n\nUse \"Add Files...\" below, or drag files here from Explorer.",
+			-1, &hr, DT_CENTER | DT_WORDBREAK);
+		SelectObject(mem, oldFont);
+		DeleteObject(hintFont);
+	} else {
+		HFONT nameFont = CreateFontW(-Scale(12, dpi_), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		HFONT pathFont = CreateFontW(-Scale(10, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		HFONT glyphFont = CreateFontW(-Scale(13, dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		int delW = Scale(24, dpi_);
+		for (int i = 0; i < static_cast<int>(files_.size()); ++i) {
+			int top = pad + i * rowH_ - scrollY_;
+			if (top + rowH_ < 0 || top > ch) continue;
+			const std::wstring& path = files_[i];
+			size_t slash = path.find_last_of(L'\\');
+			std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+			std::wstring folder = (slash == std::wstring::npos) ? std::wstring() : path.substr(0, slash);
+
+			RECT nameR = { pad, top + Scale(4, dpi_), cw - pad - delW, top + Scale(22, dpi_) };
+			SelectObject(mem, nameFont);
+			SetTextColor(mem, th.thumbText);
+			DrawTextW(mem, name.c_str(), -1, &nameR, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+			RECT pathR = { pad, top + Scale(23, dpi_), cw - pad - delW, top + rowH_ - Scale(4, dpi_) };
+			SelectObject(mem, pathFont);
+			SetTextColor(mem, th.thumbSelBorder);
+			DrawTextW(mem, folder.c_str(), -1, &pathR, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+
+			RECT delR = { cw - pad - delW, top, cw - pad, top + rowH_ };
+			SelectObject(mem, glyphFont);
+			SetTextColor(mem, RGB(180, 40, 40));
+			DrawTextW(mem, L"✕", -1, &delR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+			if (i + 1 < static_cast<int>(files_.size())) {
+				HPEN pen = CreatePen(PS_SOLID, 1, th.thumbSelFill);
+				HGDIOBJ oldPen = SelectObject(mem, pen);
+				MoveToEx(mem, pad, top + rowH_, nullptr);
+				LineTo(mem, cw - pad, top + rowH_);
+				SelectObject(mem, oldPen);
+				DeleteObject(pen);
+			}
+		}
+		DeleteObject(nameFont);
+		DeleteObject(pathFont);
+		DeleteObject(glyphFont);
+	}
+
+	BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+	SelectObject(mem, oldBack);
+	DeleteObject(back); DeleteDC(mem);
+	EndPaint(hwnd_, &ps);
+}
+
+void FileListPanel::onSize() { clampScroll(); updateScrollbar(); InvalidateRect(hwnd_, nullptr, FALSE); }
+
+void FileListPanel::onVScroll(WPARAM wp)
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int ch = rc.bottom - rc.top;
+	int old = scrollY_;
+	switch (LOWORD(wp)) {
+	case SB_LINEUP: scrollY_ -= Scale(40, dpi_); break;
+	case SB_LINEDOWN: scrollY_ += Scale(40, dpi_); break;
+	case SB_PAGEUP: scrollY_ -= ch; break;
+	case SB_PAGEDOWN: scrollY_ += ch; break;
+	case SB_THUMBTRACK: case SB_THUMBPOSITION: {
+		SCROLLINFO si = {}; si.cbSize = sizeof(si); si.fMask = SIF_TRACKPOS;
+		GetScrollInfo(hwnd_, SB_VERT, &si); scrollY_ = si.nTrackPos; break;
+	}
+	}
+	clampScroll();
+	if (scrollY_ != old) { updateScrollbar(); InvalidateRect(hwnd_, nullptr, FALSE); }
+}
+
+void FileListPanel::onWheel(short delta)
+{
+	scrollY_ -= (delta / WHEEL_DELTA) * Scale(40, dpi_) * 3;
+	clampScroll(); updateScrollbar(); InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void FileListPanel::onLButtonDown(int x, int y)
+{
+	int i = slotAt(y);
+	if (i < 0) return;
+	RECT del = deleteRectFor(i);
+	POINT pt{ x, y };
+	if (PtInRect(&del, pt)) {
+		files_.erase(files_.begin() + i);
+		relayout();
+		InvalidateRect(hwnd_, nullptr, FALSE);
+		if (onChanged_) onChanged_();
+		return;
+	}
+	dragArmed_ = true;
+	dragIndex_ = i;
+	SetCapture(hwnd_);
+}
+
+void FileListPanel::onMouseMove(int x, int y)
+{
+	(void)x;
+	if (!dragArmed_) return;
+	int i = slotAt(y);
+	if (i < 0 || i == dragIndex_) return;
+	auto item = std::move(files_[dragIndex_]);
+	files_.erase(files_.begin() + dragIndex_);
+	files_.insert(files_.begin() + i, std::move(item));
+	dragIndex_ = i;
+	InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void FileListPanel::onLButtonUp()
+{
+	if (!dragArmed_) return;
+	dragArmed_ = false;
+	dragIndex_ = -1;
+	ReleaseCapture();
+}
+
+void FileListPanel::onDropFiles(HDROP drop)
+{
+	UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+	std::vector<std::wstring> dropped;
+	wchar_t path[MAX_PATH];
+	for (UINT i = 0; i < n; ++i)
+		if (DragQueryFileW(drop, i, path, MAX_PATH)) dropped.push_back(path);
+	DragFinish(drop);
+	if (!dropped.empty()) addFiles(dropped);
+}
+
+LRESULT CALLBACK FileListPanel::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	FileListPanel* self = reinterpret_cast<FileListPanel*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	if (msg == WM_NCCREATE) {
+		auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+		self = static_cast<FileListPanel*>(cs->lpCreateParams);
+		self->hwnd_ = hwnd;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+	}
+	if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+	switch (msg) {
+	case WM_PAINT: self->onPaint(); return 0;
+	case WM_ERASEBKGND: return 1;
+	case WM_SIZE: self->onSize(); return 0;
+	case WM_VSCROLL: self->onVScroll(wp); return 0;
+	case WM_MOUSEWHEEL: self->onWheel(GET_WHEEL_DELTA_WPARAM(wp)); return 0;
+	case WM_LBUTTONDOWN: self->onLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+	case WM_MOUSEMOVE: self->onMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+	case WM_LBUTTONUP:
+	case WM_CAPTURECHANGED:
+		self->onLButtonUp();
+		return 0;
+	case WM_DROPFILES: self->onDropFiles(reinterpret_cast<HDROP>(wp)); return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 // ===========================================================================
 // Toolbar icons -- small hand-drawn vector glyphs (GDI+), monochrome to
 // match a flat, modern (Edge-like) toolbar. Drawing our own avoids any
@@ -4797,6 +5154,7 @@ void FrameWindow::applyTheme()
 		if (tab->canvas) tab->canvas->setDarkMode(isDark_);
 		if (tab->thumbs) tab->thumbs->setDarkMode(isDark_);
 	}
+	if (fileListPanel_) fileListPanel_->setDarkMode(isDark_);
 
 	// Plain InvalidateRect on the frame only repaints the frame's OWN client
 	// area -- it does not cascade to child HWNDs (EDIT/STATIC/the tab strip/
@@ -5311,6 +5669,25 @@ void FrameWindow::createChildren()
 	for (HWND h : { organizeInsert_, organizeDone_, organizeCancel_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 	organizeBarH_ = Scale(34, GetDpiForWindow(hwnd_));
+
+	// File list panel (hidden until Merge/Convert to PDF picks files) --
+	// a title label above the FileListPanel's own scrollable rows, and an
+	// Add/Action/Cancel button strip below it, same idiom as the organize
+	// bar just above.
+	fileListPanel_ = std::make_unique<FileListPanel>(hwnd_, hInst_);
+	fileListTitle_ = CreateWindowExW(0, L"STATIC", L"Files to Merge", WS_CHILD,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_FILELIST_TITLE), hInst_, nullptr);
+	fileListAdd_ = CreateWindowExW(0, L"BUTTON", L"Add Files...",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_FILELIST_ADD), hInst_, nullptr);
+	fileListAction_ = CreateWindowExW(0, L"BUTTON", L"Merge",
+		WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_FILELIST_ACTION), hInst_, nullptr);
+	fileListCancel_ = CreateWindowExW(0, L"BUTTON", L"Cancel",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_FILELIST_CANCEL), hInst_, nullptr);
+	for (HWND h : { fileListTitle_, fileListAdd_, fileListAction_, fileListCancel_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 
 	// Zoom-%/page-number readouts are now plain owner-drawn text (see
 	// zoomText_'s comment) -- no permanent child windows to create here.
@@ -6113,7 +6490,16 @@ void FrameWindow::organizeCancel()
 
 void FrameWindow::doMerge()
 {
-	auto files = PickFilesAcrossFolders(hwnd_, L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0", L"Select PDF Files");
+	// Opens the file list panel empty rather than jumping straight to the
+	// Windows file picker -- the panel itself offers both "Add Files..." and
+	// an Explorer drag-and-drop target, so this is the single entry point for
+	// building the file set (see fileListAddFiles()/FileListPanel::onDropFiles).
+	fileListPanel_->setFiles({});
+	showFileListPanel(true, FileListMode::Merge);
+}
+
+void FrameWindow::finishMerge(const std::vector<std::wstring>& files)
+{
 	if (files.empty()) return;
 	// Like openDocument(): never disturb an already-open document -- merge
 	// always lands in a fresh tab (or reuses the current one if it's
@@ -6151,15 +6537,12 @@ void FrameWindow::doMerge()
 
 void FrameWindow::doConvertToPdf()
 {
-	static const wchar_t kFilter[] =
-		L"Convertible Files (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf)\0"
-		L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf\0"
-		L"Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff)\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff\0"
-		L"Text/Markdown (*.txt;*.md)\0*.txt;*.md\0"
-		L"Word Documents (*.docx)\0*.docx\0"
-		L"PDF Documents (*.pdf)\0*.pdf\0"
-		L"All Files (*.*)\0*.*\0";
-	auto files = PickFilesAcrossFolders(hwnd_, kFilter, L"Select Files to Convert to PDF");
+	fileListPanel_->setFiles({});
+	showFileListPanel(true, FileListMode::Convert);
+}
+
+void FrameWindow::finishConvertToPdf(const std::vector<std::wstring>& files)
+{
 	if (files.empty()) return;
 
 	// Output lands next to the first picked file, named after its stem --
@@ -6193,6 +6576,52 @@ void FrameWindow::doConvertToPdf()
 		MessageBoxW(hwnd_, msg, L"Convert to PDF", MB_OK | MB_ICONWARNING);
 	}
 	openDocument(outPath.c_str());
+}
+
+void FrameWindow::showFileListPanel(bool show, FileListMode mode)
+{
+	if (show) {
+		fileListMode_ = mode;
+		bool merge = mode == FileListMode::Merge;
+		SetWindowTextW(fileListTitle_, merge ? L"Files to Merge" : L"Files to Convert");
+		SetWindowTextW(fileListAction_, merge ? L"Merge" : L"Convert to PDF");
+		EnableWindow(fileListAction_, !fileListPanel_->files().empty());
+		fileListPanel_->setOnChanged([this] {
+			EnableWindow(fileListAction_, !fileListPanel_->files().empty());
+		});
+		fileListPanelVisible_ = true;
+		layout();
+	} else {
+		fileListPanelVisible_ = false;
+		fileListPanel_->setFiles({});
+		layout();
+	}
+}
+
+void FrameWindow::fileListAddFiles()
+{
+	bool merge = fileListMode_ == FileListMode::Merge;
+	auto more = PickFilesAcrossFolders(hwnd_, merge ? kMergeFilter : kConvertFilter, merge ? kMergeTitle : kConvertTitle);
+	if (!more.empty()) fileListPanel_->addFiles(more);
+}
+
+void FrameWindow::fileListCancel()
+{
+	showFileListPanel(false, fileListMode_);
+}
+
+void FrameWindow::fileListAction()
+{
+	// Copy out first -- both finish* paths end up tearing down/hiding the
+	// panel (and Merge's path can pump messages via MessageBoxW before that),
+	// so operate on a snapshot rather than a reference into fileListPanel_'s
+	// live vector.
+	std::vector<std::wstring> files = fileListPanel_->files();
+	if (files.empty()) return;
+	FileListMode mode = fileListMode_;
+	showFileListPanel(false, mode);
+	if (mode == FileListMode::Merge) finishMerge(files);
+	else finishConvertToPdf(files);
 }
 
 void FrameWindow::showWebPdfBar(bool show)
@@ -6646,7 +7075,7 @@ void FrameWindow::layout()
 	// Print and text-editor panels are mutually exclusive (see
 	// showPrintPanel()/showTextEditorPanel()) and share one right-hand
 	// column width so switching between them doesn't jitter the canvas size.
-	int rightPanelW = (printPanelVisible_ || textPanelVisible_) ? Scale(300, dpi) : 0;
+	int rightPanelW = (printPanelVisible_ || textPanelVisible_ || fileListPanelVisible_) ? Scale(300, dpi) : 0;
 	int printPanelW = rightPanelW;
 	if (printPanelVisible_) {
 		int pad = Scale(10, dpi);
@@ -6737,6 +7166,30 @@ void FrameWindow::layout()
 	for (HWND h : { textPanelTitle_, textBoldBtn_, textItalicBtn_, textUnderlineBtn_,
 		textCaseLabel_, textCaseCombo_, textRichEdit_, textCopyBtn_, textCloseBtn_ })
 		ShowWindow(h, tsw);
+
+	if (fileListPanelVisible_) {
+		int pad = Scale(10, dpi);
+		int rowH = Scale(22, dpi);
+		int gap = Scale(6, dpi);
+		int colX = fullW - rightPanelW;
+		int px = colX + pad;
+		int pw = rightPanelW - pad * 2;
+		int y = top + pad;
+		MoveWindow(fileListTitle_, px, y, pw, rowH, TRUE);
+		y += rowH + gap;
+		int btnH = Scale(24, dpi);
+		int listBottom = bottom - pad - btnH;
+		int listH = std::max(0, listBottom - y);
+		if (fileListPanel_) MoveWindow(fileListPanel_->hwnd(), colX, y, rightPanelW, listH, TRUE);
+		int by = listBottom + gap;
+		int bw = std::max(0, (pw - gap * 2) / 3);
+		MoveWindow(fileListAdd_, px, by, bw, btnH, TRUE);
+		MoveWindow(fileListAction_, px + bw + gap, by, bw, btnH, TRUE);
+		MoveWindow(fileListCancel_, px + (bw + gap) * 2, by, pw - (bw + gap) * 2, btnH, TRUE);
+	}
+	int flsw = fileListPanelVisible_ ? SW_SHOW : SW_HIDE;
+	for (HWND h : { fileListTitle_, fileListAdd_, fileListAction_, fileListCancel_ }) ShowWindow(h, flsw);
+	if (fileListPanel_) ShowWindow(fileListPanel_->hwnd(), flsw);
 
 	if (canvas_)
 		MoveWindow(canvas_->hwnd(), thumbW, top, fullW - thumbW - rightPanelW, midH, TRUE);
@@ -7764,6 +8217,9 @@ void FrameWindow::onCommand(int id)
 	case IDC_ORGANIZE_INSERT: organizeInsertPages(); break;
 	case IDC_ORGANIZE_DONE: organizeDone(); break;
 	case IDC_ORGANIZE_CANCEL: organizeCancel(); break;
+	case IDC_FILELIST_ADD: fileListAddFiles(); break;
+	case IDC_FILELIST_ACTION: fileListAction(); break;
+	case IDC_FILELIST_CANCEL: fileListCancel(); break;
 	case IDM_TOOL_SELECT:
 	case IDM_TOOL_HIGHLIGHT:
 	case IDM_TOOL_DRAW:
@@ -8637,6 +9093,7 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 
 	CanvasView::Register(hInstance);
 	ThumbPanel::Register(hInstance);
+	FileListPanel::Register(hInstance);
 
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = FrameWindow::Proc;

@@ -166,6 +166,13 @@
 #define IDC_PRINT_QUALITY_LABEL  1168
 #define IDC_PRINT_QUALITY_COMBO  1169
 
+// File list panel (Merge / Convert to PDF: reorderable list of picked files,
+// shown between the file picker and the actual merge/convert action)
+#define IDC_FILELIST_TITLE   1170
+#define IDC_FILELIST_ADD     1171
+#define IDC_FILELIST_CANCEL  1172
+#define IDC_FILELIST_ACTION  1173
+
 // Rich-text-editor side panel (right-docked, mutually exclusive with the
 // print panel -- "Edit as Rich Text..." on a text selection's right-click menu)
 #define IDC_TEXTPANEL_TITLE      1159
