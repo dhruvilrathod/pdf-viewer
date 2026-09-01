@@ -29,14 +29,14 @@ target_link_libraries(pdfviewer_poc PRIVATE mupdf)
 
 # Console diagnostic tool for the edit+save code path (no GUI/window
 # involved) -- lets us isolate save-corruption bugs from Win32 input issues.
-add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp src/word_convert.cpp src/webview_convert.cpp src/signature.cpp)
+add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp src/word_convert.cpp src/webview_convert.cpp)
 # gdi32/user32: pdf_document.cpp now loads installed Windows fonts (CreateFontW/
 # GetFontData) so MuPDF can substitute real fonts for non-embedded references.
 # ole32/oleaut32: word_convert.cpp's Word COM automation (Convert to PDF's
 # .docx support). WebView2LoaderStatic: webview_convert.cpp (Convert to PDF's
 # web-page support).
 target_include_directories(pdfviewer_savetest PRIVATE ${WEBVIEW2_DIR}/include)
-target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32 gdiplus ole32 oleaut32
+target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32 ole32 oleaut32
 	${WEBVIEW2_DIR}/lib/x64/WebView2LoaderStatic.lib)
 target_compile_definitions(pdfviewer_savetest PRIVATE NOMINMAX UNICODE _UNICODE)
 
@@ -56,7 +56,6 @@ add_executable(pdfviewer WIN32
 	src/package_info.cpp
 	src/word_convert.cpp
 	src/webview_convert.cpp
-	src/signature.cpp
 	resources/app.rc
 )
 # winhttp: GitHub-releases update check + download (stock Windows system DLL,
