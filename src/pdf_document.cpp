@@ -2590,38 +2590,43 @@ bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 						}
 						pdf_drop_obj(ctx_, contentsRef);
 						pdf_dict_put_drop(ctx_, page_ref, PDF_NAME(Contents), newContents);
-
-						// Now that every appearance is baked into page content,
-						// the live annotation objects themselves are just dead
-						// weight -- delete them. Restart the walk after each
-						// delete rather than trying to safely advance past a
-						// just-freed node (same pattern as
-						// clearPendingRedactions); per-page annotation counts
-						// are always small so the O(n^2) worst case is fine.
-						auto shouldDelete = [&](pdf_annot* a) {
-							enum pdf_annot_type type = pdf_annot_type(ctx_, a);
-							if (type == PDF_ANNOT_LINK || type == PDF_ANNOT_POPUP) return false;
-							return pdf_annot_ap(ctx_, a) != nullptr;
-						};
-						bool foundOne = true;
-						while (foundOne) {
-							foundOne = false;
-							for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) {
-								if (!shouldDelete(a)) continue;
-								pdf_delete_annot(ctx_, pg, a);
-								foundOne = true;
-								break;
-							}
+					}
+					// Now that every appearance is baked into page content, the
+					// live annotation objects themselves are just dead weight --
+					// delete them. Restart the walk after each delete rather than
+					// trying to safely advance past a just-freed node (same
+					// pattern as clearPendingRedactions); per-page annotation
+					// counts are always small so the O(n^2) worst case is fine.
+					// Markup annots only get removed if they actually had a
+					// visible appearance that was baked above -- one with no AP
+					// (e.g. a pending redaction mark) is left alone. Widgets are
+					// unconditionally removed instead: an unchecked checkbox has
+					// no appearance for its "Off" state (nothing to bake) but is
+					// still a live, interactive form field, and flattening must
+					// strip that interactivity regardless of whether anything was
+					// drawn for it.
+					auto shouldDeleteMarkup = [&](pdf_annot* a) {
+						enum pdf_annot_type type = pdf_annot_type(ctx_, a);
+						if (type == PDF_ANNOT_LINK || type == PDF_ANNOT_POPUP) return false;
+						return pdf_annot_ap(ctx_, a) != nullptr;
+					};
+					bool foundOne = true;
+					while (foundOne) {
+						foundOne = false;
+						for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) {
+							if (!shouldDeleteMarkup(a)) continue;
+							pdf_delete_annot(ctx_, pg, a);
+							foundOne = true;
+							break;
 						}
-						foundOne = true;
-						while (foundOne) {
-							foundOne = false;
-							for (pdf_annot* w = pdf_first_widget(ctx_, pg); w; w = pdf_next_widget(ctx_, w)) {
-								if (!shouldDelete(w)) continue;
-								pdf_delete_annot(ctx_, pg, w);
-								foundOne = true;
-								break;
-							}
+					}
+					foundOne = true;
+					while (foundOne) {
+						foundOne = false;
+						for (pdf_annot* w = pdf_first_widget(ctx_, pg); w; w = pdf_next_widget(ctx_, w)) {
+							pdf_delete_annot(ctx_, pg, w);
+							foundOne = true;
+							break;
 						}
 					}
 				}

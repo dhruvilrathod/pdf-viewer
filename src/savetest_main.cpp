@@ -259,6 +259,8 @@ int wmain(int argc, wchar_t** argv)
 			if (!openFresh(doc)) return 1;
 			auto charsBefore = doc.pageChars(0);
 			auto annotsBefore = doc.pageAnnots(0);
+			int widgetsBefore = 0;
+			for (int p = 0; p < doc.pageCount(); ++p) widgetsBefore += static_cast<int>(doc.pageWidgets(p).size());
 			std::string e;
 			if (!doc.flattenAnnotationsToContent(e)) {
 				std::printf("  FAIL: flattenAnnotationsToContent: %s\n", e.c_str());
@@ -266,6 +268,14 @@ int wmain(int argc, wchar_t** argv)
 			} else {
 				auto charsAfter = doc.pageChars(0);
 				auto annotsAfter = doc.pageAnnots(0);
+				int widgetsAfter = 0;
+				for (int p = 0; p < doc.pageCount(); ++p) widgetsAfter += static_cast<int>(doc.pageWidgets(p).size());
+				// Every widget (form field) must be gone after flatten, even ones
+				// with no visible appearance to bake -- e.g. an unchecked checkbox
+				// whose "Off" state has no AP stream still must not survive as a
+				// live, interactive field.
+				std::printf("  widgets %d -> %d (expect 0)\n", widgetsBefore, widgetsAfter);
+				if (widgetsAfter != 0) ++failures;
 				// pageChars() extracts from the page's own content stream only
 				// (fz_run_page_contents, not fz_run_page -- see its comment), so
 				// it never included annotation text before flattening even
