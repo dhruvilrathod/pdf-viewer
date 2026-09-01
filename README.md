@@ -80,6 +80,19 @@ not run on macOS or Linux.
 - Highlight, freehand draw, and free-text boxes — all edited **inline**, no modal
   dialogs. Fill AcroForm fields directly on the page.
 
+**Sign**
+- **Type** your name and pick a handwriting font, or **draw** a signature with the
+  mouse — then click anywhere on the page to place it (drag instead to size it).
+- Placed signatures can be **moved and resized** afterwards: click one with the
+  Select tool for drag handles (corners keep the aspect ratio), or press Delete.
+- Signatures are **remembered** between sessions, so signing again is one click.
+- **Finish & Lock** bakes the signature, every annotation and all form-field
+  values into the page: nothing stays fillable or editable, while page text
+  stays selectable. Irreversible, so it asks first.
+- This is a visible, hand-written-style signature — *not* a cryptographic /
+  certificate-based one. There's no audit trail, and locking is enforced by
+  flattening rather than by tamper detection.
+
 **Security**
 - Open **password-protected** PDFs (inline password prompt).
 - **Remove password / restrictions** from an encrypted PDF you can open.

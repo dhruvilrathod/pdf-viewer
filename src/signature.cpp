@@ -1,0 +1,387 @@
+#include "signature.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cwchar>
+
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+
+namespace {
+
+// Candidate handwriting faces, best-looking first. A mix of Windows-shipped
+// (Segoe Script/Print, Ink Free, Gabriola, Lucida Handwriting, Mistral,
+// Monotype Corsiva) and Office-shipped (Bradley Hand, Edwardian/Freestyle/
+// French/Palace/Kunstler Script, Viner Hand, Vladimir Script) families --
+// SignatureFontFaces() filters this down to what's actually installed, so the
+// list adapts per machine instead of silently substituting Arial for a face
+// that isn't there.
+const wchar_t* const kCandidateFaces[] = {
+	L"Segoe Script",
+	L"Lucida Handwriting",
+	L"Ink Free",
+	L"Bradley Hand ITC",
+	L"Edwardian Script ITC",
+	L"Freestyle Script",
+	L"Mistral",
+	L"Monotype Corsiva",
+	L"French Script MT",
+	L"Palace Script MT",
+	L"Kunstler Script",
+	L"Vladimir Script",
+	L"Viner Hand ITC",
+	L"Segoe Print",
+	L"Gabriola",
+};
+
+// Blank margin (at render resolution) kept around the inked pixels after the
+// tight crop, so the stamped image never looks clipped at its own edges.
+constexpr int kCropPadPx = 4;
+
+// A glyph's em box is much taller than its inked extent, and script faces
+// swing well outside it with ascender/descender flourishes. Render into a
+// canvas generously larger than the nominal em size in every direction and
+// let the tight crop find the real bounds, rather than guessing at metrics.
+constexpr float kTypedCanvasSlackY = 2.2f;
+constexpr float kTypedCanvasSlackX = 1.4f;
+
+std::wstring TrimWs(const std::wstring& s)
+{
+	size_t b = s.find_first_not_of(L" \t\r\n");
+	if (b == std::wstring::npos) return std::wstring();
+	size_t e = s.find_last_not_of(L" \t\r\n");
+	return s.substr(b, e - b + 1);
+}
+
+// Tight bounding box of every pixel with any alpha, in a 32bpp PARGB bitmap.
+// Returns false if the bitmap is entirely transparent (nothing was drawn).
+bool InkBounds(Gdiplus::Bitmap& bmp, RECT& out)
+{
+	Gdiplus::Rect all(0, 0, static_cast<INT>(bmp.GetWidth()), static_cast<INT>(bmp.GetHeight()));
+	Gdiplus::BitmapData data = {};
+	if (bmp.LockBits(&all, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &data) != Gdiplus::Ok)
+		return false;
+	int minX = all.Width, minY = all.Height, maxX = -1, maxY = -1;
+	for (int y = 0; y < all.Height; ++y) {
+		const BYTE* row = static_cast<const BYTE*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+		for (int x = 0; x < all.Width; ++x) {
+			if (row[x * 4 + 3] == 0) continue;
+			if (x < minX) minX = x;
+			if (x > maxX) maxX = x;
+			if (y < minY) minY = y;
+			if (y > maxY) maxY = y;
+		}
+	}
+	bmp.UnlockBits(&data);
+	if (maxX < 0) return false;
+	out = { minX, minY, maxX + 1, maxY + 1 };
+	return true;
+}
+
+// Copies the `crop` sub-rectangle out of `bmp` as premultiplied top-down BGRA
+// -- exactly what PdfDocument::addImageStamp expects (and the same byte order
+// GDI+ already stores PixelFormat32bppPARGB in, so this is a straight copy).
+bool CopyCropped(Gdiplus::Bitmap& bmp, const RECT& crop, std::vector<BYTE>& out, int& w, int& h)
+{
+	w = crop.right - crop.left;
+	h = crop.bottom - crop.top;
+	if (w <= 0 || h <= 0) return false;
+	Gdiplus::Rect r(crop.left, crop.top, w, h);
+	Gdiplus::BitmapData data = {};
+	if (bmp.LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &data) != Gdiplus::Ok)
+		return false;
+	out.resize(static_cast<size_t>(w) * h * 4);
+	for (int y = 0; y < h; ++y) {
+		const BYTE* src = static_cast<const BYTE*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+		memcpy(out.data() + static_cast<size_t>(y) * w * 4, src, static_cast<size_t>(w) * 4);
+	}
+	bmp.UnlockBits(&data);
+	return true;
+}
+
+Gdiplus::Color ToGdiColor(COLORREF c)
+{
+	return Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c));
+}
+
+// --- Registry persistence -------------------------------------------------
+// One REG_SZ value per saved signature ("Sig0" = most recent). Serialized as
+// pipe-separated fields with the free-form part (typed text / stroke data)
+// last, so it can contain anything without needing an escape scheme.
+//   Typed: T|RRGGBB|<face>|<text>
+//   Drawn: D|RRGGBB|<padAspect>|x,y x,y;x,y x,y      (';' separates strokes)
+constexpr wchar_t kSigRegKey[] = L"Software\\PDFast\\Signatures";
+
+std::wstring Serialize(const Signature& s)
+{
+	wchar_t head[64];
+	if (s.kind == Signature::Kind::Typed) {
+		swprintf(head, 64, L"T|%02X%02X%02X|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color));
+		return std::wstring(head) + s.font + L"|" + s.text;
+	}
+	swprintf(head, 64, L"D|%02X%02X%02X|%.4f|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color),
+		s.padAspect);
+	std::wstring body;
+	for (const auto& stroke : s.strokes) {
+		if (stroke.empty()) continue;
+		if (!body.empty()) body += L';';
+		for (size_t i = 0; i < stroke.size(); ++i) {
+			wchar_t pt[40];
+			swprintf(pt, 40, i ? L" %.4f,%.4f" : L"%.4f,%.4f", stroke[i].x, stroke[i].y);
+			body += pt;
+		}
+	}
+	return std::wstring(head) + body;
+}
+
+// Splits off the first `n` '|'-delimited fields, leaving the remainder (which
+// may itself contain '|') as the final piece.
+bool SplitFields(const std::wstring& in, int n, std::vector<std::wstring>& out)
+{
+	out.clear();
+	size_t pos = 0;
+	for (int i = 0; i < n; ++i) {
+		size_t bar = in.find(L'|', pos);
+		if (bar == std::wstring::npos) return false;
+		out.push_back(in.substr(pos, bar - pos));
+		pos = bar + 1;
+	}
+	out.push_back(in.substr(pos));
+	return true;
+}
+
+COLORREF ParseHexColor(const std::wstring& hex)
+{
+	if (hex.size() < 6) return RGB(0, 0, 0);
+	unsigned r = 0, g = 0, b = 0;
+	if (swscanf_s(hex.c_str(), L"%2x%2x%2x", &r, &g, &b) != 3) return RGB(0, 0, 0);
+	return RGB(r, g, b);
+}
+
+bool Deserialize(const std::wstring& in, Signature& out)
+{
+	if (in.size() < 3) return false;
+	std::vector<std::wstring> f;
+	if (in[0] == L'T') {
+		if (!SplitFields(in, 3, f)) return false;
+		out.kind = Signature::Kind::Typed;
+		out.color = ParseHexColor(f[1]);
+		out.font = f[2];
+		out.text = f[3];
+		return !out.empty();
+	}
+	if (in[0] != L'D') return false;
+	if (!SplitFields(in, 3, f)) return false;
+	out.kind = Signature::Kind::Drawn;
+	out.color = ParseHexColor(f[1]);
+	out.padAspect = static_cast<float>(_wtof(f[2].c_str()));
+	if (!(out.padAspect > 0.01f) || out.padAspect > 100.0f) out.padAspect = 3.0f;
+	out.strokes.clear();
+	const std::wstring& body = f[3];
+	size_t pos = 0;
+	while (pos <= body.size()) {
+		size_t semi = body.find(L';', pos);
+		std::wstring seg = body.substr(pos, semi == std::wstring::npos ? std::wstring::npos : semi - pos);
+		std::vector<SigPoint> stroke;
+		size_t p = 0;
+		while (p < seg.size()) {
+			size_t sp = seg.find(L' ', p);
+			std::wstring tok = seg.substr(p, sp == std::wstring::npos ? std::wstring::npos : sp - p);
+			float x = 0, y = 0;
+			if (swscanf_s(tok.c_str(), L"%f,%f", &x, &y) == 2) stroke.push_back({ x, y });
+			if (sp == std::wstring::npos) break;
+			p = sp + 1;
+		}
+		if (!stroke.empty()) out.strokes.push_back(std::move(stroke));
+		if (semi == std::wstring::npos) break;
+		pos = semi + 1;
+	}
+	return !out.empty();
+}
+
+} // namespace
+
+std::wstring Signature::label() const
+{
+	if (kind == Kind::Typed) return TrimWs(text);
+	return L"Drawn signature";
+}
+
+const std::vector<std::wstring>& SignatureFontFaces()
+{
+	static const std::vector<std::wstring> faces = [] {
+		std::vector<std::wstring> out;
+		for (const wchar_t* face : kCandidateFaces) {
+			Gdiplus::FontFamily fam(face);
+			if (fam.IsAvailable()) out.push_back(face);
+		}
+		// Every supported Windows version ships several of the above, so this
+		// is a belt-and-braces fallback rather than an expected path -- but an
+		// empty list would leave the panel with nothing to click.
+		if (out.empty()) out.push_back(L"Segoe UI");
+		return out;
+	}();
+	return faces;
+}
+
+bool RenderSignature(const Signature& sig, int heightPx,
+	std::vector<BYTE>& bgra, int& outW, int& outH)
+{
+	bgra.clear();
+	outW = outH = 0;
+	if (sig.empty() || heightPx < 8) return false;
+
+	if (sig.kind == Signature::Kind::Typed) {
+		const std::wstring text = TrimWs(sig.text);
+		if (text.empty()) return false;
+		// Resolve the face BEFORE constructing the family: Gdiplus::FontFamily
+		// is non-assignable, so a "construct then swap on miss" shape doesn't
+		// compile. A saved signature can name a font that's since been
+		// uninstalled, hence the availability check at all.
+		std::wstring face = sig.font;
+		if (face.empty() || !Gdiplus::FontFamily(face.c_str()).IsAvailable())
+			face = SignatureFontFaces().front();
+		Gdiplus::FontFamily fam(face.c_str());
+		float emPx = static_cast<float>(heightPx);
+		Gdiplus::Font font(&fam, emPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+		if (font.GetLastStatus() != Gdiplus::Ok) return false;
+
+		// Measure first (against a throwaway 1x1 surface) so the real canvas
+		// is sized to the string rather than an arbitrary guess.
+		Gdiplus::RectF measured;
+		{
+			Gdiplus::Bitmap probe(1, 1, PixelFormat32bppPARGB);
+			Gdiplus::Graphics g(&probe);
+			g.MeasureString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0),
+				Gdiplus::StringFormat::GenericTypographic(), &measured);
+		}
+		int canvasW = static_cast<int>(std::ceil(measured.Width * kTypedCanvasSlackX)) + heightPx;
+		int canvasH = static_cast<int>(std::ceil(emPx * kTypedCanvasSlackY));
+		canvasW = std::clamp(canvasW, 16, 8000);
+		canvasH = std::clamp(canvasH, 16, 8000);
+
+		Gdiplus::Bitmap bmp(canvasW, canvasH, PixelFormat32bppPARGB);
+		{
+			Gdiplus::Graphics g(&bmp);
+			g.Clear(Gdiplus::Color(0, 0, 0, 0));
+			g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+			// ClearType subpixel AA bakes the assumed background color into
+			// the glyph edges, which turns into colored fringing on a
+			// transparent bitmap composited over an arbitrary page. Grayscale
+			// AA is the correct mode for an alpha-channel render.
+			g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+			Gdiplus::SolidBrush brush(ToGdiColor(sig.color));
+			// Draw centered in the slack canvas so flourishes that overshoot
+			// the em box in any direction still land inside it.
+			g.DrawString(text.c_str(), -1, &font,
+				Gdiplus::PointF((canvasW - measured.Width) / 2.0f, (canvasH - emPx) / 2.0f),
+				Gdiplus::StringFormat::GenericTypographic(), &brush);
+		}
+		RECT ink;
+		if (!InkBounds(bmp, ink)) return false;
+		RECT crop = { std::max<LONG>(0, ink.left - kCropPadPx), std::max<LONG>(0, ink.top - kCropPadPx),
+			std::min<LONG>(canvasW, ink.right + kCropPadPx), std::min<LONG>(canvasH, ink.bottom + kCropPadPx) };
+		return CopyCropped(bmp, crop, bgra, outW, outH);
+	}
+
+	// Drawn: replay the normalized strokes into a canvas of the pad's aspect.
+	float aspect = sig.padAspect > 0.01f ? sig.padAspect : 3.0f;
+	int canvasH = heightPx;
+	int canvasW = std::clamp(static_cast<int>(std::lround(heightPx * aspect)), 16, 8000);
+	float penW = std::max(1.5f, heightPx * 0.035f);
+	int margin = static_cast<int>(std::ceil(penW)) + kCropPadPx;
+	Gdiplus::Bitmap bmp(canvasW + margin * 2, canvasH + margin * 2, PixelFormat32bppPARGB);
+	{
+		Gdiplus::Graphics g(&bmp);
+		g.Clear(Gdiplus::Color(0, 0, 0, 0));
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		Gdiplus::Pen pen(ToGdiColor(sig.color), penW);
+		pen.SetStartCap(Gdiplus::LineCapRound);
+		pen.SetEndCap(Gdiplus::LineCapRound);
+		pen.SetLineJoin(Gdiplus::LineJoinRound);
+		Gdiplus::SolidBrush dot(ToGdiColor(sig.color));
+		for (const auto& stroke : sig.strokes) {
+			if (stroke.empty()) continue;
+			std::vector<Gdiplus::PointF> pts;
+			pts.reserve(stroke.size());
+			for (const auto& p : stroke)
+				pts.push_back(Gdiplus::PointF(margin + p.x * canvasW, margin + p.y * canvasH));
+			if (pts.size() == 1) {
+				// A single tap still deserves a visible mark (the dot on an
+				// "i", a full stop) -- DrawLines/DrawCurve draw nothing here.
+				g.FillEllipse(&dot, pts[0].X - penW / 2, pts[0].Y - penW / 2, penW, penW);
+			} else if (pts.size() == 2) {
+				g.DrawLines(&pen, pts.data(), 2);
+			} else {
+				// Mouse sampling is chunky at speed; a low-tension cardinal
+				// spline smooths that into something that reads as handwriting
+				// without the overshoot a higher tension would introduce.
+				g.DrawCurve(&pen, pts.data(), static_cast<INT>(pts.size()), 0.35f);
+			}
+		}
+	}
+	RECT ink;
+	if (!InkBounds(bmp, ink)) return false;
+	int bw = static_cast<int>(bmp.GetWidth()), bh = static_cast<int>(bmp.GetHeight());
+	RECT crop = { std::max<LONG>(0, ink.left - kCropPadPx), std::max<LONG>(0, ink.top - kCropPadPx),
+		std::min<LONG>(bw, ink.right + kCropPadPx), std::min<LONG>(bh, ink.bottom + kCropPadPx) };
+	return CopyCropped(bmp, crop, bgra, outW, outH);
+}
+
+std::vector<Signature> LoadSignatures()
+{
+	std::vector<Signature> out;
+	HKEY key = nullptr;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, kSigRegKey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+		return out;
+	for (size_t i = 0; i < kMaxSavedSignatures; ++i) {
+		wchar_t name[16];
+		swprintf(name, 16, L"Sig%zu", i);
+		DWORD type = 0, bytes = 0;
+		if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS) continue;
+		if (type != REG_SZ || bytes < sizeof(wchar_t) || bytes > 256 * 1024) continue;
+		std::wstring buf(bytes / sizeof(wchar_t), L'\0');
+		if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(buf.data()), &bytes) != ERROR_SUCCESS)
+			continue;
+		buf.resize(wcsnlen(buf.c_str(), buf.size()));
+		Signature s;
+		if (Deserialize(buf, s)) out.push_back(std::move(s));
+	}
+	RegCloseKey(key);
+	return out;
+}
+
+void SaveSignatures(const std::vector<Signature>& sigs)
+{
+	HKEY key = nullptr;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, kSigRegKey, 0, nullptr, 0,
+			KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+		return;
+	for (size_t i = 0; i < kMaxSavedSignatures; ++i) {
+		wchar_t name[16];
+		swprintf(name, 16, L"Sig%zu", i);
+		if (i < sigs.size()) {
+			std::wstring v = Serialize(sigs[i]);
+			RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()),
+				static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t)));
+		} else {
+			// Trailing slots must be cleared, not just skipped -- otherwise
+			// deleting a signature leaves the old tail value behind and it
+			// reappears on the next load.
+			RegDeleteValueW(key, name);
+		}
+	}
+	RegCloseKey(key);
+}
+
+void RememberSignature(std::vector<Signature>& sigs, const Signature& sig)
+{
+	if (sig.empty()) return;
+	const std::wstring key = Serialize(sig);
+	sigs.erase(std::remove_if(sigs.begin(), sigs.end(),
+		[&](const Signature& s) { return Serialize(s) == key; }), sigs.end());
+	sigs.insert(sigs.begin(), sig);
+	if (sigs.size() > kMaxSavedSignatures) sigs.resize(kMaxSavedSignatures);
+	SaveSignatures(sigs);
+}

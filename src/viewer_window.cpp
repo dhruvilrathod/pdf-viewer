@@ -9,6 +9,7 @@
 #include "package_info.h"
 #include "version.h"
 #include "webview_convert.h"
+#include "signature.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -188,6 +189,14 @@ constexpr wchar_t kFrameClass[] = L"PdfViewerFrame";
 constexpr wchar_t kCanvasClass[] = L"PdfViewerCanvas";
 constexpr wchar_t kThumbClass[] = L"PdfViewerThumbs";
 constexpr wchar_t kFileListClass[] = L"PdfViewerFileList";
+constexpr wchar_t kSigPadClass[] = L"PdfViewerSigPad";
+constexpr wchar_t kSigGalleryClass[] = L"PdfViewerSigGallery";
+
+// Signature bitmap helpers, defined down with the signature pad/gallery but
+// also needed by CanvasView's Sign tool, which comes first in this file.
+// (PageBitmap itself comes from pdf_document.h, already included above.)
+PageBitmap MakeArgbBitmap(const std::vector<BYTE>& bgra, int w, int h);
+void BlitArgbFit(HDC dc, const PageBitmap& bm, const RECT& dest);
 
 // Count of live top-level FrameWindow instances (normally 1, but dragging a
 // tab out or "Open in New Window" can create more) -- PostQuitMessage only
@@ -635,7 +644,10 @@ public:
 	// After Save, PdfDocument reopens its underlying fz_document internally
 	// (same PdfDocument object, new handle) -- drop caches keyed to the old
 	// handle without resetting scroll/zoom/page position like setDocument().
-	void refreshAfterSave() { widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); invalidateCache(); relayout(); invalidate(); }
+	// Also drops any signature selection: a save reopens the document, and a
+	// flatten/lock removes annotations outright, so the held index is no
+	// longer guaranteed to mean the same thing.
+	void refreshAfterSave() { clearStampSelection(); widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); invalidateCache(); relayout(); invalidate(); }
 
 	void zoomIn() { setZoom(zoom_ * kZoomStep); fit_ = Fit::None; }
 	void zoomOut() { setZoom(zoom_ / kZoomStep); fit_ = Fit::None; }
@@ -655,14 +667,40 @@ public:
 	int viewRotation() const { return viewRotation_; }
 
 	// Annotation tools
-	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact };
+	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact, Sign };
 	void setTool(Tool t) {
 		if (inlineEdit_) commitInlineEdit(true);
+		bool wasSign = tool_ == Tool::Sign;
+		// Changing tools drops any signature selection -- its handles belong
+		// to an editing gesture, not to the page. (Placing a signature leaves
+		// you on the Sign tool, so the auto-selection after a drop survives
+		// and can be resized straight away.)
+		if (t != tool_) clearStampSelection();
 		tool_ = t;
 		SetCursor(LoadCursor(nullptr, t == Tool::Select ? IDC_ARROW : IDC_CROSS));
 		if (t != Tool::Select && !hoveredLinkText_.empty()) { hoveredLinkText_.clear(); updateStatus(); }
+		// Leaving the Sign tool must clear the follow-the-cursor ghost, or it
+		// stays painted at wherever the mouse last was.
+		if (wasSign && t != Tool::Sign && sigGhostVisible_) { sigGhostVisible_ = false; invalidate(); }
+		// The Sign tool takes the status bar over as its instruction line
+		// (see updateStatus), so both entering and leaving it have to
+		// rewrite that text -- otherwise the hint lingers under another tool.
+		if (wasSign || t == Tool::Sign) updateStatus();
 	}
 	Tool tool() const { return tool_; }
+
+	// --- Sign tool -------------------------------------------------------
+	// Arms the tool with a rasterized signature (premultiplied top-down BGRA,
+	// from RenderSignature). While armed, a translucent ghost follows the
+	// cursor over the page and a click drops the signature there; dragging
+	// instead sizes it to the dragged box. Stays armed after a placement so
+	// the same signature can be applied to several spots in one pass.
+	void setPendingSignature(std::vector<BYTE> bgra, int w, int h);
+	void clearPendingSignature();
+	bool hasPendingSignature() const { return sigW_ > 0 && sigH_ > 0; }
+	// Deletes the signature (Stamp annotation) under a point, if any.
+	// Returns true if something was removed.
+	bool removeSignatureAt(int page, float px, float py);
 	// Commits whatever the user is currently typing (form field or new
 	// text-box annotation) so Save never silently drops in-progress edits.
 	void flushPendingEdit() { if (inlineEdit_) commitInlineEdit(true); }
@@ -899,10 +937,38 @@ private:
 	int inlineWidgetIndex_ = -1; // >=0 while inlineIsWidget_ -- which widget, for Tab navigation
 	float inlineFontSize_ = 12.0f;
 
-	// Resize-handle state for the free-text box currently being edited.
-	// Moving the box is triggered from InlineEditSubclass (a click near the
-	// EDIT control's own border), not a separate overlapping window -- see
-	// its WM_LBUTTONDOWN handling.
+	// Resize-handle state. The same 8 handles serve two targets: the free-text
+	// box currently being edited, and a selected Stamp (a placed signature) --
+	// see resizeTarget_. Moving a text box is triggered from
+	// InlineEditSubclass (a click near the EDIT control's own border), not a
+	// separate overlapping window; moving a stamp starts from a plain click
+	// inside it under the Select tool.
+	enum class ResizeTarget { None, InlineEdit, Stamp };
+	ResizeTarget resizeTarget_ = ResizeTarget::None;
+	// The rect/page the handles currently act on, whichever target is live.
+	PageRectPt* activeResizeRect() {
+		return resizeTarget_ == ResizeTarget::Stamp ? &stampSelRect_ : &inlineEditRectPt_;
+	}
+	int activeResizePage() const {
+		return resizeTarget_ == ResizeTarget::Stamp ? stampSelPage_ : inlineEditPage_;
+	}
+
+	// Selected Stamp annotation (a placed signature): what the Select tool
+	// has picked, so it can be dragged and resized after the fact.
+	// stampSelIndex_ < 0 means nothing is selected.
+	int stampSelPage_ = -1;
+	int stampSelIndex_ = -1;
+	PageRectPt stampSelRect_;
+	// Aspect ratio (h/w) captured at selection time. Corner handles preserve
+	// it -- a stretched signature reads as fake -- while edge handles are
+	// deliberately free, for the rare case someone wants to squash one.
+	float stampSelAspect_ = 1.0f;
+	bool stampSelected() const { return stampSelIndex_ >= 0; }
+	void selectStamp(int page, const AnnotInfo& ai);
+	void clearStampSelection();
+	void commitStampRect();
+	void deleteSelectedStamp();
+
 	HWND resizeHandles_[8] = {};
 	int activeResizeDir_ = -1;
 	PageRectPt resizeBound_;
@@ -968,6 +1034,22 @@ private:
 	int pageOrgX_ = 0, pageOrgY_ = 0;     // screen coords of page top-left at drag start
 	float dragScale_ = 1.0f;              // effScale() at drag start, for the live pen-width preview
 	std::vector<PagePointF> curStroke_;   // page-space (draw tool)
+
+	// Sign tool: the armed signature, kept both as the raw BGRA (what
+	// addImageStamp needs) and as a ready-to-AlphaBlend DIB (what the live
+	// ghost preview draws). sigGhost* track the follow-the-cursor preview so
+	// onMouseMove can invalidate just the old+new ghost rects instead of the
+	// whole canvas on every mouse move over a page.
+	std::vector<BYTE> sigBgra_;
+	int sigW_ = 0, sigH_ = 0;
+	PageBitmap sigPreview_;
+	bool sigGhostVisible_ = false;
+	RECT sigGhostRect_ = {};
+	// Default on-page width for a click-to-drop placement, in points. About
+	// 2.5 inches -- the size a signature occupies on a real form.
+	static constexpr float kSignatureDropWidthPt = 180.0f;
+	RECT signatureGhostRectAt(int mx, int my) const;
+
 	std::function<void()> onChanged_;
 	std::function<void()> onExitTextTool_;
 	std::function<void()> onViewChanged_;
@@ -1092,6 +1174,84 @@ private:
 	std::function<void()> onChanged_;
 };
 
+// ---------------------------------------------------------------------------
+// SignaturePad: the small "draw your signature here" surface in the signature
+// side panel. Captures raw mouse strokes and hands them back normalized to
+// 0..1 on both axes, so a saved signature replays correctly at any later size
+// or DPI (see signature.h). Deliberately dumb -- it owns strokes and nothing
+// else; the panel decides what to do with them.
+// ---------------------------------------------------------------------------
+class SignaturePad {
+public:
+	static void Register(HINSTANCE hInst);
+	SignaturePad(HWND parent, HINSTANCE hInst);
+	HWND hwnd() const { return hwnd_; }
+	// No setDarkMode: the pad is deliberately paper-white in both themes (see
+	// its onPaint) -- it previews ink on a white PDF page, so theming it
+	// would just make black ink invisible in dark mode.
+	void setInkColor(COLORREF c) { ink_ = c; InvalidateRect(hwnd_, nullptr, FALSE); }
+	void clear() { strokes_.clear(); InvalidateRect(hwnd_, nullptr, TRUE); if (onChanged_) onChanged_(); }
+	bool empty() const {
+		for (const auto& s : strokes_) if (!s.empty()) return false;
+		return true;
+	}
+	const std::vector<std::vector<SigPoint>>& strokes() const { return strokes_; }
+	// Aspect ratio of the pad the strokes were captured in -- stored alongside
+	// them so the replay canvas has the same proportions the user drew into.
+	float aspect() const;
+	// Fires on every stroke added/cleared, so the panel can enable/disable its
+	// "Use This Signature" button without polling.
+	void setOnChanged(std::function<void()> cb) { onChanged_ = std::move(cb); }
+	static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
+
+private:
+	void onPaint();
+	void addPoint(int x, int y);
+
+	HWND hwnd_ = nullptr;
+	UINT dpi_ = 96;
+	std::vector<std::vector<SigPoint>> strokes_;
+	bool drawing_ = false;
+	COLORREF ink_ = RGB(0, 0, 0);
+	std::function<void()> onChanged_;
+};
+
+// ---------------------------------------------------------------------------
+// SignatureGallery: the saved-signatures strip in the signature side panel.
+// One row per remembered signature, each showing the actual rendered
+// signature (not a text label) plus a small delete "x". Clicking a row loads
+// that signature for placing; clicking its x forgets it.
+// ---------------------------------------------------------------------------
+class SignatureGallery {
+public:
+	static void Register(HINSTANCE hInst);
+	SignatureGallery(HWND parent, HINSTANCE hInst);
+	HWND hwnd() const { return hwnd_; }
+	void setDarkMode(bool dark) { dark_ = dark; InvalidateRect(hwnd_, nullptr, TRUE); }
+	void setSignatures(std::vector<Signature> sigs);
+	const std::vector<Signature>& signatures() const { return sigs_; }
+	void setOnPick(std::function<void(int)> cb) { onPick_ = std::move(cb); }
+	void setOnDelete(std::function<void(int)> cb) { onDelete_ = std::move(cb); }
+	static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);
+
+private:
+	void onPaint();
+	void onLButtonDown(int x, int y);
+	int rowAt(int y) const;
+	RECT deleteRectFor(int i) const;
+	int rowHeight() const;
+
+	HWND hwnd_ = nullptr;
+	UINT dpi_ = 96;
+	std::vector<Signature> sigs_;
+	// Rendered preview per signature, built lazily on first paint (rendering
+	// is cheap but not free, and the panel repaints on every theme/resize).
+	std::vector<PageBitmap> previews_;
+	bool dark_ = false;
+	std::function<void(int)> onPick_;
+	std::function<void(int)> onDelete_;
+};
+
 class FrameWindow;
 // Creates a brand-new top-level window (its own FrameWindow, own tab strip)
 // and opens each of `paths` as its own tab (first one lands in the window's
@@ -1145,6 +1305,7 @@ private:
 	static LRESULT CALLBACK SplitEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK SetPwdEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	static LRESULT CALLBACK WebPdfEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+	static LRESULT CALLBACK SigTextEditSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	void updatePageEditBox();
 	void beginPageNumberEdit();          // creates the transient page-number EDIT control and focuses it
 	void endPageNumberEdit(bool commit); // destroys it, optionally jumping to the typed page first
@@ -1340,6 +1501,47 @@ private:
 	bool fileListPanelVisible_ = false;
 	FileListMode fileListMode_ = FileListMode::Merge;
 	void showFileListPanel(bool show, FileListMode mode);
+
+	// Signature side panel -- opens with the Sign tool, shares the right-hand
+	// column with the print/rich-text/file-list panels (all mutually
+	// exclusive). Two modes in one panel: type a name in a handwriting font,
+	// or draw one on the pad; either way "Use This Signature" rasterizes it,
+	// remembers it in the gallery, and arms CanvasView to stamp it on the
+	// next page click. NOT a cryptographic signature -- see signature.h.
+	enum class SigMode { Type, Draw };
+	HWND sigTitle_ = nullptr;
+	HWND sigModeType_ = nullptr, sigModeDraw_ = nullptr;
+	HWND sigTextLabel_ = nullptr, sigTextEdit_ = nullptr;
+	HWND sigFontList_ = nullptr;
+	HWND sigPadLabel_ = nullptr, sigClear_ = nullptr;
+	HWND sigColorLabel_ = nullptr, sigColorBlack_ = nullptr, sigColorBlue_ = nullptr;
+	HWND sigUse_ = nullptr;
+	HWND sigSavedLabel_ = nullptr;
+	HWND sigLock_ = nullptr, sigClose_ = nullptr;
+	std::unique_ptr<SignaturePad> sigPad_;
+	std::unique_ptr<SignatureGallery> sigGallery_;
+	bool sigPanelVisible_ = false;
+	SigMode sigMode_ = SigMode::Type;
+	COLORREF sigColor_ = RGB(0, 0, 0);
+	// The saved gallery, loaded once per window and written back on every
+	// change (see signature.h's registry notes).
+	std::vector<Signature> savedSignatures_;
+	void showSignaturePanel(bool show);
+	void sigSetMode(SigMode m);
+	void sigSetColor(COLORREF c);
+	// Builds a Signature from whatever the panel currently holds for the
+	// active mode. Returns false if there's nothing usable yet.
+	bool sigFromPanel(Signature& out) const;
+	void sigUseCurrent();
+	// Arms the canvas with `sig` and remembers it; shared by "Use This
+	// Signature" and picking an existing one out of the gallery.
+	void sigArm(const Signature& sig, bool remember);
+	void sigDeleteSaved(int index);
+	void sigUpdateEnabled();
+	void sigLockDocument();
+	// Owner-draws one row of the font list: the name currently typed,
+	// rendered in that row's own face (see sigFontList_'s creation comment).
+	void drawSignatureFontItem(const DRAWITEMSTRUCT* dis);
 	void fileListAddFiles();
 	void fileListCancel();
 	void fileListAction();
@@ -1374,6 +1576,9 @@ private:
 	// Edits Only" tiles (see IDM_EMPTY_FLATTEN_IMAGE/IDM_EMPTY_FLATTEN_EDITS):
 	// 0 = none pending, 1 = flatten to image, 2 = flatten edits only.
 	int pendingFlattenAfterOpen_ = 0;
+	// Same chaining pattern again for the empty-state "Sign PDF" tile: open a
+	// file, then land straight on the Sign tool with its panel up.
+	bool pendingSignAfterOpen_ = false;
 
 	// Protection info bar -- offers to strip password/restrictions from an
 	// encrypted PDF that's currently open. Both buttons call the same
@@ -1713,6 +1918,7 @@ CanvasView::CanvasView(HWND parent, HINSTANCE hInst)
 void CanvasView::setDocument(PdfDocument* doc)
 {
 	if (inlineEdit_) commitInlineEdit(false); // old doc's widget indices won't apply
+	clearStampSelection();                   // ... nor its annotation indices
 	doc_ = doc;
 	currentPage_ = 0;
 	scrollX_ = scrollY_ = 0;
@@ -1927,9 +2133,24 @@ void CanvasView::onLButtonDown(int mx, int my)
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return;
 
+	// Any non-Select tool click starts a fresh mark, so a leftover signature
+	// selection would just leave stale handles floating over the page. (The
+	// Select branch below does its own, more nuanced, deselect.)
+	if (tool_ != Tool::Select && stampSelected()) clearStampSelection();
+
 	if (tool_ == Tool::Select) {
 		clearTextSelection();
 		AnnotInfo ai = doc_->annotAt(page, { px, py });
+		// A placed signature: select it (showing the 8 resize handles) and
+		// arm a move drag in one gesture -- click alone just selects, since
+		// with no mouse movement the committed rect is unchanged.
+		if (ai.kind == AnnotKind::Stamp) {
+			if (!stampSelected() || stampSelIndex_ != ai.index || stampSelPage_ != page)
+				selectStamp(page, ai);
+			beginMove(mx, my);
+			return;
+		}
+		if (stampSelected()) clearStampSelection(); // clicked away from it
 		if (ai.kind == AnnotKind::FreeText) { beginExistingAnnotEdit(page, ai); return; }
 		WidgetInfo wi = doc_->widgetAt(page, { px, py });
 		if (wi.index >= 0) { doFormFill(page, px, py); return; }
@@ -1949,7 +2170,11 @@ void CanvasView::onLButtonDown(int mx, int my)
 		eraseAt(mx, my);
 		return;
 	}
-	// Begin a drag for Highlight / Draw / Text.
+	// Sign tool with nothing armed yet: the panel is where a signature gets
+	// made, and updateStatus() is already saying so -- just don't start a
+	// drag that could never place anything.
+	if (tool_ == Tool::Sign && !hasPendingSignature()) return;
+	// Begin a drag for Highlight / Draw / Text / Sign.
 	dragging_ = true;
 	dragPage_ = page;
 	dragStartX_ = dragCurX_ = mx;
@@ -1978,6 +2203,23 @@ void CanvasView::onMouseMove(int mx, int my)
 	}
 	if (!dragging_) {
 		if (tool_ == Tool::Select) updateLinkHover(mx, my);
+		if (tool_ == Tool::Sign && hasPendingSignature()) {
+			// Follow-the-cursor ghost. Invalidate only the union of the old
+			// and new ghost rects -- a full-canvas invalidate on every mouse
+			// move would repaint every visible page bitmap continuously.
+			int page; float px, py;
+			bool onPage = hitTestPage(mx, my, page, px, py);
+			RECT old = sigGhostRect_;
+			bool wasVisible = sigGhostVisible_;
+			sigGhostVisible_ = onPage;
+			if (onPage) sigGhostRect_ = signatureGhostRectAt(mx, my);
+			if (wasVisible || sigGhostVisible_) {
+				RECT dirty = sigGhostVisible_ ? sigGhostRect_ : old;
+				if (wasVisible && sigGhostVisible_) UnionRect(&dirty, &old, &sigGhostRect_);
+				InflateRect(&dirty, 2, 2);
+				InvalidateRect(hwnd_, &dirty, FALSE);
+			}
+		}
 		return;
 	}
 	if (tool_ == Tool::Erase) { eraseAt(mx, my); return; }
@@ -2031,6 +2273,42 @@ void CanvasView::onLButtonUp(int mx, int my)
 	} else if (tool_ == Tool::Draw) {
 		std::vector<std::vector<PagePointF>> strokes{ curStroke_ };
 		if (doc_->addInk(dragPage_, strokes, drawColor_, penWidth_, err)) changed = true;
+	} else if (tool_ == Tool::Sign && hasPendingSignature()) {
+		float x0, y0, x1, y1;
+		toPage(dragStartX_, dragStartY_, x0, y0);
+		toPage(mx, my, x1, y1);
+		float aspect = sigH_ / static_cast<float>(std::max(1, sigW_));
+		PageRectPt rectPt;
+		if (std::abs(x1 - x0) < 12 || std::abs(y1 - y0) < 12) {
+			// Treated as a click, not a drag: drop at the default width with
+			// the top-left at the click point, matching the ghost preview.
+			rectPt = { x0, y0, x0 + kSignatureDropWidthPt, y0 + kSignatureDropWidthPt * aspect };
+		} else {
+			// Dragged a box: fit the signature inside it, anchored top-left
+			// and keeping the aspect ratio -- a stretched signature would
+			// look obviously fake.
+			float bx0 = std::min(x0, x1), by0 = std::min(y0, y1);
+			float bw = std::abs(x1 - x0), bh = std::abs(y1 - y0);
+			float w = std::min(bw, bh / aspect);
+			rectPt = { bx0, by0, bx0 + w, by0 + w * aspect };
+		}
+		if (doc_->addImageStamp(dragPage_, rectPt, sigBgra_.data(), sigW_, sigH_, err)) {
+			changed = true;
+			// Select what was just dropped, so its resize handles are there
+			// immediately -- otherwise adjusting the size is an
+			// undiscoverable "switch to Select, then click it" two-step.
+			// Re-hit-testing is how we learn the new annotation's index:
+			// addImageStamp doesn't report it, and the newest stamp is
+			// necessarily the topmost one at that point.
+			AnnotInfo placed = doc_->annotAt(dragPage_,
+				{ (rectPt.x0 + rectPt.x1) / 2, (rectPt.y0 + rectPt.y1) / 2 });
+			if (placed.kind == AnnotKind::Stamp) selectStamp(dragPage_, placed);
+		} else {
+			MessageBoxW(hwnd_, L"Could not place the signature on this page.",
+				L"Sign", MB_OK | MB_ICONWARNING);
+		}
+		// The ghost is stale the moment the real stamp lands underneath it.
+		sigGhostVisible_ = false;
 	} else if (tool_ == Tool::Text) {
 		// No dialogs: type directly into an inline box, pick color from the
 		// floating swatch popup, and it commits when you click away or hit Esc.
@@ -2075,6 +2353,108 @@ void CanvasView::onLButtonUp(int mx, int my)
 	}
 }
 
+void CanvasView::selectStamp(int page, const AnnotInfo& ai)
+{
+	if (inlineEdit_) commitInlineEdit(true); // the two targets share one handle set
+	stampSelPage_ = page;
+	stampSelIndex_ = ai.index;
+	stampSelRect_ = ai.rect;
+	float w = std::max(1.0f, ai.rect.x1 - ai.rect.x0);
+	stampSelAspect_ = (ai.rect.y1 - ai.rect.y0) / w;
+	resizeTarget_ = ResizeTarget::Stamp;
+	createResizeHandles();
+	positionResizeHandles();
+	invalidate();
+}
+
+void CanvasView::clearStampSelection()
+{
+	if (!stampSelected()) return;
+	stampSelPage_ = -1;
+	stampSelIndex_ = -1;
+	if (resizeTarget_ == ResizeTarget::Stamp) {
+		resizeTarget_ = ResizeTarget::None;
+		// Only tear the handles down if the inline editor isn't using them.
+		if (!inlineEdit_) destroyResizeHandles();
+	}
+	invalidate();
+}
+
+void CanvasView::commitStampRect()
+{
+	if (!stampSelected() || !doc_) return;
+	std::string err;
+	if (!doc_->setAnnotRect(stampSelPage_, stampSelIndex_, stampSelRect_, err)) {
+		// Leave the selection alone -- the annotation is unchanged, and the
+		// handles snapping back on the next repaint is the honest feedback.
+		invalidate();
+		return;
+	}
+	// The annotation index is stable across an in-place rect change (nothing
+	// is added or removed), so the selection survives the re-render.
+	invalidatePage(stampSelPage_);
+	invalidate();
+	if (onChanged_) onChanged_();
+}
+
+void CanvasView::deleteSelectedStamp()
+{
+	if (!stampSelected() || !doc_) return;
+	int page = stampSelPage_, idx = stampSelIndex_;
+	clearStampSelection();
+	std::string err;
+	if (doc_->deleteAnnot(page, idx, err)) {
+		invalidatePage(page);
+		invalidate();
+		if (onChanged_) onChanged_();
+	}
+}
+
+void CanvasView::setPendingSignature(std::vector<BYTE> bgra, int w, int h)
+{
+	sigBgra_ = std::move(bgra);
+	sigW_ = w;
+	sigH_ = h;
+	sigPreview_ = MakeArgbBitmap(sigBgra_, w, h);
+	sigGhostVisible_ = false;
+	updateStatus();
+	invalidate();
+}
+
+void CanvasView::clearPendingSignature()
+{
+	sigBgra_.clear();
+	sigW_ = sigH_ = 0;
+	sigPreview_ = PageBitmap();
+	if (sigGhostVisible_) { sigGhostVisible_ = false; invalidate(); }
+	updateStatus();
+}
+
+// Screen rect the armed signature would occupy if dropped with its top-left
+// at the cursor. Sized from the CURRENT zoom so the ghost is a true preview:
+// kSignatureDropWidthPt is a page-space measurement, so it has to be scaled
+// by effScale() to become pixels.
+RECT CanvasView::signatureGhostRectAt(int mx, int my) const
+{
+	float scale = effScale();
+	int w = std::max(1, static_cast<int>(std::lround(kSignatureDropWidthPt * scale)));
+	int h = std::max(1, static_cast<int>(std::lround(w * sigH_ / static_cast<float>(std::max(1, sigW_)))));
+	return { mx, my, mx + w, my + h };
+}
+
+bool CanvasView::removeSignatureAt(int page, float px, float py)
+{
+	if (!doc_ || !doc_->isPdf()) return false;
+	AnnotInfo ai = doc_->annotAt(page, { px, py });
+	if (ai.kind != AnnotKind::Stamp) return false;
+	std::string err;
+	if (!doc_->deleteAnnot(page, ai.index, err)) return false;
+	invalidatePage(page);
+	invalidate();
+	if (onChanged_) onChanged_();
+	return true;
+}
+
 void CanvasView::eraseAt(int mx, int my)
 {
 	if (!doc_ || !doc_->isPdf()) return;
@@ -2085,7 +2465,10 @@ void CanvasView::eraseAt(int mx, int my)
 	// stroke, so the eraser doesn't also eat highlights/text boxes it
 	// happens to pass over.
 	AnnotInfo ai = doc_->annotAt(page, { px, py });
-	if (ai.kind != AnnotKind::Ink) return;
+	// Stamps (placed signatures) join ink strokes as erasable: a signature
+	// dropped in the wrong spot needs SOME way to come back off, and the
+	// eraser is the obvious one. Highlights/text boxes are still spared.
+	if (ai.kind != AnnotKind::Ink && ai.kind != AnnotKind::Stamp) return;
 	std::string err;
 	if (doc_->deleteAnnot(page, ai.index, err)) {
 		invalidatePage(page);
@@ -2348,6 +2731,22 @@ void CanvasView::onRButtonDown(int mx, int my)
 	if (tool_ != Tool::Select) return;
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return;
+	// A placed signature takes priority over anything underneath it: it's the
+	// only markup this app can create that has no other way to be removed
+	// with the Select tool (free-text boxes get a delete in their own inline
+	// popup; highlights/ink go via the eraser).
+	if (doc_ && doc_->isPdf() && doc_->annotAt(page, { px, py }).kind == AnnotKind::Stamp) {
+		HMENU sigMenu = CreatePopupMenu();
+		AppendMenuW(sigMenu, MF_STRING, IDM_SIG_REMOVE, L"Remove Signature");
+		POINT sp{ mx, my };
+		ClientToScreen(hwnd_, &sp);
+		int cmd = TrackPopupMenu(sigMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, sp.x, sp.y, 0, hwnd_, nullptr);
+		DestroyMenu(sigMenu);
+		// Re-hit-test rather than reusing the AnnotInfo above: TrackPopupMenu
+		// pumps messages, so annotation indices could have shifted meanwhile.
+		if (cmd == IDM_SIG_REMOVE) removeSignatureAt(page, px, py);
+		return;
+	}
 	const LinkInfo* hit = linkAt(page, px, py);
 	if (!hit) {
 		// No link under the cursor: offer the active selection's menu
@@ -2749,6 +3148,7 @@ void CanvasView::makeInlineBgBrush()
 
 void CanvasView::createResizeHandles()
 {
+	if (resizeHandles_[0]) return; // already up (two targets share one set)
 	HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE));
 	for (int i = 0; i < 8; ++i) {
 		resizeHandles_[i] = CreateWindowExW(0, kResizeHandleClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -2769,12 +3169,13 @@ void CanvasView::positionResizeHandles()
 {
 	if (!resizeHandles_[0]) return;
 	int sx, sy;
-	if (!pageScreenOrigin(inlineEditPage_, sx, sy)) return;
+	if (!pageScreenOrigin(activeResizePage(), sx, sy)) return;
+	const PageRectPt& rc = *activeResizeRect();
 	float sc = effScale();
-	int x0 = sx + static_cast<int>(inlineEditRectPt_.x0 * sc);
-	int y0 = sy + static_cast<int>(inlineEditRectPt_.y0 * sc);
-	int x1 = sx + static_cast<int>(inlineEditRectPt_.x1 * sc);
-	int y1 = sy + static_cast<int>(inlineEditRectPt_.y1 * sc);
+	int x0 = sx + static_cast<int>(rc.x0 * sc);
+	int y0 = sy + static_cast<int>(rc.y0 * sc);
+	int x1 = sx + static_cast<int>(rc.x1 * sc);
+	int y1 = sy + static_cast<int>(rc.y1 * sc);
 	int hs = Scale(4, dpi_); // half-size: 8px handle at 96 DPI
 	int xm = (x0 + x1) / 2, ym = (y0 + y1) / 2;
 	const int cx[8] = { x0, xm, x1, x0, x1, x0, xm, x1 };
@@ -2785,25 +3186,25 @@ void CanvasView::positionResizeHandles()
 
 void CanvasView::beginResize(int dir)
 {
-	if (!inlineEdit_ || !doc_) return;
+	if (resizeTarget_ == ResizeTarget::None || !doc_) return;
 	activeResizeDir_ = dir;
-	resizeBound_ = doc_->pageBound(inlineEditPage_);
+	resizeBound_ = doc_->pageBound(activeResizePage());
 	resizeScale_ = effScale();
-	pageScreenOrigin(inlineEditPage_, resizeOrgX_, resizeOrgY_);
+	pageScreenOrigin(activeResizePage(), resizeOrgX_, resizeOrgY_);
 	SetCapture(hwnd_);
 }
 
 void CanvasView::beginMove(int mx, int my)
 {
-	if (!inlineEdit_ || !doc_) return;
+	if (resizeTarget_ == ResizeTarget::None || !doc_) return;
 	activeResizeDir_ = kResizeMove;
-	resizeBound_ = doc_->pageBound(inlineEditPage_);
+	resizeBound_ = doc_->pageBound(activeResizePage());
 	resizeScale_ = effScale();
-	pageScreenOrigin(inlineEditPage_, resizeOrgX_, resizeOrgY_);
+	pageScreenOrigin(activeResizePage(), resizeOrgX_, resizeOrgY_);
 	float px = resizeBound_.x0 + (mx - resizeOrgX_) / resizeScale_;
 	float py = resizeBound_.y0 + (my - resizeOrgY_) / resizeScale_;
-	moveGrabDX_ = px - inlineEditRectPt_.x0;
-	moveGrabDY_ = py - inlineEditRectPt_.y0;
+	moveGrabDX_ = px - activeResizeRect()->x0;
+	moveGrabDY_ = py - activeResizeRect()->y0;
 	SetCapture(hwnd_);
 }
 
@@ -2813,7 +3214,15 @@ void CanvasView::updateResize(int mx, int my)
 	float px = resizeBound_.x0 + (mx - resizeOrgX_) / resizeScale_;
 	float py = resizeBound_.y0 + (my - resizeOrgY_) / resizeScale_;
 	constexpr float kMinW = 20.0f, kMinH = 12.0f;
-	PageRectPt r = inlineEditRectPt_;
+	PageRectPt r = *activeResizeRect();
+	// A stamp is an image: stretching it independently on both axes makes a
+	// signature look obviously fabricated, so the four CORNER handles drive
+	// width and derive height from the aspect captured at selection time.
+	// Edge handles stay free-form (both targets), so squashing is still
+	// possible if someone actually wants it.
+	bool lockAspect = resizeTarget_ == ResizeTarget::Stamp &&
+		(activeResizeDir_ == kResizeNW || activeResizeDir_ == kResizeNE ||
+		 activeResizeDir_ == kResizeSW || activeResizeDir_ == kResizeSE);
 	switch (activeResizeDir_) {
 	case kResizeNW: r.x0 = std::min(px, r.x1 - kMinW); r.y0 = std::min(py, r.y1 - kMinH); break;
 	case kResizeN:  r.y0 = std::min(py, r.y1 - kMinH); break;
@@ -2830,14 +3239,33 @@ void CanvasView::updateResize(int mx, int my)
 		break;
 	}
 	}
-	inlineEditRectPt_ = r;
-	positionInlineEdit(); // also repositions the handles/move frame
+	if (lockAspect) {
+		// Re-derive the height from the new width, growing away from whichever
+		// corner is anchored (the one diagonally opposite the dragged handle).
+		float w = std::max(kMinW, r.x1 - r.x0);
+		float h = std::max(kMinH, w * stampSelAspect_);
+		bool anchorTop = activeResizeDir_ == kResizeSW || activeResizeDir_ == kResizeSE;
+		if (anchorTop) r.y1 = r.y0 + h;
+		else r.y0 = r.y1 - h;
+	}
+	*activeResizeRect() = r;
+	if (resizeTarget_ == ResizeTarget::Stamp) {
+		// The annotation itself isn't touched until the drag ends (same
+		// "don't mutate the document mid-drag" rule Organize follows) -- the
+		// dashed outline in onPaint is the live feedback.
+		positionResizeHandles();
+		invalidate();
+	} else {
+		positionInlineEdit(); // also repositions the handles/move frame
+	}
 }
 
 void CanvasView::endResize()
 {
+	bool wasStamp = resizeTarget_ == ResizeTarget::Stamp && activeResizeDir_ >= 0;
 	activeResizeDir_ = -1;
 	ReleaseCapture();
+	if (wasStamp) commitStampRect();
 }
 
 void CanvasView::updateInlineEditFont()
@@ -2923,7 +3351,10 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 
 	// Form fields keep their fixed widget-defined size; only free-text boxes
 	// (new or existing) get drag handles.
-	if (!opts.isWidget) createResizeHandles();
+	if (!opts.isWidget) {
+		resizeTarget_ = ResizeTarget::InlineEdit;
+		createResizeHandles();
+	}
 
 	positionInlineEdit();
 	SetFocus(inlineEdit_);
@@ -2945,6 +3376,7 @@ void CanvasView::commitInlineEdit(bool commit)
 	DestroyWindow(edit);
 	if (colorPopup_) { DestroyWindow(colorPopup_); colorPopup_ = nullptr; }
 	destroyResizeHandles();
+	if (resizeTarget_ == ResizeTarget::InlineEdit) resizeTarget_ = ResizeTarget::None;
 	if (activeResizeDir_ >= 0) { activeResizeDir_ = -1; ReleaseCapture(); }
 	if (inlineEditFont_) { DeleteObject(inlineEditFont_); inlineEditFont_ = nullptr; }
 	if (inlineBgBrush_) { DeleteObject(inlineBgBrush_); inlineBgBrush_ = nullptr; }
@@ -3410,6 +3842,7 @@ void CanvasView::stepScrollAnim()
 	updateScrollbars();
 	invalidate();
 	if (inlineEdit_) positionInlineEdit();
+	else if (stampSelected()) positionResizeHandles(); // selected signature's handles track the page too
 	if (!scrollAnimY_ && !scrollAnimX_) {
 		KillTimer(hwnd_, kScrollAnimTimerId);
 		updateStatus(); // also updates currentPage_ from scrollY_ in Continuous mode
@@ -3535,6 +3968,69 @@ void CanvasView::onPaint()
 		drawEmptyState(mem, rc);
 	}
 
+	// Sign tool: translucent preview of exactly what a click would drop, and
+	// where. Drawn before the drag overlay below so an in-progress sizing
+	// drag paints its own outline on top.
+	if (tool_ == Tool::Sign && hasPendingSignature() && sigPreview_.hbmp && !printPreviewActive_) {
+		RECT ghost = {};
+		bool show = false;
+		if (dragging_) {
+			// Mid-drag: show it fitted into the box being dragged out, same
+			// top-left anchor + aspect rule onLButtonUp will actually apply.
+			int gx0 = std::min(dragStartX_, dragCurX_), gy0 = std::min(dragStartY_, dragCurY_);
+			int bw = std::abs(dragCurX_ - dragStartX_), bh = std::abs(dragCurY_ - dragStartY_);
+			if (bw > 12 && bh > 12) {
+				float aspect = sigH_ / static_cast<float>(std::max(1, sigW_));
+				int w = std::min(bw, static_cast<int>(bh / aspect));
+				ghost = { gx0, gy0, gx0 + w, gy0 + static_cast<int>(w * aspect) };
+			} else {
+				ghost = signatureGhostRectAt(dragStartX_, dragStartY_);
+			}
+			show = true;
+		} else if (sigGhostVisible_) {
+			ghost = sigGhostRect_;
+			show = true;
+		}
+		if (show) {
+			HDC gsrc = CreateCompatibleDC(mem);
+			HGDIOBJ oldG = SelectObject(gsrc, sigPreview_.hbmp);
+			// 60% opacity: clearly a preview, still legible enough to judge
+			// placement against the text underneath.
+			BLENDFUNCTION bf = { AC_SRC_OVER, 0, 150, AC_SRC_ALPHA };
+			AlphaBlend(mem, ghost.left, ghost.top, ghost.right - ghost.left, ghost.bottom - ghost.top,
+				gsrc, 0, 0, sigPreview_.width, sigPreview_.height, bf);
+			SelectObject(gsrc, oldG);
+			DeleteDC(gsrc);
+			HPEN pen = CreatePen(PS_DOT, 1, RGB(0, 120, 215));
+			HGDIOBJ oldPen = SelectObject(mem, pen);
+			HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
+			Rectangle(mem, ghost.left, ghost.top, ghost.right, ghost.bottom);
+			SelectObject(mem, oldPen); SelectObject(mem, oldBr);
+			DeleteObject(pen);
+		}
+	}
+
+	// Selected signature: a dashed outline marking what the resize handles
+	// act on. While a resize/move drag is running this tracks the NEW box
+	// live while the annotation itself stays rendered at its old position
+	// underneath -- the document isn't touched until the drag ends.
+	if (stampSelected() && !printPreviewActive_) {
+		int sx, sy;
+		if (pageScreenOrigin(stampSelPage_, sx, sy)) {
+			float sc = effScale();
+			RECT r = { sx + static_cast<int>(stampSelRect_.x0 * sc),
+				sy + static_cast<int>(stampSelRect_.y0 * sc),
+				sx + static_cast<int>(stampSelRect_.x1 * sc),
+				sy + static_cast<int>(stampSelRect_.y1 * sc) };
+			HPEN pen = CreatePen(PS_DOT, 1, RGB(0, 120, 215));
+			HGDIOBJ oldPen = SelectObject(mem, pen);
+			HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
+			Rectangle(mem, r.left, r.top, r.right, r.bottom);
+			SelectObject(mem, oldPen); SelectObject(mem, oldBr);
+			DeleteObject(pen);
+		}
+	}
+
 	// Live overlay for the in-progress annotation drag.
 	if (dragging_) {
 		if (tool_ == Tool::Highlight || tool_ == Tool::Text || tool_ == Tool::Redact) {
@@ -3628,6 +4124,7 @@ void CanvasView::onSize()
 	relayout();
 	invalidate();
 	if (inlineEdit_) positionInlineEdit();
+	else if (stampSelected()) positionResizeHandles(); // selected signature's handles track the page too
 }
 
 void CanvasView::onVScroll(WPARAM wp)
@@ -3656,6 +4153,7 @@ void CanvasView::onVScroll(WPARAM wp)
 		if (scrollY_ != old) {
 			updateScrollbars(); invalidate(); updateStatus();
 			if (inlineEdit_) positionInlineEdit();
+			else if (stampSelected()) positionResizeHandles(); // selected signature's handles track the page too
 		}
 		break;
 	}
@@ -3683,6 +4181,7 @@ void CanvasView::onHScroll(WPARAM wp)
 		if (scrollX_ != old) {
 			updateScrollbars(); invalidate();
 			if (inlineEdit_) positionInlineEdit();
+			else if (stampSelected()) positionResizeHandles(); // selected signature's handles track the page too
 		}
 		break;
 	}
@@ -3750,6 +4249,17 @@ void CanvasView::updateStatus()
 		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 		return;
 	}
+	// While the Sign tool is active the status bar becomes its instruction
+	// line -- the tool is modal in feel (arm a signature, then click a spot)
+	// and there's no other always-visible place to say which step you're on.
+	if (tool_ == Tool::Sign && doc_ && doc_->isOpen()) {
+		statusText_ = hasPendingSignature()
+			? L"Click the page to place your signature, or drag to size it. Esc to stop."
+			: L"Type or draw a signature in the panel, then choose \"Use This Signature\".";
+		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
+		if (onViewChanged_) onViewChanged_();
+		return;
+	}
 	wchar_t buf[128];
 	if (doc_ && doc_->isOpen()) {
 		int cur = (mode_ == Mode::Continuous) ? dominantVisiblePage() : currentPage_;
@@ -3788,6 +4298,14 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_MOUSELEAVE:
 		self->trackingMouseLeave_ = false;
 		if (!self->hoveredLinkText_.empty()) { self->hoveredLinkText_.clear(); self->updateStatus(); }
+		// The Sign tool's ghost follows the cursor, so it has to go when the
+		// cursor does -- otherwise it stays frozen at the canvas edge.
+		if (self->sigGhostVisible_) {
+			self->sigGhostVisible_ = false;
+			RECT dirty = self->sigGhostRect_;
+			InflateRect(&dirty, 2, 2);
+			InvalidateRect(hwnd, &dirty, FALSE);
+		}
 		return 0;
 	case WM_TIMER:
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
@@ -3844,6 +4362,28 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		case VK_NEXT:  self->onVScroll(SB_PAGEDOWN); return 0;
 		case VK_HOME:  self->onVScroll(SB_TOP); return 0;
 		case VK_END:   self->onVScroll(SB_BOTTOM); return 0;
+		case VK_ESCAPE:
+			// Deselecting a signature comes first: if one is selected, Escape
+			// is much more likely to mean "drop the selection" than "leave
+			// the tool", and a second Escape still does the latter.
+			if (self->stampSelected()) { self->clearStampSelection(); return 0; }
+			// Otherwise Escape backs out of the Sign tool, which the
+			// status-bar hint promises. onExitTextTool_ is just "drop back to
+			// Select" (the frame binds it to selectTool(IDM_TOOL_SELECT)),
+			// which also closes the signature panel and disarms the pending
+			// signature.
+			if (self->tool_ == Tool::Sign) {
+				if (self->onExitTextTool_) self->onExitTextTool_();
+				return 0;
+			}
+			break;
+		case VK_DELETE:
+		case VK_BACK:
+			// Delete removes a selected signature. Only ever reached when the
+			// canvas itself has focus, so it can't eat a keystroke meant for
+			// an inline edit box or a toolbar field.
+			if (self->stampSelected()) { self->deleteSelectedStamp(); return 0; }
+			break;
 		}
 		break;
 	case WM_CTLCOLOREDIT:
@@ -4558,6 +5098,351 @@ LRESULT CALLBACK FileListPanel::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ===========================================================================
+// Signature pad + gallery implementation
+// ===========================================================================
+
+namespace {
+
+// Wraps a premultiplied BGRA buffer (what RenderSignature produces) in a
+// 32-bit top-down DIB section so it can be AlphaBlend'ed onto any DC. The
+// returned PageBitmap owns the HBITMAP.
+PageBitmap MakeArgbBitmap(const std::vector<BYTE>& bgra, int w, int h)
+{
+	PageBitmap out;
+	if (w <= 0 || h <= 0 || bgra.size() < static_cast<size_t>(w) * h * 4) return out;
+	BITMAPINFO bi = {};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h; // top-down, matching the source buffer
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	HBITMAP hb = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+	if (!hb || !bits) { if (hb) DeleteObject(hb); return out; }
+	memcpy(bits, bgra.data(), static_cast<size_t>(w) * h * 4);
+	out.hbmp = hb;
+	out.width = w;
+	out.height = h;
+	return out;
+}
+
+// Draws `bm` (a premultiplied-alpha DIB) scaled to fit inside `dest`,
+// preserving aspect and centering it. No-op for an empty bitmap.
+void BlitArgbFit(HDC dc, const PageBitmap& bm, const RECT& dest)
+{
+	if (!bm.hbmp || bm.width <= 0 || bm.height <= 0) return;
+	int dw = dest.right - dest.left, dh = dest.bottom - dest.top;
+	if (dw <= 0 || dh <= 0) return;
+	float s = std::min(dw / static_cast<float>(bm.width), dh / static_cast<float>(bm.height));
+	int w = std::max(1, static_cast<int>(bm.width * s));
+	int h = std::max(1, static_cast<int>(bm.height * s));
+	int x = dest.left + (dw - w) / 2;
+	int y = dest.top + (dh - h) / 2;
+	HDC src = CreateCompatibleDC(dc);
+	HGDIOBJ old = SelectObject(src, bm.hbmp);
+	BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+	AlphaBlend(dc, x, y, w, h, src, 0, 0, bm.width, bm.height, bf);
+	SelectObject(src, old);
+	DeleteDC(src);
+}
+
+// Rendering resolution for the panel's small previews. Well above their
+// on-screen size so they stay crisp on a high-DPI display.
+constexpr int kSigPreviewRenderPx = 160;
+
+} // namespace
+
+void SignaturePad::Register(HINSTANCE hInst)
+{
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc = SignaturePad::Proc;
+	wc.hInstance = hInst;
+	wc.hCursor = LoadCursor(nullptr, IDC_CROSS);
+	wc.hbrBackground = nullptr;
+	wc.lpszClassName = kSigPadClass;
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	RegisterClassW(&wc);
+}
+
+SignaturePad::SignaturePad(HWND parent, HINSTANCE hInst)
+{
+	hwnd_ = CreateWindowExW(0, kSigPadClass, L"",
+		WS_CHILD, 0, 0, 100, 100, parent, nullptr, hInst, this);
+	dpi_ = GetDpiForWindow(hwnd_);
+}
+
+float SignaturePad::aspect() const
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	if (w <= 0 || h <= 0) return 3.0f;
+	return static_cast<float>(w) / h;
+}
+
+void SignaturePad::addPoint(int x, int y)
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	if (w <= 0 || h <= 0 || strokes_.empty()) return;
+	// Clamp rather than drop: a fast stroke that briefly leaves the pad
+	// should stay one continuous line along the edge, not break in two.
+	float nx = std::clamp(x / static_cast<float>(w), 0.0f, 1.0f);
+	float ny = std::clamp(y / static_cast<float>(h), 0.0f, 1.0f);
+	strokes_.back().push_back({ nx, ny });
+}
+
+void SignaturePad::onPaint()
+{
+	PAINTSTRUCT ps;
+	HDC dc = BeginPaint(hwnd_, &ps);
+	RECT rc; GetClientRect(hwnd_, &rc);
+	// Deliberately paper-white in BOTH themes, and not from the palette: this
+	// is a preview of ink on a white PDF page, so a dark-mode pad would show
+	// black ink on a near-black background and be unusable. Same reasoning
+	// applies to the gallery's preview rows.
+	HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
+	FillRect(dc, &rc, bg);
+	DeleteObject(bg);
+
+	// Dotted baseline about three-quarters down, the way a paper signature
+	// line sits -- gives the stroke somewhere to aim without constraining it.
+	{
+		int y = rc.top + (rc.bottom - rc.top) * 3 / 4;
+		int inset = Scale(10, dpi_);
+		HPEN pen = CreatePen(PS_DOT, 1, RGB(190, 190, 190));
+		HGDIOBJ old = SelectObject(dc, pen);
+		MoveToEx(dc, rc.left + inset, y, nullptr);
+		LineTo(dc, rc.right - inset, y);
+		SelectObject(dc, old);
+		DeleteObject(pen);
+	}
+
+	if (empty()) {
+		SetBkMode(dc, TRANSPARENT);
+		SetTextColor(dc, RGB(150, 150, 150));
+		HFONT f = CreateFontW(-MulDiv(10, dpi_, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH, L"Segoe UI");
+		HGDIOBJ oldF = SelectObject(dc, f);
+		RECT tr = rc;
+		DrawTextW(dc, L"Draw here with your mouse", -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+		SelectObject(dc, oldF);
+		DeleteObject(f);
+	} else {
+		// Same GDI+ smoothing/curve treatment RenderSignature() uses, so what
+		// you see while drawing matches what actually lands on the page.
+		Gdiplus::Graphics g(dc);
+		g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		int w = rc.right - rc.left, h = rc.bottom - rc.top;
+		float penW = std::max(1.5f, h * 0.035f);
+		Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(ink_), GetGValue(ink_), GetBValue(ink_)), penW);
+		pen.SetStartCap(Gdiplus::LineCapRound);
+		pen.SetEndCap(Gdiplus::LineCapRound);
+		pen.SetLineJoin(Gdiplus::LineJoinRound);
+		Gdiplus::SolidBrush dot(Gdiplus::Color(255, GetRValue(ink_), GetGValue(ink_), GetBValue(ink_)));
+		for (const auto& stroke : strokes_) {
+			if (stroke.empty()) continue;
+			std::vector<Gdiplus::PointF> pts;
+			pts.reserve(stroke.size());
+			for (const auto& p : stroke) pts.push_back(Gdiplus::PointF(p.x * w, p.y * h));
+			if (pts.size() == 1)
+				g.FillEllipse(&dot, pts[0].X - penW / 2, pts[0].Y - penW / 2, penW, penW);
+			else if (pts.size() == 2)
+				g.DrawLines(&pen, pts.data(), 2);
+			else
+				g.DrawCurve(&pen, pts.data(), static_cast<INT>(pts.size()), 0.35f);
+		}
+	}
+	FrameRect(dc, &rc, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+	EndPaint(hwnd_, &ps);
+}
+
+LRESULT CALLBACK SignaturePad::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	auto* self = reinterpret_cast<SignaturePad*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	if (msg == WM_NCCREATE) {
+		auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+		self = static_cast<SignaturePad*>(cs->lpCreateParams);
+		self->hwnd_ = hwnd;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+	}
+	if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+	switch (msg) {
+	case WM_PAINT: self->onPaint(); return 0;
+	case WM_ERASEBKGND: return 1;
+	case WM_LBUTTONDOWN:
+		self->drawing_ = true;
+		self->strokes_.push_back({});
+		self->addPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+		SetCapture(hwnd);
+		InvalidateRect(hwnd, nullptr, TRUE);
+		return 0;
+	case WM_MOUSEMOVE:
+		if (self->drawing_) {
+			self->addPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+			InvalidateRect(hwnd, nullptr, FALSE);
+		}
+		return 0;
+	case WM_LBUTTONUP:
+	case WM_CAPTURECHANGED:
+		if (self->drawing_) {
+			self->drawing_ = false;
+			if (msg == WM_LBUTTONUP) ReleaseCapture();
+			// Drop a stroke that never got any points (a click that landed
+			// outside the client area) so empty() stays honest.
+			if (!self->strokes_.empty() && self->strokes_.back().empty())
+				self->strokes_.pop_back();
+			InvalidateRect(hwnd, nullptr, TRUE);
+			if (self->onChanged_) self->onChanged_();
+		}
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void SignatureGallery::Register(HINSTANCE hInst)
+{
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc = SignatureGallery::Proc;
+	wc.hInstance = hInst;
+	wc.hCursor = LoadCursor(nullptr, IDC_HAND);
+	wc.hbrBackground = nullptr;
+	wc.lpszClassName = kSigGalleryClass;
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	RegisterClassW(&wc);
+}
+
+SignatureGallery::SignatureGallery(HWND parent, HINSTANCE hInst)
+{
+	hwnd_ = CreateWindowExW(0, kSigGalleryClass, L"",
+		WS_CHILD, 0, 0, 100, 100, parent, nullptr, hInst, this);
+	dpi_ = GetDpiForWindow(hwnd_);
+}
+
+int SignatureGallery::rowHeight() const { return Scale(46, dpi_); }
+
+void SignatureGallery::setSignatures(std::vector<Signature> sigs)
+{
+	sigs_ = std::move(sigs);
+	previews_.clear();
+	previews_.resize(sigs_.size());
+	for (size_t i = 0; i < sigs_.size(); ++i) {
+		std::vector<BYTE> bgra; int w = 0, h = 0;
+		if (RenderSignature(sigs_[i], kSigPreviewRenderPx, bgra, w, h))
+			previews_[i] = MakeArgbBitmap(bgra, w, h);
+	}
+	InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
+RECT SignatureGallery::deleteRectFor(int i) const
+{
+	RECT rc; GetClientRect(hwnd_, &rc);
+	int rh = rowHeight();
+	int sz = Scale(18, dpi_);
+	int pad = Scale(6, dpi_);
+	int top = i * rh;
+	return { rc.right - pad - sz, top + (rh - sz) / 2, rc.right - pad, top + (rh + sz) / 2 };
+}
+
+int SignatureGallery::rowAt(int y) const
+{
+	int i = y / std::max(1, rowHeight());
+	return (i >= 0 && i < static_cast<int>(sigs_.size())) ? i : -1;
+}
+
+void SignatureGallery::onPaint()
+{
+	PAINTSTRUCT ps;
+	HDC dc = BeginPaint(hwnd_, &ps);
+	RECT rc; GetClientRect(hwnd_, &rc);
+	const ThemeColors& th = Theme(dark_);
+	HBRUSH bg = CreateSolidBrush(th.frameBg);
+	FillRect(dc, &rc, bg);
+	DeleteObject(bg);
+	SetBkMode(dc, TRANSPARENT);
+
+	HFONT f = CreateFontW(-MulDiv(10, dpi_, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH, L"Segoe UI");
+	HGDIOBJ oldF = SelectObject(dc, f);
+
+	if (sigs_.empty()) {
+		SetTextColor(dc, th.emptySubtitle);
+		RECT tr = rc;
+		tr.top += Scale(6, dpi_);
+		DrawTextW(dc, L"Signatures you create are saved here.", -1, &tr,
+			DT_CENTER | DT_TOP | DT_WORDBREAK);
+	}
+
+	int rh = rowHeight();
+	int pad = Scale(6, dpi_);
+	for (size_t i = 0; i < sigs_.size(); ++i) {
+		RECT row = { rc.left, static_cast<LONG>(i) * rh, rc.right, static_cast<LONG>(i + 1) * rh };
+		if (row.top > rc.bottom) break;
+		// Paper-white in both themes, for the same reason the pad is (a saved
+		// signature is black/blue ink, and it has to stay legible here).
+		HBRUSH rowBg = CreateSolidBrush(RGB(255, 255, 255));
+		RECT inner = { row.left + pad / 2, row.top + pad / 2, row.right - pad / 2, row.bottom - pad / 2 };
+		FillRect(dc, &inner, rowBg);
+		DeleteObject(rowBg);
+		FrameRect(dc, &inner, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+
+		RECT del = deleteRectFor(static_cast<int>(i));
+		RECT preview = { inner.left + pad, inner.top + pad / 2, del.left - pad, inner.bottom - pad / 2 };
+		if (i < previews_.size() && previews_[i].hbmp) {
+			BlitArgbFit(dc, previews_[i], preview);
+		} else {
+			// Rendering failed (e.g. the saved font is gone and the fallback
+			// produced nothing) -- still show something clickable. Dark text
+			// to match the row's own paper-white background, not the theme's.
+			SetTextColor(dc, RGB(60, 60, 60));
+			std::wstring lbl = sigs_[i].label();
+			DrawTextW(dc, lbl.c_str(), -1, &preview,
+				DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		}
+		SetTextColor(dc, RGB(180, 60, 60));
+		DrawTextW(dc, L"✕", -1, &del, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	}
+	SelectObject(dc, oldF);
+	DeleteObject(f);
+	EndPaint(hwnd_, &ps);
+}
+
+void SignatureGallery::onLButtonDown(int x, int y)
+{
+	int i = rowAt(y);
+	if (i < 0) return;
+	RECT del = deleteRectFor(i);
+	// Give the small x a slightly generous hit box -- it's an 18px target.
+	InflateRect(&del, Scale(4, dpi_), Scale(4, dpi_));
+	POINT p{ x, y };
+	if (PtInRect(&del, p)) {
+		if (onDelete_) onDelete_(i);
+		return;
+	}
+	if (onPick_) onPick_(i);
+}
+
+LRESULT CALLBACK SignatureGallery::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	auto* self = reinterpret_cast<SignatureGallery*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	if (msg == WM_NCCREATE) {
+		auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+		self = static_cast<SignatureGallery*>(cs->lpCreateParams);
+		self->hwnd_ = hwnd;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+	}
+	if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+	switch (msg) {
+	case WM_PAINT: self->onPaint(); return 0;
+	case WM_ERASEBKGND: return 1;
+	case WM_LBUTTONDOWN: self->onLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ===========================================================================
 // Toolbar icons -- small hand-drawn vector glyphs (GDI+), monochrome to
 // match a flat, modern (Edge-like) toolbar. Drawing our own avoids any
 // dependency on a specific icon font's glyph set/codepoints being present.
@@ -4753,6 +5638,18 @@ void DrawEraseTool(Gdiplus::Graphics& g, float s)
 	// overlapping an outline segment.
 	p.polyline({ {0.22f,0.62f}, {0.52f,0.22f}, {0.86f,0.46f}, {0.56f,0.86f}, {0.22f,0.62f} });
 	p.line(0.38f, 0.48f, 0.68f, 0.74f);
+}
+
+void DrawSignTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	// A flowing signature squiggle sitting on a short baseline -- the
+	// universal "sign here" glyph. The baseline is drawn separately (and
+	// clearly below the squiggle's lowest point) so the two never merge into
+	// one shape at 20px.
+	p.polyline({ {0.16f,0.60f}, {0.30f,0.32f}, {0.40f,0.62f}, {0.52f,0.26f},
+		{0.62f,0.62f}, {0.74f,0.40f}, {0.84f,0.50f} });
+	p.line(0.14f, 0.78f, 0.86f, 0.78f);
 }
 
 void DrawTextTool(Gdiplus::Graphics& g, float s)
@@ -4959,6 +5856,7 @@ const std::vector<EmptyTile>& emptyStateTiles()
 		{ icons::DrawOpen,          L"Open a PDF",       IDM_FILE_OPEN },
 		{ icons::DrawHighlightTool, L"Annotate",          IDM_FILE_OPEN },
 		{ icons::DrawTextTool,      L"Fill Forms",        IDM_FILE_OPEN },
+		{ icons::DrawSignTool,      L"Sign PDF",          IDM_EMPTY_SIGN },
 		{ icons::DrawThumbs,        L"Organize Pages",    IDM_FILE_OPEN },
 		{ icons::DrawMergeTool,     L"Merge PDFs",        IDM_TOOLS_MERGE },
 		{ icons::DrawSplitTool,     L"Split PDF",         IDM_FILE_OPEN },
@@ -5156,6 +6054,8 @@ void FrameWindow::applyTheme()
 	}
 	if (fileListPanel_) fileListPanel_->setDarkMode(isDark_);
 
+	if (sigGallery_) sigGallery_->setDarkMode(isDark_);
+
 	// Plain InvalidateRect on the frame only repaints the frame's OWN client
 	// area -- it does not cascade to child HWNDs (EDIT/STATIC/the tab strip/
 	// status bar/canvas/thumbnail panel), which is why they'd otherwise keep
@@ -5183,6 +6083,7 @@ const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
 		icons::DrawZoomOut, icons::DrawZoomIn, icons::DrawFitWidth, icons::DrawFitPage,
 		icons::DrawToolsMenu, icons::DrawThemeToggle, icons::DrawEraseTool,
 		icons::DrawRotateView,
+		icons::DrawSignTool,
 	};
 	return fns;
 }
@@ -5251,7 +6152,7 @@ void FrameWindow::createChildren()
 	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
 		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
 		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18,
-		iErase = 19, iRotate = 20;
+		iErase = 19, iRotate = 20, iSign = 21;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -5306,6 +6207,7 @@ void FrameWindow::createChildren()
 	radioBtn(IDM_TOOL_DRAW, iDraw, L"Draw");
 	radioBtn(IDM_TOOL_ERASE, iErase, L"Erase");
 	radioBtn(IDM_TOOL_TEXT, iText, L"Add Text");
+	radioBtn(IDM_TOOL_SIGN, iSign, L"Sign — type or draw a signature, then click the page to place it");
 	radioBtn(IDM_TOOL_REDACT, iRedact, L"Redact");
 	btn(IDM_TOOL_COLOR, iColor, L"Color");
 	btn(IDM_TOOL_WIDTH, iWidth, L"Line Width");
@@ -5688,6 +6590,67 @@ void FrameWindow::createChildren()
 		reinterpret_cast<HMENU>(IDC_FILELIST_CANCEL), hInst_, nullptr);
 	for (HWND h : { fileListTitle_, fileListAdd_, fileListAction_, fileListCancel_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+
+	// Signature side panel (hidden until the Sign tool is picked). Same
+	// right-docked vertical-stack idiom as the print panel; positioned in
+	// layout(), which also shows/hides the half belonging to the inactive
+	// Type/Draw mode.
+	sigTitle_ = mkStatic(L"Signature", IDC_SIG_TITLE);
+	// BS_PUSHLIKE checkboxes, not radios: this pair is a segmented control,
+	// and sigSetMode() drives the checked state explicitly (same reason the
+	// rich-text B/I/U buttons avoid BS_AUTOCHECKBOX).
+	sigModeType_ = CreateWindowExW(0, L"BUTTON", L"Type", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_MODE_TYPE), hInst_, nullptr);
+	sigModeDraw_ = CreateWindowExW(0, L"BUTTON", L"Draw", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_MODE_DRAW), hInst_, nullptr);
+	sigTextLabel_ = mkStatic(L"Your name", IDC_SIG_TEXT_LABEL);
+	sigTextEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+		WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_TEXT_EDIT), hInst_, nullptr);
+	// Owner-drawn so each row can render the typed name in its OWN face --
+	// a plain list of font names tells you nothing about what the signature
+	// will actually look like, which is the whole point of choosing one.
+	sigFontList_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+		WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_FONT_LIST), hInst_, nullptr);
+	for (const auto& face : SignatureFontFaces())
+		SendMessageW(sigFontList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(face.c_str()));
+	SendMessageW(sigFontList_, LB_SETITEMHEIGHT, 0, Scale(34, dpi));
+	SendMessageW(sigFontList_, LB_SETCURSEL, 0, 0);
+	sigPadLabel_ = mkStatic(L"Draw your signature", IDC_SIG_PAD_LABEL);
+	sigPad_ = std::make_unique<SignaturePad>(hwnd_, hInst_);
+	sigClear_ = CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | BS_PUSHBUTTON,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_CLEAR), hInst_, nullptr);
+	sigColorLabel_ = mkStatic(L"Ink", IDC_SIG_COLOR_LABEL);
+	sigColorBlack_ = CreateWindowExW(0, L"BUTTON", L"Black", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_COLOR_BLACK), hInst_, nullptr);
+	sigColorBlue_ = CreateWindowExW(0, L"BUTTON", L"Blue", WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_COLOR_BLUE), hInst_, nullptr);
+	sigUse_ = CreateWindowExW(0, L"BUTTON", L"Use This Signature",
+		WS_CHILD | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_USE), hInst_, nullptr);
+	sigSavedLabel_ = mkStatic(L"Saved signatures", IDC_SIG_SAVED_LABEL);
+	sigGallery_ = std::make_unique<SignatureGallery>(hwnd_, hInst_);
+	sigLock_ = CreateWindowExW(0, L"BUTTON", L"Finish && Lock...",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_SIG_LOCK), hInst_, nullptr);
+	sigClose_ = CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | BS_PUSHBUTTON,
+		0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SIG_CLOSE), hInst_, nullptr);
+	for (HWND h : { sigTitle_, sigModeType_, sigModeDraw_, sigTextLabel_, sigTextEdit_,
+		sigPadLabel_, sigClear_, sigColorLabel_, sigColorBlack_, sigColorBlue_,
+		sigUse_, sigSavedLabel_, sigLock_, sigClose_ })
+		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
+	SetWindowSubclass(sigTextEdit_, SigTextEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+	sigPad_->setOnChanged([this] { sigUpdateEnabled(); });
+	sigGallery_->setOnPick([this](int i) {
+		if (i >= 0 && i < static_cast<int>(savedSignatures_.size()))
+			sigArm(savedSignatures_[i], /*remember=*/true); // promotes it to most-recent
+	});
+	sigGallery_->setOnDelete([this](int i) { sigDeleteSaved(i); });
+	savedSignatures_ = LoadSignatures();
+	sigGallery_->setSignatures(savedSignatures_);
+	SendMessageW(sigModeType_, BM_SETCHECK, BST_CHECKED, 0);
+	SendMessageW(sigColorBlack_, BM_SETCHECK, BST_CHECKED, 0);
 
 	// Zoom-%/page-number readouts are now plain owner-drawn text (see
 	// zoomText_'s comment) -- no permanent child windows to create here.
@@ -6082,6 +7045,10 @@ void FrameWindow::showPrintPanel(bool show)
 	if (show) {
 		if (!doc_ || !doc_->isOpen() || !canvas_) return;
 		if (textPanelVisible_) showTextEditorPanel(false); // one right-hand panel at a time
+		// Signing is a tool, not just a panel, so back out of the tool too --
+		// otherwise the canvas would still be stamping signatures on click
+		// while the print preview is up.
+		if (sigPanelVisible_) { showSignaturePanel(false); selectTool(IDM_TOOL_SELECT); }
 		// Populate the printer list fresh every time the panel opens (cheap,
 		// and picks up printers installed/removed since last time).
 		SendMessageW(printPrinterCombo_, CB_RESETCONTENT, 0, 0);
@@ -6274,6 +7241,7 @@ void FrameWindow::showTextEditorPanel(bool show, const std::wstring& initialText
 {
 	if (show) {
 		if (printPanelVisible_) showPrintPanel(false); // one right-hand panel at a time
+		if (sigPanelVisible_) { showSignaturePanel(false); selectTool(IDM_TOOL_SELECT); }
 		SetWindowTextW(textRichEdit_, initialText.c_str());
 		SendMessageW(textRichEdit_, EM_SETSEL, 0, 0);
 		textPanelVisible_ = true;
@@ -6581,6 +7549,7 @@ void FrameWindow::finishConvertToPdf(const std::vector<std::wstring>& files)
 void FrameWindow::showFileListPanel(bool show, FileListMode mode)
 {
 	if (show) {
+		if (sigPanelVisible_) { showSignaturePanel(false); selectTool(IDM_TOOL_SELECT); }
 		fileListMode_ = mode;
 		bool merge = mode == FileListMode::Merge;
 		SetWindowTextW(fileListTitle_, merge ? L"Files to Merge" : L"Files to Convert");
@@ -6622,6 +7591,194 @@ void FrameWindow::fileListAction()
 	showFileListPanel(false, mode);
 	if (mode == FileListMode::Merge) finishMerge(files);
 	else finishConvertToPdf(files);
+}
+
+void FrameWindow::drawSignatureFontItem(const DRAWITEMSTRUCT* dis)
+{
+	if (!dis || dis->itemID == static_cast<UINT>(-1)) return;
+	const auto& faces = SignatureFontFaces();
+	if (dis->itemID >= faces.size()) return;
+	const ThemeColors& th = Theme(isDark_);
+	bool selected = (dis->itemState & ODS_SELECTED) != 0;
+	HBRUSH bg = CreateSolidBrush(selected ? th.thumbSelFill : th.ctrlBg);
+	FillRect(dis->hDC, &dis->rcItem, bg);
+	DeleteObject(bg);
+	if (selected) FrameRect(dis->hDC, &dis->rcItem,
+		reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+
+	// Preview the name the user actually typed, so choosing a font is a
+	// direct visual comparison. Falls back to the face's own name while the
+	// text box is still empty.
+	wchar_t typed[256] = {};
+	GetWindowTextW(sigTextEdit_, typed, 256);
+	std::wstring sample = typed[0] ? typed : faces[dis->itemID];
+
+	UINT dpi = GetDpiForWindow(hwnd_);
+	int rowH = dis->rcItem.bottom - dis->rcItem.top;
+	Gdiplus::Graphics g(dis->hDC);
+	g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+	g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+	Gdiplus::FontFamily fam(faces[dis->itemID].c_str());
+	Gdiplus::Font font(&fam, rowH * 0.62f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+	COLORREF ink = sigColor_;
+	// Ink colors are chosen for white paper; on a dark panel a near-black
+	// signature would be invisible, so preview it in the panel's text color.
+	if (isDark_) ink = th.ctrlText;
+	Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)));
+	Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+	fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+	fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+	fmt.SetFormatFlags(fmt.GetFormatFlags() | Gdiplus::StringFormatFlagsNoWrap);
+	int inset = Scale(8, dpi);
+	Gdiplus::RectF box(static_cast<float>(dis->rcItem.left + inset), static_cast<float>(dis->rcItem.top),
+		static_cast<float>(dis->rcItem.right - dis->rcItem.left - inset * 2), static_cast<float>(rowH));
+	if (font.GetLastStatus() == Gdiplus::Ok)
+		g.DrawString(sample.c_str(), -1, &font, box, &fmt, &brush);
+}
+
+void FrameWindow::showSignaturePanel(bool show)
+{
+	if (show == sigPanelVisible_) return;
+	if (show) {
+		// One right-hand panel at a time (same rule the print/rich-text/file
+		// list panels already follow -- they all claim the same column).
+		if (printPanelVisible_) showPrintPanel(false);
+		if (textPanelVisible_) showTextEditorPanel(false);
+		if (fileListPanelVisible_) showFileListPanel(false, fileListMode_);
+		sigPanelVisible_ = true;
+		layout();
+		// The list is only sized by layout(), so scroll the selected face
+		// back into view afterwards -- otherwise the default selection can
+		// sit above the first visible row and look like it isn't there.
+		int sel = static_cast<int>(SendMessageW(sigFontList_, LB_GETCURSEL, 0, 0));
+		SendMessageW(sigFontList_, LB_SETTOPINDEX, sel > 0 ? sel : 0, 0);
+		sigUpdateEnabled();
+		if (sigMode_ == SigMode::Type) SetFocus(sigTextEdit_);
+	} else {
+		sigPanelVisible_ = false;
+		layout();
+	}
+}
+
+void FrameWindow::sigSetMode(SigMode m)
+{
+	sigMode_ = m;
+	SendMessageW(sigModeType_, BM_SETCHECK, m == SigMode::Type ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW(sigModeDraw_, BM_SETCHECK, m == SigMode::Draw ? BST_CHECKED : BST_UNCHECKED, 0);
+	layout();
+	sigUpdateEnabled();
+	if (m == SigMode::Type) SetFocus(sigTextEdit_);
+}
+
+void FrameWindow::sigSetColor(COLORREF c)
+{
+	sigColor_ = c;
+	bool black = c == RGB(0, 0, 0);
+	SendMessageW(sigColorBlack_, BM_SETCHECK, black ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW(sigColorBlue_, BM_SETCHECK, black ? BST_UNCHECKED : BST_CHECKED, 0);
+	if (sigPad_) sigPad_->setInkColor(c);
+	// The font-list previews are drawn in the ink color too, so they have to
+	// repaint when it changes.
+	InvalidateRect(sigFontList_, nullptr, TRUE);
+}
+
+bool FrameWindow::sigFromPanel(Signature& out) const
+{
+	out = Signature();
+	out.color = sigColor_;
+	if (sigMode_ == SigMode::Type) {
+		wchar_t buf[256] = {};
+		GetWindowTextW(sigTextEdit_, buf, 256);
+		out.kind = Signature::Kind::Typed;
+		out.text = buf;
+		int sel = static_cast<int>(SendMessageW(sigFontList_, LB_GETCURSEL, 0, 0));
+		const auto& faces = SignatureFontFaces();
+		out.font = faces[(sel >= 0 && sel < static_cast<int>(faces.size())) ? sel : 0];
+	} else {
+		if (!sigPad_) return false;
+		out.kind = Signature::Kind::Drawn;
+		out.strokes = sigPad_->strokes();
+		out.padAspect = sigPad_->aspect();
+	}
+	return !out.empty();
+}
+
+void FrameWindow::sigUpdateEnabled()
+{
+	Signature s;
+	EnableWindow(sigUse_, sigFromPanel(s));
+	bool canLock = doc_ && doc_->isOpen() && doc_->isPdf();
+	EnableWindow(sigLock_, canLock);
+}
+
+void FrameWindow::sigArm(const Signature& sig, bool remember)
+{
+	if (!canvas_ || sig.empty()) return;
+	std::vector<BYTE> bgra; int w = 0, h = 0;
+	// Render well above any realistic on-page size so the stamp stays sharp
+	// when the PDF is later zoomed or printed at 300+ DPI.
+	if (!RenderSignature(sig, 400, bgra, w, h)) {
+		MessageBoxW(hwnd_, L"Could not render that signature.", L"Sign", MB_OK | MB_ICONWARNING);
+		return;
+	}
+	canvas_->setPendingSignature(std::move(bgra), w, h);
+	if (remember) {
+		RememberSignature(savedSignatures_, sig);
+		if (sigGallery_) sigGallery_->setSignatures(savedSignatures_);
+	}
+	// Placing is a canvas gesture, so put focus back there -- otherwise the
+	// first page click just moves focus and the ghost never appears.
+	SetFocus(canvas_->hwnd());
+}
+
+void FrameWindow::sigUseCurrent()
+{
+	Signature s;
+	if (!sigFromPanel(s)) return;
+	sigArm(s, /*remember=*/true);
+}
+
+void FrameWindow::sigDeleteSaved(int index)
+{
+	if (index < 0 || index >= static_cast<int>(savedSignatures_.size())) return;
+	savedSignatures_.erase(savedSignatures_.begin() + index);
+	SaveSignatures(savedSignatures_);
+	if (sigGallery_) sigGallery_->setSignatures(savedSignatures_);
+}
+
+void FrameWindow::sigLockDocument()
+{
+	if (!doc_ || !doc_->isOpen() || !doc_->isPdf()) return;
+	if (canvas_) canvas_->flushPendingEdit();
+	// A real confirm, deliberately: this is irreversible in the same way
+	// Apply Redactions is (form fields stop being fields, annotations stop
+	// being annotations), which is a different risk category from the
+	// workflow dialogs the app's no-modals preference is about.
+	if (MessageBoxW(hwnd_,
+			L"Lock this document?\n\n"
+			L"Form fields and every annotation - including your signature - become part "
+			L"of the page. Nothing stays fillable or editable afterwards, and page text "
+			L"stays selectable.\n\n"
+			L"This cannot be undone.",
+			L"Finish & Lock", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+		return;
+	std::string err;
+	if (!doc_->flattenAnnotationsToContent(err)) {
+		std::wstring wmsg(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to lock the document." : wmsg.c_str(),
+			L"Finish & Lock", MB_OK | MB_ICONERROR);
+		return;
+	}
+	if (canvas_) {
+		canvas_->clearPendingSignature();
+		canvas_->refreshAfterSave();
+	}
+	if (thumbs_) thumbs_->refreshAfterSave();
+	showSignaturePanel(false);
+	selectTool(IDM_TOOL_SELECT);
+	// Nothing is on disk yet -- the shared result bar is how every other
+	// one-shot operation offers Save vs. Save a Copy.
+	showOpResultBar(true);
 }
 
 void FrameWindow::showWebPdfBar(bool show)
@@ -6777,6 +7934,22 @@ LRESULT CALLBACK FrameWindow::WebPdfEditSubclass(HWND hwnd, UINT msg, WPARAM wp,
 	if (msg == WM_KEYDOWN) {
 		if (wp == VK_RETURN) { self->runWebToPdf(); return 0; }
 		if (wp == VK_ESCAPE) { self->showWebPdfBar(false); return 0; }
+		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
+		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
+	}
+	if (msg == WM_CHAR && (wp == VK_RETURN || wp == 0x1B || wp == 0x7F)) return 0; // swallow beep
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK FrameWindow::SigTextEditSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+	UINT_PTR, DWORD_PTR ref)
+{
+	auto* self = reinterpret_cast<FrameWindow*>(ref);
+	if (msg == WM_KEYDOWN) {
+		// Enter is the obvious "I'm done typing my name" gesture -- without
+		// this it would just beep, since the frame isn't a dialog.
+		if (wp == VK_RETURN) { self->sigUseCurrent(); return 0; }
+		if (wp == VK_ESCAPE) { self->showSignaturePanel(false); self->selectTool(IDM_TOOL_SELECT); return 0; }
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
 		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
@@ -7075,7 +8248,8 @@ void FrameWindow::layout()
 	// Print and text-editor panels are mutually exclusive (see
 	// showPrintPanel()/showTextEditorPanel()) and share one right-hand
 	// column width so switching between them doesn't jitter the canvas size.
-	int rightPanelW = (printPanelVisible_ || textPanelVisible_ || fileListPanelVisible_) ? Scale(300, dpi) : 0;
+	int rightPanelW = (printPanelVisible_ || textPanelVisible_ || fileListPanelVisible_ || sigPanelVisible_)
+		? Scale(300, dpi) : 0;
 	int printPanelW = rightPanelW;
 	if (printPanelVisible_) {
 		int pad = Scale(10, dpi);
@@ -7191,6 +8365,76 @@ void FrameWindow::layout()
 	for (HWND h : { fileListTitle_, fileListAdd_, fileListAction_, fileListCancel_ }) ShowWindow(h, flsw);
 	if (fileListPanel_) ShowWindow(fileListPanel_->hwnd(), flsw);
 
+	bool sigTyping = sigPanelVisible_ && sigMode_ == SigMode::Type;
+	bool sigDrawing = sigPanelVisible_ && sigMode_ == SigMode::Draw;
+	if (sigPanelVisible_) {
+		int pad = Scale(10, dpi);
+		int rowH = Scale(22, dpi);
+		int gap = Scale(6, dpi);
+		int btnH = Scale(28, dpi);
+		int colX = fullW - rightPanelW;
+		int px = colX + pad;
+		int pw = rightPanelW - pad * 2;
+		int halfW = (pw - gap) / 2;
+		int y = top + pad;
+		MoveWindow(sigTitle_, px, y, pw, rowH, TRUE);
+		y += rowH + gap;
+		MoveWindow(sigModeType_, px, y, halfW, rowH, TRUE);
+		MoveWindow(sigModeDraw_, px + halfW + gap, y, pw - halfW - gap, rowH, TRUE);
+		y += rowH + gap * 2;
+		// Only the active mode's controls occupy vertical space; the other
+		// mode's are hidden below and never contribute to the stack, so the
+		// two layouts don't have to agree on height.
+		if (sigTyping) {
+			MoveWindow(sigTextLabel_, px, y, pw, rowH, TRUE);
+			y += rowH;
+			MoveWindow(sigTextEdit_, px, y, pw, rowH, TRUE);
+			y += rowH + gap;
+			MoveWindow(sigFontList_, px, y, pw, Scale(140, dpi), TRUE);
+			y += Scale(140, dpi) + gap;
+		} else {
+			MoveWindow(sigPadLabel_, px, y, pw, rowH, TRUE);
+			y += rowH;
+			int padH = Scale(110, dpi);
+			if (sigPad_) MoveWindow(sigPad_->hwnd(), px, y, pw, padH, TRUE);
+			y += padH + gap;
+			MoveWindow(sigClear_, px, y, pw, rowH, TRUE);
+			y += rowH + gap;
+		}
+		y += gap;
+		int inkLabelW = Scale(30, dpi);
+		int swatchW = std::max(0, (pw - inkLabelW - gap * 2) / 2);
+		MoveWindow(sigColorLabel_, px, y, inkLabelW, rowH, TRUE);
+		MoveWindow(sigColorBlack_, px + inkLabelW + gap, y, swatchW, rowH, TRUE);
+		MoveWindow(sigColorBlue_, px + inkLabelW + gap * 2 + swatchW, y,
+			pw - inkLabelW - gap * 2 - swatchW, rowH, TRUE);
+		y += rowH + gap * 2;
+		MoveWindow(sigUse_, px, y, pw, btnH, TRUE);
+		y += btnH + gap * 2;
+		MoveWindow(sigSavedLabel_, px, y, pw, rowH, TRUE);
+		y += rowH + gap / 2;
+		// Everything below the gallery is fixed-height, so the gallery takes
+		// whatever vertical space is left -- and can legitimately end up zero
+		// on a very short window, which is fine (it just isn't visible).
+		int galleryBottom = bottom - pad - btnH * 2 - gap;
+		int galleryH = std::max(0, galleryBottom - y);
+		if (sigGallery_) MoveWindow(sigGallery_->hwnd(), colX, y, rightPanelW, galleryH, TRUE);
+		y = galleryBottom + gap;
+		MoveWindow(sigLock_, px, y, pw, btnH, TRUE);
+		y += btnH + gap;
+		MoveWindow(sigClose_, px, y, pw, btnH, TRUE);
+	}
+	int ssw = sigPanelVisible_ ? SW_SHOW : SW_HIDE;
+	for (HWND h : { sigTitle_, sigModeType_, sigModeDraw_, sigColorLabel_, sigColorBlack_,
+		sigColorBlue_, sigUse_, sigSavedLabel_, sigLock_, sigClose_ })
+		ShowWindow(h, ssw);
+	for (HWND h : { sigTextLabel_, sigTextEdit_, sigFontList_ })
+		ShowWindow(h, sigTyping ? SW_SHOW : SW_HIDE);
+	for (HWND h : { sigPadLabel_, sigClear_ })
+		ShowWindow(h, sigDrawing ? SW_SHOW : SW_HIDE);
+	if (sigPad_) ShowWindow(sigPad_->hwnd(), sigDrawing ? SW_SHOW : SW_HIDE);
+	if (sigGallery_) ShowWindow(sigGallery_->hwnd(), ssw);
+
 	if (canvas_)
 		MoveWindow(canvas_->hwnd(), thumbW, top, fullW - thumbW - rightPanelW, midH, TRUE);
 }
@@ -7252,6 +8496,10 @@ void FrameWindow::switchToTab(int idx)
 	// tab switch either (and nothing here is "in progress" -- Copy already
 	// happened if the user wanted it).
 	if (textPanelVisible_) showTextEditorPanel(false);
+	// Same reasoning for the signature panel: the Sign tool is per-canvas
+	// state, so leaving it open across a tab switch would show signing UI for
+	// a tab whose canvas is back on the Select tool.
+	if (sigPanelVisible_) { showSignaturePanel(false); selectTool(IDM_TOOL_SELECT); }
 	if (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size()) && activeTab_ != idx) {
 		ShowWindow(tabs_[activeTab_]->canvas->hwnd(), SW_HIDE);
 		ShowWindow(tabs_[activeTab_]->thumbs->hwnd(), SW_HIDE);
@@ -7302,6 +8550,7 @@ void FrameWindow::closeTab(int idx)
 	// already been DestroyWindow()'d -- a use-after-free on canvas_.
 	if (printPanelVisible_) showPrintPanel(false);
 	if (textPanelVisible_) showTextEditorPanel(false);
+	if (sigPanelVisible_) showSignaturePanel(false);
 	// Make it active first so promptSaveIfDirty()/saveDocument() (which
 	// operate on doc_/canvas_) see the right document.
 	if (activeTab_ != idx) switchToTab(idx);
@@ -8015,6 +9264,7 @@ void FrameWindow::openDocument(const wchar_t* path)
 	if (!ok) {
 		pendingSetPasswordAfterOpen_ = false;
 		pendingFlattenAfterOpen_ = 0;
+		pendingSignAfterOpen_ = false;
 		std::wstring wmsg(err.begin(), err.end());
 		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to open document." : wmsg.c_str(),
 			L"Open PDF", MB_OK | MB_ICONERROR);
@@ -8049,8 +9299,16 @@ void FrameWindow::finishOpenDocument(const wchar_t* path)
 		if (which == 1) doFlatten();
 		else doFlattenEdits();
 	}
+	bool chainToSign = false;
+	if (pendingSignAfterOpen_) {
+		pendingSignAfterOpen_ = false;
+		chainToSign = doc_ && doc_->isPdf();
+	}
 	if (chainToSetPassword) showSetPasswordBar(true); // moves focus to its own edit box
+	else if (chainToSign) selectTool(IDM_TOOL_SIGN);  // opens the signature panel + focuses its text box
 	else SetFocus(canvas_->hwnd());
+	// The Lock button's enabled state depends on there being an open PDF.
+	if (sigPanelVisible_) sigUpdateEnabled();
 }
 
 void FrameWindow::toggleThumbs()
@@ -8220,11 +9478,28 @@ void FrameWindow::onCommand(int id)
 	case IDC_FILELIST_ADD: fileListAddFiles(); break;
 	case IDC_FILELIST_ACTION: fileListAction(); break;
 	case IDC_FILELIST_CANCEL: fileListCancel(); break;
+	case IDC_SIG_MODE_TYPE: sigSetMode(SigMode::Type); break;
+	case IDC_SIG_MODE_DRAW: sigSetMode(SigMode::Draw); break;
+	case IDC_SIG_COLOR_BLACK: sigSetColor(RGB(0, 0, 0)); break;
+	// Not pure blue: a slightly deep navy reads like real ballpoint ink
+	// against a white page, where 0000FF looks like a screen color.
+	case IDC_SIG_COLOR_BLUE: sigSetColor(RGB(16, 42, 140)); break;
+	case IDC_SIG_CLEAR: if (sigPad_) sigPad_->clear(); break;
+	case IDC_SIG_USE: sigUseCurrent(); break;
+	case IDC_SIG_LOCK:
+	case IDM_TOOLS_SIGN_LOCK: sigLockDocument(); break;
+	case IDC_SIG_CLOSE: showSignaturePanel(false); selectTool(IDM_TOOL_SELECT); break;
+	case IDM_EMPTY_SIGN: {
+		std::wstring p = OpenFileDialog(hwnd_);
+		if (!p.empty()) { pendingSignAfterOpen_ = true; openDocument(p.c_str()); }
+		break;
+	}
 	case IDM_TOOL_SELECT:
 	case IDM_TOOL_HIGHLIGHT:
 	case IDM_TOOL_DRAW:
 	case IDM_TOOL_ERASE:
 	case IDM_TOOL_TEXT:
+	case IDM_TOOL_SIGN:
 	case IDM_TOOL_REDACT: selectTool(id); break;
 	case IDM_TOOL_COLOR: chooseColor(); break;
 	case IDM_TOOL_WIDTH: chooseWidth(); break;
@@ -8267,13 +9542,26 @@ void FrameWindow::selectTool(int id)
 	case IDM_TOOL_DRAW: t = CanvasView::Tool::Draw; break;
 	case IDM_TOOL_ERASE: t = CanvasView::Tool::Erase; break;
 	case IDM_TOOL_TEXT: t = CanvasView::Tool::Text; break;
+	case IDM_TOOL_SIGN: t = CanvasView::Tool::Sign; break;
 	case IDM_TOOL_REDACT: t = CanvasView::Tool::Redact; break;
 	default: t = CanvasView::Tool::Select; break;
 	}
 	if (canvas_) canvas_->setTool(t);
-	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
+	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE,
+		IDM_TOOL_TEXT, IDM_TOOL_SIGN, IDM_TOOL_REDACT })
 		SendMessageW(toolbar_, TB_CHECKBUTTON, b, MAKELPARAM(b == id, 0));
 	updateRedactBar();
+	// The signature panel IS the Sign tool's UI, so it follows the tool
+	// selection rather than being opened separately (mirrors how the redact
+	// bar tracks the Redact tool). Leaving Sign also disarms the pending
+	// signature, so switching tools and back doesn't silently keep a stale
+	// one loaded with no visible sign that it's armed.
+	if (t == CanvasView::Tool::Sign) {
+		showSignaturePanel(true);
+	} else if (sigPanelVisible_) {
+		showSignaturePanel(false);
+		if (canvas_) canvas_->clearPendingSignature();
+	}
 }
 
 void FrameWindow::chooseColor()
@@ -8319,6 +9607,10 @@ void FrameWindow::showToolsMenu()
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_RESIZE_A4, L"Resize Pages to A4");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN, L"Flatten to Image (Read-Only)");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN_EDITS, L"Flatten Edits Only (Keep Text Selectable)");
+	// Same underlying operation as Flatten Edits Only, but named for the
+	// signing workflow (and it confirms first, since that's how people reach
+	// it -- "I'm done signing" rather than "flatten annotations").
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_SIGN_LOCK, L"Finish && Lock (Make Read-Only)...");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_COMPRESS, L"Compress PDF");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_SET_PASSWORD, L"Set Password...");
@@ -8584,6 +9876,14 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			SetTimer(hwnd, 1 /*IDT_SEARCH*/, 150, nullptr);
 			return 0;
 		}
+		// The font list previews the name being typed in each face, so every
+		// keystroke has to repaint it -- and "Use This Signature" only makes
+		// sense once there's actually something to render.
+		if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == IDC_SIG_TEXT_EDIT) {
+			InvalidateRect(self->sigFontList_, nullptr, TRUE);
+			self->sigUpdateEnabled();
+			return 0;
+		}
 		// onCommand only takes the id (see below), so the case-converter
 		// combo's notification code has to be checked here -- it must react
 		// only to an actual selection change, not every WM_COMMAND a combo
@@ -8815,6 +10115,10 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		if (dis->hwndItem == self->status_) {
 			self->drawStatusBarItem(dis);
+			return TRUE;
+		}
+		if (dis->hwndItem == self->sigFontList_) {
+			self->drawSignatureFontItem(dis);
 			return TRUE;
 		}
 		break;
@@ -9094,6 +10398,8 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 	CanvasView::Register(hInstance);
 	ThumbPanel::Register(hInstance);
 	FileListPanel::Register(hInstance);
+	SignaturePad::Register(hInstance);
+	SignatureGallery::Register(hInstance);
 
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = FrameWindow::Proc;

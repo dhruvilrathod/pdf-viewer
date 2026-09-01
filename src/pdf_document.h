@@ -47,7 +47,11 @@ struct PageChar {
 
 // An existing markup annotation (free text, highlight, ink, ...) found under
 // a point, for click-to-edit / delete support.
-enum class AnnotKind { None, FreeText, Highlight, Ink, Other };
+// Stamp covers image stamps -- in practice the Sign tool's placed
+// signatures (PdfDocument::addImageStamp). Classified rather than lumped
+// into Other so a misplaced signature is still findable by annotAt() and can
+// therefore be erased/removed like any other markup.
+enum class AnnotKind { None, FreeText, Highlight, Ink, Stamp, Other };
 struct AnnotInfo {
 	int index = -1;    // stable index into this page's pdf_first_annot/next_annot enumeration
 	AnnotKind kind = AnnotKind::None;
@@ -158,6 +162,14 @@ public:
 	bool setFreeTextAnnot(int page, int annotIndex, const std::string& utf8,
 		float fontSize, unsigned long color, PageRectPt rect, std::string& err);
 	bool deleteAnnot(int page, int annotIndex, std::string& err);
+	// Moves/resizes an existing annotation to `rect` (page-space points).
+	// The annotation's appearance stream stretches its own /BBox onto /Rect,
+	// so this rescales what's drawn without regenerating it -- which is what
+	// backs dragging a placed signature's resize handles. Safe for any
+	// annotation whose Rect is authoritative (Stamp/Square/FreeText/...);
+	// pointless for ones whose Rect is derived (Ink/Highlight), where MuPDF
+	// recomputes it from the InkList/QuadPoints instead.
+	bool setAnnotRect(int page, int annotIndex, PageRectPt rect, std::string& err);
 
 	// Annotation creation. Each returns false + fills `err` on failure and
 	// marks the document dirty on success. color is 0xRRGGBB (COLORREF-style).
@@ -175,6 +187,19 @@ public:
 	// UI font is not Helvetica, so its widths don't predict MuPDF's wrapping.
 	PageSizePt measureFreeText(const std::string& utf8, const std::string& font,
 		float sizePt, float maxWidthPt) const;
+	// Stamps a raster image onto `page`, filling `rect`, as a Stamp annotation
+	// whose /AP /N draws the image across its whole bounding box. `bgra` is
+	// `w`*`h` premultiplied top-down BGRA (the layout GDI+'s
+	// PixelFormat32bppPARGB uses, and what RenderSignature() produces); its
+	// alpha channel becomes an /SMask, so a transparent-background signature
+	// composites correctly over whatever page content sits underneath.
+	// Backs the Sign tool -- this is an ordinary annotation, so a placed
+	// signature stays movable/deletable until "Finish & Lock" bakes it in via
+	// flattenAnnotationsToContent(). NOT a cryptographic /Sig field: there's
+	// no certificate, no signing time, no audit trail, by design.
+	bool addImageStamp(int page, PageRectPt rect, const unsigned char* bgra,
+		int w, int h, std::string& err);
+
 	// Marks a region for redaction (shown as a solid black box). Nothing is
 	// actually removed from the page until applyRedactions().
 	bool addRedaction(int page, PageRectPt rect, std::string& err);

@@ -872,6 +872,80 @@ PageSizePt PdfDocument::measureFreeText(const std::string& utf8, const std::stri
 	return out;
 }
 
+bool PdfDocument::addImageStamp(int page, PageRectPt rect, const unsigned char* bgra,
+	int w, int h, std::string& err)
+{
+	if (!bgra || w <= 0 || h <= 0) { err = "empty image"; return false; }
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	fz_rect r = normRect(rect);
+	if (r.x1 - r.x0 < 1.0f || r.y1 - r.y0 < 1.0f) { err = "target area too small"; return false; }
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	pdf_page* pg = nullptr;
+	pdf_annot* annot = nullptr;
+	fz_pixmap* pix = nullptr;
+	fz_image* img = nullptr;
+	pdf_obj* imgRef = nullptr;
+	pdf_obj* res = nullptr;
+	fz_buffer* contents = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		// MuPDF pixmaps with an alpha channel are premultiplied, same as the
+		// incoming GDI+ PARGB buffer, so only the component ORDER differs
+		// (BGRA -> RGBA). pdf_add_image then splits the alpha back out into an
+		// /SMask and un-premultiplies the color planes itself.
+		pix = fz_new_pixmap(ctx_, fz_device_rgb(ctx_), w, h, nullptr, 1);
+		for (int y = 0; y < h; ++y) {
+			const unsigned char* src = bgra + static_cast<size_t>(y) * w * 4;
+			unsigned char* dst = pix->samples + static_cast<size_t>(y) * pix->stride;
+			for (int x = 0; x < w; ++x) {
+				dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = src[3];
+				src += 4; dst += 4;
+			}
+		}
+		img = fz_new_image_from_pixmap(ctx_, pix, nullptr);
+
+		pg = pdf_load_page(ctx_, pdf, page);
+		annot = pdf_create_annot(ctx_, pg, PDF_ANNOT_STAMP);
+		pdf_set_annot_rect(ctx_, annot, r);
+		// Must print: the whole point of a signature is that it shows up on
+		// paper and in every other viewer, not just on screen here.
+		pdf_set_annot_flags(ctx_, annot, PDF_ANNOT_IS_PRINT);
+
+		float bw = r.x1 - r.x0, bh = r.y1 - r.y0;
+		imgRef = pdf_add_image(ctx_, pdf, img);
+		res = pdf_new_dict(ctx_, pdf, 1);
+		pdf_obj* xobj = pdf_dict_put_dict(ctx_, res, PDF_NAME(XObject), 1);
+		pdf_dict_puts(ctx_, xobj, "Im0", imgRef);
+		contents = fz_new_buffer(ctx_, 64);
+		// An image XObject always draws into the unit square of the current
+		// transform, so this scales it to exactly fill the form's BBox --
+		// which the viewer in turn maps onto the annotation's /Rect.
+		fz_append_printf(ctx_, contents, "q %g 0 0 %g 0 0 cm /Im0 Do Q", bw, bh);
+		// Sets /AP /N directly (and marks the annotation as already
+		// resynthesised), so do NOT follow this with pdf_update_annot --
+		// that would hand the appearance back to MuPDF's own generator.
+		pdf_set_annot_appearance(ctx_, annot, "N", nullptr, fz_identity,
+			fz_make_rect(0, 0, bw, bh), res, contents);
+		ok = true;
+	}
+	fz_always(ctx_) {
+		if (contents) fz_drop_buffer(ctx_, contents);
+		if (res) pdf_drop_obj(ctx_, res);
+		if (imgRef) pdf_drop_obj(ctx_, imgRef);
+		if (img) fz_drop_image(ctx_, img);
+		if (pix) fz_drop_pixmap(ctx_, pix);
+		if (annot) pdf_drop_annot(ctx_, annot);
+		if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg));
+	}
+	fz_catch(ctx_) {
+		err = fz_caught_message(ctx_); ok = false;
+	}
+	if (ok) dirty_ = true;
+	return ok;
+}
+
 bool PdfDocument::addRedaction(int page, PageRectPt rect, std::string& err)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
@@ -1169,6 +1243,7 @@ AnnotInfo describeAnnot(fz_context* ctx, pdf_annot* a, int idx)
 	}
 	case PDF_ANNOT_HIGHLIGHT: info.kind = AnnotKind::Highlight; break;
 	case PDF_ANNOT_INK: info.kind = AnnotKind::Ink; break;
+	case PDF_ANNOT_STAMP: info.kind = AnnotKind::Stamp; break;
 	default: info.kind = AnnotKind::Other; break;
 	}
 	return info;
@@ -1277,6 +1352,39 @@ bool PdfDocument::deleteAnnot(int page, int annotIndex, std::string& err)
 		pg = pdf_load_page(ctx_, pdf, page);
 		pdf_annot* a = annotByIndex(ctx_, pg, annotIndex);
 		if (a) { pdf_delete_annot(ctx_, pg, a); ok = true; }
+	}
+	fz_always(ctx_) { if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg)); }
+	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }
+	if (ok) dirty_ = true;
+	return ok;
+}
+
+bool PdfDocument::setAnnotRect(int page, int annotIndex, PageRectPt rect, std::string& err)
+{
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	fz_rect r = normRect(rect);
+	if (r.x1 - r.x0 < 1.0f || r.y1 - r.y0 < 1.0f) { err = "target area too small"; return false; }
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	pdf_page* pg = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		pg = pdf_load_page(ctx_, pdf, page);
+		pdf_annot* a = annotByIndex(ctx_, pg, annotIndex);
+		if (a) {
+			pdf_set_annot_rect(ctx_, a, r);
+			// The annotation's /AP /N form stretches its own /BBox onto /Rect,
+			// so moving/resizing the rect rescales the existing appearance for
+			// free -- no need to regenerate anything. But pdf_set_annot_rect
+			// DIRTIES the annotation, and MuPDF's own generator does handle
+			// Stamp (pdf_write_stamp_appearance): letting it resynthesise would
+			// throw away our signature image and draw a generic rubber stamp in
+			// its place. Declaring it already-resynthesised keeps ours.
+			pdf_set_annot_resynthesised(ctx_, a);
+			ok = true;
+		} else {
+			err = "annotation not found";
+		}
 	}
 	fz_always(ctx_) { if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg)); }
 	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }

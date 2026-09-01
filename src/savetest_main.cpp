@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <cmath>
 #include "pdf_document.h"
 #include "webview_convert.h"
+#include "signature.h"
+#include <gdiplus.h>
 
 namespace {
 std::string ToUtf8(const wchar_t* w)
@@ -733,6 +736,168 @@ int wmain(int argc, wchar_t** argv)
 			if (!b.hbmp) { std::printf("RENDER FAILED on page %d\n", p); return 3; }
 		}
 		std::printf("compressed file reopened + all pages rendered OK\n");
+		return 0;
+	}
+
+	// --signtest mode: exercises the Sign tool's PDF layer headlessly --
+	// RenderSignature() (both typed and drawn) -> addImageStamp() -> save ->
+	// reopen -> render, then a second pass through flattenAnnotationsToContent()
+	// (what "Finish & Lock" runs) to confirm the stamps bake in and every form
+	// widget really does go away. Writes <output> and <output>.locked.pdf.
+	if (argc > 3 && wcscmp(argv[3], L"--signtest") == 0) {
+		// RenderSignature() draws with GDI+, which the GUI app starts up in
+		// wWinMain -- this console harness has to do it itself.
+		Gdiplus::GdiplusStartupInput gdipIn;
+		ULONG_PTR gdipToken = 0;
+		if (Gdiplus::GdiplusStartup(&gdipToken, &gdipIn, nullptr) != Gdiplus::Ok) {
+			std::printf("GdiplusStartup FAILED\n");
+			return 1;
+		}
+		struct GdipShutdown {
+			ULONG_PTR t;
+			~GdipShutdown() { Gdiplus::GdiplusShutdown(t); }
+		} gdipGuard{ gdipToken };
+
+		const std::vector<std::wstring>& faces = SignatureFontFaces();
+		std::printf("handwriting fonts installed: %zu\n", faces.size());
+		for (const auto& f : faces) std::printf("  %ls\n", f.c_str());
+
+		Signature typed;
+		typed.kind = Signature::Kind::Typed;
+		typed.text = argc > 4 ? argv[4] : L"Jane Q. Sample";
+		typed.font = faces.front();
+		typed.color = RGB(0, 0, 0);
+
+		// A simple two-stroke scribble, in the same normalized pad space the
+		// signature pad captures into.
+		Signature drawn;
+		drawn.kind = Signature::Kind::Drawn;
+		drawn.padAspect = 3.0f;
+		drawn.color = RGB(0, 40, 160);
+		std::vector<SigPoint> s1, s2;
+		for (int i = 0; i <= 40; ++i) {
+			float t = i / 40.0f;
+			s1.push_back({ 0.05f + t * 0.6f, 0.6f - 0.35f * std::sin(t * 6.2f) });
+		}
+		for (int i = 0; i <= 10; ++i) s2.push_back({ 0.70f + i * 0.02f, 0.30f + i * 0.03f });
+		drawn.strokes.push_back(s1);
+		drawn.strokes.push_back(s2);
+
+		PdfDocument doc;
+		std::string e; bool npw = false;
+		if (!doc.open(input, e, npw)) { std::printf("open failed: %s\n", e.c_str()); return 1; }
+		std::printf("opened: %d pages\n", doc.pageCount());
+		if (doc.pageCount() < 1) { std::printf("no pages\n"); return 1; }
+
+		int placed = 0;
+		float y = 60.0f;
+		for (const Signature* sig : { &typed, &drawn }) {
+			std::vector<BYTE> bgra; int w = 0, h = 0;
+			if (!RenderSignature(*sig, 320, bgra, w, h)) {
+				std::printf("RenderSignature FAILED (%s)\n",
+					sig->kind == Signature::Kind::Typed ? "typed" : "drawn");
+				return 2;
+			}
+			std::printf("rendered %s: %dx%d px (aspect %.2f)\n",
+				sig->kind == Signature::Kind::Typed ? "typed" : "drawn", w, h,
+				h ? static_cast<double>(w) / h : 0.0);
+			// Place at a fixed 180pt width, aspect preserved -- the same shape
+			// the canvas's click-to-drop placement uses.
+			float wPt = 180.0f, hPt = wPt * h / static_cast<float>(w);
+			PageRectPt rect{ 60.0f, y, 60.0f + wPt, y + hPt };
+			if (!doc.addImageStamp(0, rect, bgra.data(), w, h, e)) {
+				std::printf("addImageStamp FAILED: %s\n", e.c_str());
+				return 3;
+			}
+			y += hPt + 20.0f;
+			++placed;
+		}
+		std::printf("placed %d stamp(s); dirty=%d\n", placed, doc.dirty() ? 1 : 0);
+
+		// Resize/move the stamps via setAnnotRect (what the resize handles do)
+		// and confirm the image appearance survives -- MuPDF has its own Stamp
+		// appearance generator that would otherwise replace it.
+		{
+			auto before = doc.pageAnnots(0);
+			int resized = 0;
+			for (const auto& ai : before) {
+				if (ai.kind != AnnotKind::Stamp) continue;
+				float w = ai.rect.x1 - ai.rect.x0, h = ai.rect.y1 - ai.rect.y0;
+				// Grow 1.5x and shift right/down, i.e. both a resize and a move.
+				PageRectPt moved{ ai.rect.x0 + 25.0f, ai.rect.y0 + 10.0f,
+					ai.rect.x0 + 25.0f + w * 1.5f, ai.rect.y0 + 10.0f + h * 1.5f };
+				if (!doc.setAnnotRect(0, ai.index, moved, e)) {
+					std::printf("setAnnotRect FAILED on annot %d: %s\n", ai.index, e.c_str());
+					return 14;
+				}
+				++resized;
+			}
+			std::printf("resized %d stamp(s)\n", resized);
+			if (resized == 0) { std::printf("FAIL: no stamps found to resize\n"); return 15; }
+			auto after = doc.pageAnnots(0);
+			for (size_t i = 0; i < before.size() && i < after.size(); ++i) {
+				if (before[i].kind != AnnotKind::Stamp) continue;
+				float bw = before[i].rect.x1 - before[i].rect.x0;
+				float aw = after[i].rect.x1 - after[i].rect.x0;
+				std::printf("  annot %d width %.1f -> %.1f\n", before[i].index, bw, aw);
+				if (aw < bw * 1.4f) { std::printf("FAIL: resize did not take effect\n"); return 16; }
+			}
+		}
+
+		if (!doc.save(output, false, e)) { std::printf("save FAILED: %s\n", e.c_str()); return 4; }
+
+		PdfDocument doc2; std::string e2; bool npw2 = false;
+		if (!doc2.open(output, e2, npw2)) { std::printf("REOPEN FAILED: %s\n", e2.c_str()); return 5; }
+		auto annots = doc2.pageAnnots(0);
+		std::printf("reopened OK; page 0 reports %zu markup annot(s)\n", annots.size());
+		// Dump page 0 to PNG so the stamps can be eyeballed: "renders without
+		// error" is NOT enough here -- if MuPDF ever resynthesised the Stamp
+		// appearance it would draw a generic rubber stamp and still succeed.
+		{
+			PageBitmap pb = doc2.renderPage(0, 1.5f);
+			if (pb.hbmp) {
+				Gdiplus::Bitmap bmp(pb.hbmp, nullptr);
+				CLSID pngClsid = { 0x557cf406, 0x1a04, 0x11d3,
+					{ 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } }; // image/png
+				std::wstring png = std::wstring(output) + L".page0.png";
+				if (bmp.Save(png.c_str(), &pngClsid, nullptr) == Gdiplus::Ok)
+					std::printf("wrote %ls (%dx%d)\n", png.c_str(), pb.width, pb.height);
+			}
+		}
+		for (int p = 0; p < doc2.pageCount(); ++p) {
+			PageBitmap b = doc2.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("RENDER FAILED on page %d\n", p); return 6; }
+		}
+		std::printf("all pages rendered OK\n");
+
+		// Now the "Finish & Lock" half: bake everything in, confirm no live
+		// widgets survive and page text is still extractable.
+		size_t widgetsBefore = doc2.pageWidgets(0).size();
+		size_t charsBefore = doc2.pageChars(0).size();
+		if (!doc2.flattenAnnotationsToContent(e2)) {
+			std::printf("flattenAnnotationsToContent FAILED: %s\n", e2.c_str());
+			return 7;
+		}
+		std::wstring lockedPath = std::wstring(output) + L".locked.pdf";
+		if (!doc2.save(lockedPath.c_str(), false, e2)) { std::printf("locked save FAILED: %s\n", e2.c_str()); return 8; }
+		PdfDocument doc3; std::string e3; bool npw3 = false;
+		if (!doc3.open(lockedPath.c_str(), e3, npw3)) { std::printf("LOCKED REOPEN FAILED: %s\n", e3.c_str()); return 9; }
+		size_t widgetsAfter = doc3.pageWidgets(0).size();
+		size_t annotsAfter = doc3.pageAnnots(0).size();
+		size_t charsAfter = doc3.pageChars(0).size();
+		std::printf("locked: widgets %zu -> %zu, annots -> %zu, page chars %zu -> %zu\n",
+			widgetsBefore, widgetsAfter, annotsAfter, charsBefore, charsAfter);
+		if (widgetsAfter != 0) { std::printf("FAIL: form widgets survived the lock\n"); return 10; }
+		if (annotsAfter != 0) { std::printf("FAIL: annotations survived the lock\n"); return 11; }
+		// Baking only ever APPENDS to page content, so extractable text can
+		// grow (widget/free-text values become real content) but must never
+		// shrink -- see the flatten notes in pdf_document.cpp.
+		if (charsAfter < charsBefore) { std::printf("FAIL: page text shrank after locking\n"); return 12; }
+		for (int p = 0; p < doc3.pageCount(); ++p) {
+			PageBitmap b = doc3.renderPage(p, 1.0f);
+			if (!b.hbmp) { std::printf("LOCKED RENDER FAILED on page %d\n", p); return 13; }
+		}
+		std::printf("locked file reopened + all pages rendered OK\n");
 		return 0;
 	}
 
