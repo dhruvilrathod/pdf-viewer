@@ -2525,6 +2525,112 @@ bool PdfDocument::flattenToImages(std::string& err)
 	return true;
 }
 
+namespace {
+
+// Marks a page whose original content has already been sealed into a form
+// XObject by isolatePageContents(), so repeated flattens don't nest wrappers.
+const char* kFlatBaseMark = "PDFastFlatBase";
+
+// Seals a page's existing content stream(s) inside a Form XObject and replaces
+// /Contents with a single "q /PDFastBase Do Q".
+//
+// WHY: flattenAnnotationsToContent APPENDS the baked annotations to the page's
+// content, and PDF concatenates a /Contents array into ONE stream. So the baked
+// content inherits whatever graphics state the original left behind -- and
+// real-world PDFs (forms exported by Word and friends especially) very often
+// leave a dangling `q` or a top-level `cm`. When that happens the baked
+// annotations render translated, scaled, and -- with a negative y factor --
+// UPSIDE DOWN; flatten again and they're transformed a second time and vanish
+// off the page entirely. It looks fine before flattening because MuPDF's own
+// renderer draws annotations from a clean state, which is exactly the state
+// this restores.
+//
+// A form XObject invocation is atomic to the enclosing stream (the `Do`
+// operator saves and restores the graphics state around it, per the spec), so
+// nothing inside can leak out -- the same reasoning resizeToA4() already uses
+// for the same hazard. Counting `q`/`Q` to emit balancing `Q`s would NOT be
+// enough: a bare top-level `cm` with no `q` at all is perfectly balanced and
+// still corrupts everything appended after it.
+void isolatePageContents(fz_context* ctx, pdf_document* pdf, pdf_obj* page_ref)
+{
+	if (pdf_dict_gets(ctx, page_ref, kFlatBaseMark)) return; // already sealed
+	pdf_obj* contents = pdf_dict_get(ctx, page_ref, PDF_NAME(Contents));
+	if (!contents) return; // nothing to isolate
+
+	fz_buffer* all = nullptr;
+	pdf_obj* form = nullptr;
+	fz_var(all);
+	fz_var(form);
+	fz_try(ctx) {
+		// Concatenate exactly what the viewer would concatenate, newline-joined
+		// (an array's parts are separate lexical units -- joining without one
+		// can fuse the last operator of a part to the first of the next).
+		all = fz_new_buffer(ctx, 1024);
+		if (pdf_is_array(ctx, contents)) {
+			int n = pdf_array_len(ctx, contents);
+			for (int i = 0; i < n; ++i) {
+				fz_buffer* part = pdf_load_stream(ctx, pdf_array_get(ctx, contents, i));
+				fz_try(ctx) {
+					unsigned char* data = nullptr;
+					size_t len = fz_buffer_storage(ctx, part, &data);
+					fz_append_data(ctx, all, data, len);
+					fz_append_byte(ctx, all, '\n');
+				}
+				fz_always(ctx) { fz_drop_buffer(ctx, part); }
+				fz_catch(ctx) { fz_rethrow(ctx); }
+			}
+		} else {
+			fz_buffer* part = pdf_load_stream(ctx, contents);
+			fz_try(ctx) {
+				unsigned char* data = nullptr;
+				size_t len = fz_buffer_storage(ctx, part, &data);
+				fz_append_data(ctx, all, data, len);
+				fz_append_byte(ctx, all, '\n');
+			}
+			fz_always(ctx) { fz_drop_buffer(ctx, part); }
+			fz_catch(ctx) { fz_rethrow(ctx); }
+		}
+
+		// The form keeps the page's ORIGINAL resources (inheritable -- a page
+		// may take them from the Pages tree rather than hold its own).
+		pdf_obj* origRes = pdf_dict_get_inheritable(ctx, page_ref, PDF_NAME(Resources));
+		// BBox must cover the whole page or content gets clipped away. Use the
+		// MediaBox, likewise inheritable.
+		fz_rect box = pdf_dict_get_rect(ctx, page_ref, PDF_NAME(MediaBox));
+		if (fz_is_empty_rect(box)) {
+			pdf_obj* mb = pdf_dict_get_inheritable(ctx, page_ref, PDF_NAME(MediaBox));
+			box = mb ? pdf_to_rect(ctx, mb) : fz_make_rect(0, 0, 612, 792);
+		}
+		form = pdf_new_xobject(ctx, pdf, box, fz_identity, origRes, all);
+
+		// Give the page a FRESH resources dict holding just the wrapper, rather
+		// than adding the form into origRes -- the form's own /Resources is
+		// origRes, so that would make it reference itself.
+		pdf_obj* newRes = pdf_new_dict(ctx, pdf, 1);
+		pdf_obj* xo = pdf_dict_put_dict(ctx, newRes, PDF_NAME(XObject), 1);
+		pdf_dict_puts(ctx, xo, "PDFastBase", form);
+		pdf_dict_put_drop(ctx, page_ref, PDF_NAME(Resources), newRes);
+
+		fz_buffer* invoke = fz_new_buffer(ctx, 32);
+		fz_try(ctx) {
+			fz_append_string(ctx, invoke, "q /PDFastBase Do Q\n");
+			pdf_obj* ref = pdf_add_stream(ctx, pdf, invoke, nullptr, 0);
+			pdf_dict_put_drop(ctx, page_ref, PDF_NAME(Contents), ref);
+		}
+		fz_always(ctx) { fz_drop_buffer(ctx, invoke); }
+		fz_catch(ctx) { fz_rethrow(ctx); }
+
+		pdf_dict_puts(ctx, page_ref, kFlatBaseMark, PDF_TRUE);
+	}
+	fz_always(ctx) {
+		pdf_drop_obj(ctx, form);
+		fz_drop_buffer(ctx, all);
+	}
+	fz_catch(ctx) { fz_rethrow(ctx); }
+}
+
+} // namespace
+
 bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
@@ -2552,6 +2658,15 @@ bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 						pdf_obj* ap = pdf_annot_ap(ctx_, a);
 						if (!ap) return; // no visible appearance (e.g. a pending redaction mark, or an unfilled field) -- nothing to bake
 						if (!xobjDict) {
+							// First thing we bake on this page: seal the page's
+							// own content into a form XObject so what follows
+							// starts from a clean graphics state instead of
+							// inheriting a dangling `q`/`cm` from it. Must
+							// happen BEFORE the resources below are fetched --
+							// it gives the page a fresh /Resources, and reading
+							// them first would add the baked XObjects to a dict
+							// that is about to be replaced.
+							isolatePageContents(ctx_, pdf, page_ref);
 							pdf_obj* res = pdf_dict_get(ctx_, page_ref, PDF_NAME(Resources));
 							if (!res) res = pdf_dict_put_dict(ctx_, page_ref, PDF_NAME(Resources), 2);
 							xobjDict = pdf_dict_get(ctx_, res, PDF_NAME(XObject));
@@ -2559,7 +2674,17 @@ bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 						}
 						fz_matrix m = pdf_annot_transform(ctx_, a);
 						char name[32];
-						snprintf(name, sizeof(name), "FlatAnnot%d", counter++);
+						// Skip past any name a PREVIOUS flatten already left in
+						// this page's resources. Blindly restarting at
+						// "FlatAnnot0" would rebind that earlier name to THIS
+						// annotation, so the earlier flatten's own `Do` -- still
+						// sitting in the content stream -- would draw this one
+						// instead, and whatever it had baked would vanish. That
+						// is exactly the "flatten, add more text, flatten again
+						// and the first text is gone" report.
+						do {
+							snprintf(name, sizeof(name), "FlatAnnot%d", counter++);
+						} while (pdf_dict_gets(ctx_, xobjDict, name) != nullptr);
 						pdf_dict_puts(ctx_, xobjDict, name, ap);
 						fz_append_printf(ctx_, extra, "q %g %g %g %g %g %g cm /%s Do Q\n",
 							m.a, m.b, m.c, m.d, m.e, m.f, name);
