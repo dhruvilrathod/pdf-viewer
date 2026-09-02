@@ -36,6 +36,7 @@
 #define IDM_EDIT_COPY        1043
 #define IDM_EDIT_SELECTALL   1044
 #define IDM_EDIT_PASTE       1045  // Ctrl+V: paste a copied signature at the cursor
+#define IDM_CANCEL_SIGN      1046  // Escape while signing: back to Select (no-op otherwise)
 
 #define IDM_HELP_ABOUT       1030
 #define IDM_HELP_CHECKUPDATE 1031  // Tools menu: manual "Check for Updates"

@@ -4481,19 +4481,21 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		case VK_HOME:  self->onVScroll(SB_TOP); return 0;
 		case VK_END:   self->onVScroll(SB_BOTTOM); return 0;
 		case VK_ESCAPE:
-			// Deselecting a signature comes first: if one is selected, Escape
-			// is much more likely to mean "drop the selection" than "leave
-			// the tool", and a second Escape still does the latter.
-			if (self->stampSelected()) { self->clearStampSelection(); return 0; }
-			// Otherwise Escape backs out of the Sign tool, which the
-			// status-bar hint promises. onExitTextTool_ is just "drop back to
-			// Select" (the frame binds it to selectTool(IDM_TOOL_SELECT)),
-			// which also closes the signature panel and disarms the pending
-			// signature.
+			// Escape means "stop signing" -- back to the Select tool, so the
+			// pointer returns to a normal arrow. This has to come BEFORE the
+			// deselect below: placing a signature leaves it selected, so a
+			// deselect-first Escape would swallow the keystroke and strand the
+			// user in the Sign tool still holding a crosshair.
 			if (self->tool_ == Tool::Sign) {
+				self->clearStampSelection();
+				// onExitTextTool_ is "drop back to Select" (the frame binds it
+				// to selectTool(IDM_TOOL_SELECT)), which also closes the
+				// signature panel and disarms the pending signature.
 				if (self->onExitTextTool_) self->onExitTextTool_();
 				return 0;
 			}
+			// Under any other tool, Escape just drops a signature selection.
+			if (self->stampSelected()) { self->clearStampSelection(); return 0; }
 			break;
 		case VK_DELETE:
 		case VK_BACK:
@@ -9684,6 +9686,12 @@ void FrameWindow::onCommand(int id)
 		if (canvas_) canvas_->copySelectionToClipboard();
 		break;
 	case IDM_EDIT_PASTE: if (canvas_) canvas_->pasteStamp(); break;
+	case IDM_CANCEL_SIGN:
+		// Escape from anywhere while signing. Deliberately a no-op under every
+		// other tool, so the message loop can fire it on any Escape without
+		// having to know what else that keystroke might be for.
+		if (canvas_ && canvas_->tool() == CanvasView::Tool::Sign) selectTool(IDM_TOOL_SELECT);
+		break;
 	case IDM_EDIT_SELECTALL: if (canvas_) canvas_->selectAll(); break;
 	case IDM_EDIT_FIND: showSearchBar(true); break;
 	case IDM_EDIT_FINDNEXT:
@@ -10741,6 +10749,20 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 		// dragging a tab out / "Open in New Window" means more than one can
 		// now exist on this same thread's message queue.
 		HWND active = GetActiveWindow();
+		// Escape leaves the Sign tool no matter what has focus. The canvas
+		// handles its own Escape, but the signature panel's buttons, font list
+		// and date picker would otherwise swallow it and strand the user in
+		// the tool holding a crosshair. Sent (not translated) so the keystroke
+		// still reaches its normal handler afterwards -- the command is a
+		// no-op unless the Sign tool is actually active, and edit controls are
+		// left alone since theirs close bars/commit text.
+		if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE && active) {
+			wchar_t cls[32] = {};
+			HWND focused = GetFocus();
+			bool inEdit = focused && GetClassNameW(focused, cls, 32) &&
+				(_wcsicmp(cls, L"Edit") == 0 || _wcsnicmp(cls, L"RichEdit", 8) == 0);
+			if (!inEdit) SendMessageW(active, WM_COMMAND, IDM_CANCEL_SIGN, 0);
+		}
 		if (skipAccel || !active || !TranslateAcceleratorW(active, accel, &msg)) {
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
