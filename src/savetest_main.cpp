@@ -6,6 +6,11 @@
 #include <vector>
 #include "pdf_document.h"
 #include "webview_convert.h"
+#include <gdiplus.h>
+#include <cmath>
+// PNG dumps in --flattentest; the shipped app links gdiplus via CMake, this
+// diagnostic tool asks for it directly so CMakeLists stays untouched.
+#pragma comment(lib, "gdiplus.lib")
 
 namespace {
 std::string ToUtf8(const wchar_t* w)
@@ -734,6 +739,138 @@ int wmain(int argc, wchar_t** argv)
 		}
 		std::printf("compressed file reopened + all pages rendered OK\n");
 		return 0;
+	}
+
+	// --flattentest mode: reproduces the real "add text -> Flatten Edits Only
+	// -> save -> reopen -> add MORE text -> flatten -> save" workflow, which
+	// is where reported breakage lives. Checks after each round that (a) every
+	// piece of text added so far is still extractable, and (b) the earlier
+	// text has not MOVED or FLIPPED -- a flattened run that inherits a bad
+	// graphics state lands somewhere else, or upside down, while still being
+	// present, so presence alone is not enough.
+	if (argc > 3 && wcscmp(argv[3], L"--flattentest") == 0) {
+		auto pageText = [](PdfDocument& d, int page) {
+			std::string s;
+			for (const auto& c : d.pageChars(page))
+				if (c.unicode > 0 && c.unicode < 128) s += static_cast<char>(c.unicode);
+			return s;
+		};
+		// Bounding box of `needle`'s characters on `page`, so a later round can
+		// prove the text stayed where it was put.
+		auto findBox = [](PdfDocument& d, int page, const std::string& needle, PageRectPt& box) {
+			auto chars = d.pageChars(page);
+			std::string all;
+			std::vector<size_t> idx;
+			for (size_t i = 0; i < chars.size(); ++i) {
+				if (chars[i].unicode > 0 && chars[i].unicode < 128) {
+					all += static_cast<char>(chars[i].unicode);
+					idx.push_back(i);
+				}
+			}
+			size_t at = all.find(needle);
+			if (at == std::string::npos) return false;
+			box = chars[idx[at]].quad;
+			for (size_t k = at; k < at + needle.size() && k < idx.size(); ++k) {
+				const PageRectPt& q = chars[idx[k]].quad;
+				box.x0 = std::min(box.x0, q.x0); box.y0 = std::min(box.y0, q.y0);
+				box.x1 = std::max(box.x1, q.x1); box.y1 = std::max(box.y1, q.y1);
+			}
+			return true;
+		};
+		auto dumpPng = [](PdfDocument& d, const std::wstring& path) {
+			PageBitmap pb = d.renderPage(0, 1.5f);
+			if (!pb.hbmp) return;
+			Gdiplus::Bitmap bmp(pb.hbmp, nullptr);
+			CLSID png = { 0x557cf406, 0x1a04, 0x11d3,
+				{ 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+			bmp.Save(path.c_str(), &png, nullptr);
+		};
+		Gdiplus::GdiplusStartupInput gi; ULONG_PTR gt = 0;
+		Gdiplus::GdiplusStartup(&gt, &gi, nullptr);
+
+		const char* kOne = "ROUNDONE";
+		const char* kTwo = "ROUNDTWO";
+		const char* kP2  = "PAGETWOTEXT";
+		std::wstring out1 = std::wstring(output) + L".r1.pdf";
+		std::wstring out2 = std::wstring(output) + L".r2.pdf";
+		std::string e;
+		int failures = 0;
+		PageRectPt boxOneAfterR1{}, boxP2AfterR1{};
+
+		// ---- Round 1: add text on page 0 (and page 1 if present), flatten, save.
+		{
+			PdfDocument d; bool npw = false;
+			if (!d.open(input, e, npw)) { std::printf("open failed: %s\n", e.c_str()); return 1; }
+			std::string before = pageText(d, 0);
+			if (!d.addTextBox(0, { 70.0f, 120.0f, 260.0f, 150.0f }, kOne, "Helv", 14.0f, 0xFF0000, e))
+				{ std::printf("addTextBox r1 FAILED: %s\n", e.c_str()); return 2; }
+			if (d.pageCount() > 1 &&
+				!d.addTextBox(1, { 70.0f, 120.0f, 280.0f, 150.0f }, kP2, "Helv", 14.0f, 0xFF0000, e))
+				{ std::printf("addTextBox p2 FAILED: %s\n", e.c_str()); return 2; }
+			if (!d.flattenAnnotationsToContent(e)) { std::printf("flatten r1 FAILED: %s\n", e.c_str()); return 3; }
+			if (!d.save(out1.c_str(), false, e)) { std::printf("save r1 FAILED: %s\n", e.c_str()); return 4; }
+			std::printf("[round 1] page0 text %zu -> %zu chars\n", before.size(), pageText(d, 0).size());
+		}
+		{
+			PdfDocument d; bool npw = false;
+			if (!d.open(out1.c_str(), e, npw)) { std::printf("reopen r1 FAILED: %s\n", e.c_str()); return 5; }
+			dumpPng(d, std::wstring(output) + L".r1.png");
+			bool has = pageText(d, 0).find(kOne) != std::string::npos;
+			std::printf("[round 1] \"%s\" present on page 0: %s\n", kOne, has ? "yes" : "NO");
+			if (!has) { std::printf("FAIL: round-1 text missing after flatten+save\n"); ++failures; }
+			else findBox(d, 0, kOne, boxOneAfterR1);
+			if (d.pageCount() > 1) {
+				bool h2 = pageText(d, 1).find(kP2) != std::string::npos;
+				std::printf("[round 1] \"%s\" present on page 1: %s\n", kP2, h2 ? "yes" : "NO");
+				if (!h2) ++failures; else findBox(d, 1, kP2, boxP2AfterR1);
+			}
+			std::printf("[round 1] \"%s\" box = (%.1f,%.1f)-(%.1f,%.1f)\n", kOne,
+				boxOneAfterR1.x0, boxOneAfterR1.y0, boxOneAfterR1.x1, boxOneAfterR1.y1);
+		}
+
+		// ---- Round 2: reopen THAT file, add more text, flatten again, save.
+		{
+			PdfDocument d; bool npw = false;
+			if (!d.open(out1.c_str(), e, npw)) { std::printf("open r1 FAILED: %s\n", e.c_str()); return 6; }
+			if (!d.addTextBox(0, { 70.0f, 200.0f, 260.0f, 230.0f }, kTwo, "Helv", 14.0f, 0x0000FF, e))
+				{ std::printf("addTextBox r2 FAILED: %s\n", e.c_str()); return 7; }
+			if (!d.flattenAnnotationsToContent(e)) { std::printf("flatten r2 FAILED: %s\n", e.c_str()); return 8; }
+			if (!d.save(out2.c_str(), false, e)) { std::printf("save r2 FAILED: %s\n", e.c_str()); return 9; }
+		}
+		{
+			PdfDocument d; bool npw = false;
+			if (!d.open(out2.c_str(), e, npw)) { std::printf("reopen r2 FAILED: %s\n", e.c_str()); return 10; }
+			dumpPng(d, std::wstring(output) + L".r2.png");
+			std::string t0 = pageText(d, 0);
+			bool hasOne = t0.find(kOne) != std::string::npos;
+			bool hasTwo = t0.find(kTwo) != std::string::npos;
+			std::printf("[round 2] \"%s\" (from round 1) still present: %s\n", kOne, hasOne ? "yes" : "NO  <-- BUG");
+			std::printf("[round 2] \"%s\" (new) present            : %s\n", kTwo, hasTwo ? "yes" : "NO  <-- BUG");
+			if (!hasOne) ++failures;
+			if (!hasTwo) ++failures;
+			if (d.pageCount() > 1) {
+				bool h2 = pageText(d, 1).find(kP2) != std::string::npos;
+				std::printf("[round 2] \"%s\" (page 1, untouched) present: %s\n", kP2, h2 ? "yes" : "NO  <-- BUG");
+				if (!h2) ++failures;
+			}
+			if (hasOne) {
+				PageRectPt now{};
+				findBox(d, 0, kOne, now);
+				std::printf("[round 2] \"%s\" box = (%.1f,%.1f)-(%.1f,%.1f)\n", kOne,
+					now.x0, now.y0, now.x1, now.y1);
+				float dx = std::fabs(now.x0 - boxOneAfterR1.x0);
+				float dy = std::fabs(now.y0 - boxOneAfterR1.y0);
+				if (dx > 2.0f || dy > 2.0f) {
+					std::printf("FAIL: round-1 text MOVED by (%.1f, %.1f) pts  <-- BUG\n", dx, dy);
+					++failures;
+				}
+				bool flipped = (now.y1 - now.y0) < 0 || (now.x1 - now.x0) < 0;
+				if (flipped) { std::printf("FAIL: round-1 text box is INVERTED  <-- BUG\n"); ++failures; }
+			}
+		}
+		Gdiplus::GdiplusShutdown(gt);
+		std::printf("\n--flattentest failures: %d\n", failures);
+		return failures == 0 ? 0 : 1;
 	}
 
 	bool incremental = argc > 3 && wcscmp(argv[3], L"1") == 0;
