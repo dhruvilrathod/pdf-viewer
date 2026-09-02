@@ -55,6 +55,14 @@ struct Signature {
 	SigDateFormat dateFormat = SigDateFormat::DMY;
 	SigDatePos datePos = SigDatePos::Below;
 
+	// On-page height in points that this signature was last placed/resized at,
+	// so re-using it puts down the same size rather than a generic default.
+	// 0 means "never sized" -- use DefaultSignatureHeightPt(). Deliberately a
+	// HEIGHT, not a width: a signature's height is what reads as its size on a
+	// page, and holding width fixed instead makes a short name enormous and a
+	// long one tiny (they differ several-fold in aspect ratio).
+	float heightPt = 0.0f;
+
 	bool hasValidDate() const
 	{
 		return hasDate && dateYear >= 1 && dateYear <= 9999 &&
@@ -70,6 +78,17 @@ struct Signature {
 	// A short human label for the gallery / status text.
 	std::wstring label() const;
 };
+
+// Height in points to place `sig` at when it has no remembered size. Sized so
+// a signature lands about as tall as a hand-written one on a real form (~1cm);
+// a date below needs proportionally more room for the extra line.
+float DefaultSignatureHeightPt(const Signature& sig);
+// Widest a freshly-dropped signature is allowed to be (~2.6 inches), so a long
+// name can't span the page; height scales down to respect it. Handwriting a
+// long name 1cm tall really is very wide, but a signature on a form is not --
+// so long names end up shorter than the nominal height, which is what a person
+// would actually do when signing into a fixed-width space.
+constexpr float kSignatureMaxDropWidthPt = 190.0f;
 
 // The signature's date rendered per its dateFormat; empty if it has none.
 std::wstring FormatSignatureDate(const Signature& s);

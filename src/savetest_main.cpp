@@ -968,27 +968,37 @@ int wmain(int argc, wchar_t** argv)
 			std::vector<Signature> backup = LoadSignatures();
 			std::printf("saved signatures currently stored: %zu (backed up)\n", backup.size());
 
-			// A pre-dates-existed value, written raw in the legacy "T|" form,
-			// must still load rather than being silently dropped.
+			// EVERY older record generation must still load rather than being
+			// silently dropped -- v1 (pre-dates) and v2 (pre-remembered-size)
+			// are both out in the wild on users' machines.
 			HKEY key = nullptr;
 			bool legacyOk = false;
 			if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PDFast\\Signatures", 0, nullptr, 0,
 					KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
-				std::wstring legacy = L"T|123456|" + faces.front() + L"|Legacy Sample";
-				RegSetValueExW(key, L"Sig0", 0, REG_SZ,
-					reinterpret_cast<const BYTE*>(legacy.c_str()),
-					static_cast<DWORD>((legacy.size() + 1) * sizeof(wchar_t)));
-				for (int i = 1; i < 5; ++i) {
+				auto putRaw = [&](const wchar_t* name, const std::wstring& v) {
+					RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()),
+						static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t)));
+				};
+				putRaw(L"Sig0", L"T|123456|" + faces.front() + L"|Legacy V1");
+				putRaw(L"Sig1", L"T2|123456|2026-09-01,2,0|" + faces.front() + L"|Legacy V2");
+				putRaw(L"Sig2", L"D2|001020|" + std::wstring(L"|") + faces.front() +
+					L"|3.0000|0.1,0.5 0.9,0.5");
+				for (int i = 3; i < 5; ++i) {
 					wchar_t n[16]; swprintf(n, 16, L"Sig%d", i);
 					RegDeleteValueW(key, n);
 				}
 				RegCloseKey(key);
 				auto loaded = LoadSignatures();
-				legacyOk = loaded.size() == 1 &&
-					loaded[0].kind == Signature::Kind::Typed &&
-					loaded[0].text == L"Legacy Sample" &&
-					!loaded[0].hasDate;
-				std::printf("legacy \"T|\" value still loads: %s\n", legacyOk ? "yes" : "NO");
+				bool v1ok = loaded.size() > 0 && loaded[0].text == L"Legacy V1" &&
+					!loaded[0].hasDate && loaded[0].heightPt == 0.0f;
+				bool v2ok = loaded.size() > 1 && loaded[1].text == L"Legacy V2" &&
+					loaded[1].hasDate && loaded[1].dateYear == 2026 && loaded[1].dateMonth == 9 &&
+					loaded[1].dateFormat == SigDateFormat::DMonthY && loaded[1].heightPt == 0.0f;
+				bool d2ok = loaded.size() > 2 && loaded[2].kind == Signature::Kind::Drawn &&
+					!loaded[2].strokes.empty();
+				std::printf("legacy records load -- v1 typed: %s, v2 typed+date: %s, v2 drawn: %s (%zu total)\n",
+					v1ok ? "yes" : "NO", v2ok ? "yes" : "NO", d2ok ? "yes" : "NO", loaded.size());
+				legacyOk = v1ok && v2ok && d2ok;
 			}
 			if (!legacyOk) { SaveSignatures(backup); std::printf("FAIL: legacy parse\n"); return 20; }
 
@@ -1004,12 +1014,27 @@ int wmain(int argc, wchar_t** argv)
 			rt.dateYear = 2027; rt.dateMonth = 3; rt.dateDay = 14;
 			rt.dateFormat = SigDateFormat::ISO;
 			rt.datePos = SigDatePos::Right;
+			rt.heightPt = 42.5f;
 			RememberSignature(list, rt);
 			auto back = LoadSignatures();
 			bool rtOk = !back.empty() && back[0].text == rt.text && back[0].font == rt.font &&
 				back[0].color == rt.color && back[0].hasDate &&
 				back[0].dateYear == 2027 && back[0].dateMonth == 3 && back[0].dateDay == 14 &&
-				back[0].dateFormat == SigDateFormat::ISO && back[0].datePos == SigDatePos::Right;
+				back[0].dateFormat == SigDateFormat::ISO && back[0].datePos == SigDatePos::Right &&
+				std::fabs(back[0].heightPt - 42.5f) < 0.01f;
+
+			// Re-saving the SAME signature at a new size must UPDATE that entry,
+			// not add a second one differing only in height -- this is what
+			// makes "resize on the page, then reuse at that size" work.
+			Signature resized = rt;
+			resized.heightPt = 61.0f;
+			RememberSignature(list, resized);
+			auto back2 = LoadSignatures();
+			bool sizeOk = back2.size() == 1 && std::fabs(back2[0].heightPt - 61.0f) < 0.01f;
+			std::printf("resize updates the saved entry in place: %s (%zu entr%s, height %.1f)\n",
+				sizeOk ? "yes" : "NO", back2.size(), back2.size() == 1 ? "y" : "ies",
+				back2.empty() ? 0.0f : back2[0].heightPt);
+			rtOk = rtOk && sizeOk;
 			std::printf("signature+date round trip: %s (date reads back as \"%ls\")\n",
 				rtOk ? "ok" : "MISMATCH",
 				back.empty() ? L"" : FormatSignatureDate(back[0]).c_str());

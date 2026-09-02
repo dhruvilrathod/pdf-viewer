@@ -1392,6 +1392,58 @@ bool PdfDocument::setAnnotRect(int page, int annotIndex, PageRectPt rect, std::s
 	return ok;
 }
 
+bool PdfDocument::duplicateAnnot(int srcPage, int srcAnnotIndex, int dstPage,
+	PageRectPt dstRect, std::string& err)
+{
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	fz_rect r = normRect(dstRect);
+	if (r.x1 - r.x0 < 1.0f || r.y1 - r.y0 < 1.0f) { err = "target area too small"; return false; }
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	pdf_page* sp = nullptr;
+	pdf_page* dp = nullptr;
+	pdf_annot* copy = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		sp = pdf_load_page(ctx_, pdf, srcPage);
+		pdf_annot* src = annotByIndex(ctx_, sp, srcAnnotIndex);
+		if (!src) { err = "annotation not found"; }
+		else {
+			pdf_obj* ap = pdf_annot_ap(ctx_, src);
+			if (!ap) { err = "annotation has no appearance to copy"; }
+			else {
+				enum pdf_annot_type type = pdf_annot_type(ctx_, src);
+				// Same page or another one -- reload only when it differs, so
+				// a same-page paste doesn't hold two handles to one page.
+				dp = (dstPage == srcPage) ? nullptr : pdf_load_page(ctx_, pdf, dstPage);
+				pdf_page* target = dp ? dp : sp;
+				copy = pdf_create_annot(ctx_, target, type);
+				pdf_set_annot_rect(ctx_, copy, r);
+				pdf_set_annot_flags(ctx_, copy, PDF_ANNOT_IS_PRINT);
+				// Point the copy at the SAME appearance object. It's shared,
+				// which is exactly right: both draw identical artwork, and the
+				// form's own /BBox is stretched onto each one's /Rect
+				// independently, so they can be different sizes.
+				pdf_obj* apDict = pdf_dict_put_dict(ctx_, pdf_annot_obj(ctx_, copy), PDF_NAME(AP), 1);
+				pdf_dict_put(ctx_, apDict, PDF_NAME(N), ap);
+				// Ours now, so MuPDF must not regenerate it (it has its own
+				// Stamp appearance generator -- see setAnnotRect).
+				pdf_set_annot_resynthesised(ctx_, copy);
+				ok = true;
+			}
+		}
+	}
+	fz_always(ctx_) {
+		if (copy) pdf_drop_annot(ctx_, copy);
+		if (dp) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(dp));
+		if (sp) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(sp));
+	}
+	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }
+	if (ok) dirty_ = true;
+	return ok;
+}
+
 PageBitmap PdfDocument::renderPageWithoutAnnot(int index, float scale, int annotIndex)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;

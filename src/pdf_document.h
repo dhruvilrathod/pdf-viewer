@@ -170,6 +170,13 @@ public:
 	// pointless for ones whose Rect is derived (Ink/Highlight), where MuPDF
 	// recomputes it from the InkList/QuadPoints instead.
 	bool setAnnotRect(int page, int annotIndex, PageRectPt rect, std::string& err);
+	// Copies an existing annotation to `dstRect` on `dstPage`, reusing its
+	// appearance stream rather than re-rendering it -- so a placed signature
+	// can be duplicated elsewhere (Ctrl+C / Ctrl+V) with no loss and no need
+	// to still have its source bitmap around. Works for any annotation with
+	// an /AP; returns false for one without.
+	bool duplicateAnnot(int srcPage, int srcAnnotIndex, int dstPage,
+		PageRectPt dstRect, std::string& err);
 
 	// Annotation creation. Each returns false + fills `err` on failure and
 	// marks the document dirty on success. color is 0xRRGGBB (COLORREF-style).

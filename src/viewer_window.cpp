@@ -695,12 +695,24 @@ public:
 	// cursor over the page and a click drops the signature there; dragging
 	// instead sizes it to the dragged box. Stays armed after a placement so
 	// the same signature can be applied to several spots in one pass.
-	void setPendingSignature(std::vector<BYTE> bgra, int w, int h);
+	// `heightPt` is the on-page height to drop at (see
+	// DefaultSignatureHeightPt / Signature::heightPt).
+	void setPendingSignature(std::vector<BYTE> bgra, int w, int h, float heightPt);
+	// Fires when a placed signature is resized, reporting its new on-page
+	// height, so the panel can remember that size for next time.
+	void setOnSignatureResized(std::function<void(float)> cb) { onSignatureResized_ = std::move(cb); }
 	void clearPendingSignature();
 	bool hasPendingSignature() const { return sigW_ > 0 && sigH_ > 0; }
 	// Deletes the signature (Stamp annotation) under a point, if any.
 	// Returns true if something was removed.
 	bool removeSignatureAt(int page, float px, float py);
+	// Ctrl+C: remembers the selected signature so it can be pasted. False if
+	// nothing is selected.
+	bool copySelectedStamp();
+	// Ctrl+V: drops a copy at the last cursor position over a page (or the
+	// middle of the view if the cursor isn't over one) and selects it.
+	bool pasteStamp();
+	bool hasCopiedStamp() const { return stampClipIndex_ >= 0; }
 	// Commits whatever the user is currently typing (form field or new
 	// text-box annotation) so Save never silently drops in-progress edits.
 	void flushPendingEdit() { if (inlineEdit_) commitInlineEdit(true); }
@@ -964,6 +976,16 @@ private:
 	// deliberately free, for the rare case someone wants to squash one.
 	float stampSelAspect_ = 1.0f;
 	bool stampSelected() const { return stampSelIndex_ >= 0; }
+	// Ctrl+C / Ctrl+V on a selected signature. The "clipboard" is deliberately
+	// in-document (source page + annotation index + size) rather than the
+	// system clipboard: pasting reuses the original's appearance stream, so
+	// the copy is identical with no re-rendering, and nothing has to be
+	// serialised out and back.
+	int stampClipPage_ = -1;
+	int stampClipIndex_ = -1;
+	float stampClipW_ = 0.0f, stampClipH_ = 0.0f;
+	// Where the cursor last was over a page, so a paste can land there.
+	int lastMouseX_ = 0, lastMouseY_ = 0;
 	void selectStamp(int page, const AnnotInfo& ai);
 	void clearStampSelection();
 	void commitStampRect();
@@ -1045,10 +1067,15 @@ private:
 	PageBitmap sigPreview_;
 	bool sigGhostVisible_ = false;
 	RECT sigGhostRect_ = {};
-	// Default on-page width for a click-to-drop placement, in points. About
-	// 2.5 inches -- the size a signature occupies on a real form.
-	static constexpr float kSignatureDropWidthPt = 180.0f;
+	// On-page HEIGHT for a click-to-drop placement, in points -- width follows
+	// from the signature's own aspect ratio (capped, see dropSizePt). Height
+	// is the meaningful dimension: a fixed width makes a short name like
+	// "asdf" enormously tall and a long one a thin sliver.
+	float sigDropHeightPt_ = 30.0f;
+	// Page-space size a drop would produce, aspect-preserved and width-capped.
+	void signatureDropSizePt(float& wPt, float& hPt) const;
 	RECT signatureGhostRectAt(int mx, int my) const;
+	std::function<void(float)> onSignatureResized_;
 
 	std::function<void()> onChanged_;
 	std::function<void()> onExitTextTool_;
@@ -1543,6 +1570,10 @@ private:
 	// The saved gallery, loaded once per window and written back on every
 	// change (see signature.h's registry notes).
 	std::vector<Signature> savedSignatures_;
+	// Whatever is currently armed for stamping, kept so a later resize on the
+	// page can be written back against the right gallery entry.
+	Signature sigArmed_;
+	void sigRememberSize(float heightPt);
 	void showSignaturePanel(bool show);
 	void sigSetMode(SigMode m);
 	void sigSetColor(COLORREF c);
@@ -2215,6 +2246,8 @@ void CanvasView::onMouseMove(int mx, int my)
 		TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd_, 0 };
 		if (TrackMouseEvent(&tme)) trackingMouseLeave_ = true;
 	}
+	lastMouseX_ = mx; // where a Ctrl+V would land
+	lastMouseY_ = my;
 	if (activeResizeDir_ >= 0) { updateResize(mx, my); return; }
 	if (selDragging_) {
 		int page; float px, py;
@@ -2301,9 +2334,11 @@ void CanvasView::onLButtonUp(int mx, int my)
 		float aspect = sigH_ / static_cast<float>(std::max(1, sigW_));
 		PageRectPt rectPt;
 		if (std::abs(x1 - x0) < 12 || std::abs(y1 - y0) < 12) {
-			// Treated as a click, not a drag: drop at the default width with
+			// Treated as a click, not a drag: drop at the remembered size with
 			// the top-left at the click point, matching the ghost preview.
-			rectPt = { x0, y0, x0 + kSignatureDropWidthPt, y0 + kSignatureDropWidthPt * aspect };
+			float wPt = 0.0f, hPt = 0.0f;
+			signatureDropSizePt(wPt, hPt);
+			rectPt = { x0, y0, x0 + wPt, y0 + hPt };
 		} else {
 			// Dragged a box: fit the signature inside it, anchored top-left
 			// and keeping the aspect ratio -- a stretched signature would
@@ -2416,6 +2451,53 @@ void CanvasView::commitStampRect()
 	invalidatePage(stampSelPage_);
 	invalidate();
 	if (onChanged_) onChanged_();
+	// Adopt the new size for subsequent drops, and tell the panel so it can
+	// remember it against the saved signature -- resize once, then every
+	// later placement matches without touching the handles again.
+	float newH = stampSelRect_.y1 - stampSelRect_.y0;
+	if (newH > 1.0f) {
+		sigDropHeightPt_ = newH;
+		if (onSignatureResized_) onSignatureResized_(newH);
+	}
+}
+
+bool CanvasView::copySelectedStamp()
+{
+	if (!stampSelected()) return false;
+	stampClipPage_ = stampSelPage_;
+	stampClipIndex_ = stampSelIndex_;
+	stampClipW_ = stampSelRect_.x1 - stampSelRect_.x0;
+	stampClipH_ = stampSelRect_.y1 - stampSelRect_.y0;
+	return true;
+}
+
+bool CanvasView::pasteStamp()
+{
+	if (!hasCopiedStamp() || !doc_ || !doc_->isPdf()) return false;
+	// Land where the cursor is; fall back to the middle of the viewport when
+	// it isn't over a page (e.g. pasting straight after a menu click).
+	int page = -1; float px = 0.0f, py = 0.0f;
+	if (!hitTestPage(lastMouseX_, lastMouseY_, page, px, py)) {
+		RECT rc; GetClientRect(hwnd_, &rc);
+		if (!hitTestPage((rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2, page, px, py))
+			return false;
+	}
+	PageRectPt dst{ px, py, px + stampClipW_, py + stampClipH_ };
+	std::string err;
+	if (!doc_->duplicateAnnot(stampClipPage_, stampClipIndex_, page, dst, err)) {
+		// Most likely the source was deleted since the copy -- forget it
+		// rather than failing again on every subsequent paste.
+		stampClipIndex_ = -1;
+		return false;
+	}
+	invalidatePage(page);
+	invalidate();
+	if (onChanged_) onChanged_();
+	// Select the pasted copy so it can be nudged or resized straight away,
+	// exactly like a freshly placed signature.
+	AnnotInfo placed = doc_->annotAt(page, { (dst.x0 + dst.x1) / 2, (dst.y0 + dst.y1) / 2 });
+	if (placed.kind == AnnotKind::Stamp) selectStamp(page, placed);
+	return true;
 }
 
 void CanvasView::deleteSelectedStamp()
@@ -2431,11 +2513,12 @@ void CanvasView::deleteSelectedStamp()
 	}
 }
 
-void CanvasView::setPendingSignature(std::vector<BYTE> bgra, int w, int h)
+void CanvasView::setPendingSignature(std::vector<BYTE> bgra, int w, int h, float heightPt)
 {
 	sigBgra_ = std::move(bgra);
 	sigW_ = w;
 	sigH_ = h;
+	if (heightPt > 0.0f) sigDropHeightPt_ = heightPt;
 	sigPreview_ = MakeArgbBitmap(sigBgra_, w, h);
 	sigGhostVisible_ = false;
 	updateStatus();
@@ -2451,15 +2534,29 @@ void CanvasView::clearPendingSignature()
 	updateStatus();
 }
 
-// Screen rect the armed signature would occupy if dropped with its top-left
-// at the cursor. Sized from the CURRENT zoom so the ghost is a true preview:
-// kSignatureDropWidthPt is a page-space measurement, so it has to be scaled
-// by effScale() to become pixels.
+// Page-space size a drop produces: the target height, with width following
+// the signature's own aspect -- unless that would exceed the width cap, in
+// which case both shrink so a very long name still fits the page.
+void CanvasView::signatureDropSizePt(float& wPt, float& hPt) const
+{
+	hPt = sigDropHeightPt_ > 0.0f ? sigDropHeightPt_ : 30.0f;
+	wPt = hPt * (sigW_ / static_cast<float>(std::max(1, sigH_)));
+	if (wPt > kSignatureMaxDropWidthPt && wPt > 0.0f) {
+		hPt *= kSignatureMaxDropWidthPt / wPt;
+		wPt = kSignatureMaxDropWidthPt;
+	}
+}
+
+// Screen rect the armed signature would occupy if dropped with its top-left at
+// the cursor. Scaled by effScale() so the ghost is a true preview of the
+// page-space size computed above.
 RECT CanvasView::signatureGhostRectAt(int mx, int my) const
 {
 	float scale = effScale();
-	int w = std::max(1, static_cast<int>(std::lround(kSignatureDropWidthPt * scale)));
-	int h = std::max(1, static_cast<int>(std::lround(w * sigH_ / static_cast<float>(std::max(1, sigW_)))));
+	float wPt = 0.0f, hPt = 0.0f;
+	signatureDropSizePt(wPt, hPt);
+	int w = std::max(1, static_cast<int>(std::lround(wPt * scale)));
+	int h = std::max(1, static_cast<int>(std::lround(hPt * scale)));
 	return { mx, my, mx + w, my + h };
 }
 
@@ -7842,9 +7939,14 @@ void FrameWindow::sigArm(const Signature& sig, bool remember)
 		MessageBoxW(hwnd_, L"Could not render that signature.", L"Sign", MB_OK | MB_ICONWARNING);
 		return;
 	}
-	canvas_->setPendingSignature(std::move(bgra), w, h);
+	// Fall back to a sensible default only when this signature has never been
+	// sized; otherwise reuse whatever height it was last resized to.
+	float heightPt = sig.heightPt > 0.0f ? sig.heightPt : DefaultSignatureHeightPt(sig);
+	canvas_->setPendingSignature(std::move(bgra), w, h, heightPt);
+	sigArmed_ = sig;
+	sigArmed_.heightPt = heightPt;
 	if (remember) {
-		RememberSignature(savedSignatures_, sig);
+		RememberSignature(savedSignatures_, sigArmed_);
 		if (sigGallery_) sigGallery_->setSignatures(savedSignatures_);
 	}
 	// Placing is a canvas gesture, so put focus back there -- otherwise the
@@ -7857,6 +7959,18 @@ void FrameWindow::sigUseCurrent()
 	Signature s;
 	if (!sigFromPanel(s)) return;
 	sigArm(s, /*remember=*/true);
+}
+
+void FrameWindow::sigRememberSize(float heightPt)
+{
+	if (sigArmed_.empty() || !(heightPt > 1.0f)) return;
+	if (std::fabs(sigArmed_.heightPt - heightPt) < 0.5f) return; // no real change
+	sigArmed_.heightPt = heightPt;
+	// RememberSignature matches ignoring size, so this REPLACES the gallery
+	// entry rather than adding a near-duplicate -- the saved signature now
+	// carries the size you just dragged it to.
+	RememberSignature(savedSignatures_, sigArmed_);
+	if (sigGallery_) sigGallery_->setSignatures(savedSignatures_);
 }
 
 void FrameWindow::sigDeleteSaved(int index)
@@ -8601,6 +8715,7 @@ int FrameWindow::newTab()
 		if (printPanelVisible_ && canvas_ && canvas_->printPreviewActive()) updatePrintPreviewFromPanel();
 	});
 	tab->canvas->setOnEmptyStateAction([this](int cmdId) { onCommand(cmdId); });
+	tab->canvas->setOnSignatureResized([this](float heightPt) { sigRememberSize(heightPt); });
 	tab->canvas->setOnOpenTextEditor([this](const std::wstring& text) { showTextEditorPanel(true, text); });
 	tab->canvas->setDarkMode(isDark_);
 	tab->thumbs->setDarkMode(isDark_);
@@ -9561,7 +9676,14 @@ void FrameWindow::onCommand(int id)
 	case IDC_TEXTPANEL_UNDERLINE: textPanelToggleFormat(CFM_UNDERLINE, CFE_UNDERLINE); break;
 	case IDC_TEXTPANEL_COPY: textPanelCopy(); break;
 	case IDC_TEXTPANEL_CLOSE: showTextEditorPanel(false); break;
-	case IDM_EDIT_COPY: if (canvas_) canvas_->copySelectionToClipboard(); break;
+	case IDM_EDIT_COPY:
+		// A selected signature takes priority over a text selection -- if one
+		// is selected, Ctrl+C can only sensibly mean "copy this signature"
+		// (selecting a stamp clears any text selection anyway).
+		if (canvas_ && canvas_->copySelectedStamp()) break;
+		if (canvas_) canvas_->copySelectionToClipboard();
+		break;
+	case IDM_EDIT_PASTE: if (canvas_) canvas_->pasteStamp(); break;
 	case IDM_EDIT_SELECTALL: if (canvas_) canvas_->selectAll(); break;
 	case IDM_EDIT_FIND: showSearchBar(true); break;
 	case IDM_EDIT_FINDNEXT:
@@ -10602,11 +10724,16 @@ int RunViewer(HINSTANCE hInstance, const wchar_t* optionalPath, int nCmdShow)
 		// entirely and let it fall through untranslated instead of hijacking
 		// the keystroke into our page-text command.
 		bool skipAccel = false;
-		if (msg.message == WM_KEYDOWN && (msg.wParam == 'C' || msg.wParam == 'A') &&
+		if (msg.message == WM_KEYDOWN &&
+			(msg.wParam == 'C' || msg.wParam == 'A' || msg.wParam == 'V') &&
 			(GetKeyState(VK_CONTROL) & 0x8000)) {
 			wchar_t cls[32] = {};
 			HWND focused = GetFocus();
-			if (focused && GetClassNameW(focused, cls, 32) && _wcsicmp(cls, L"Edit") == 0)
+			// Rich edit (the rich-text panel) as well as plain EDIT: Ctrl+C/V
+			// must reach whichever has focus rather than being hijacked into
+			// the page-text copy or the signature paste.
+			if (focused && GetClassNameW(focused, cls, 32) &&
+				(_wcsicmp(cls, L"Edit") == 0 || _wcsnicmp(cls, L"RichEdit", 8) == 0))
 				skipAccel = true;
 		}
 		// Accelerators must be translated against whichever top-level

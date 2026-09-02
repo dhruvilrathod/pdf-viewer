@@ -111,13 +111,17 @@ Gdiplus::Color ToGdiColor(COLORREF c)
 // pipe-separated fields with the free-form part (typed text / stroke data)
 // last, so it can contain anything without needing an escape scheme.
 //
-//   Typed: T2|RRGGBB|<date>|<face>|<text>
-//   Drawn: D2|RRGGBB|<date>|<face>|<padAspect>|x,y x,y;x,y x,y   (';' = stroke)
+//   Typed: T3|RRGGBB|<date>|<size>|<face>|<text>
+//   Drawn: D3|RRGGBB|<date>|<size>|<face>|<padAspect>|x,y x,y;x,y   (';' = stroke)
 //
 // <date> is empty when there is none, else "yyyy-MM-dd,format,position" (',',
-// not '|', so it stays a single field). The original date-less "T|"/"D|" forms
-// are still READ, so signatures saved before dates existed keep working; only
-// the new forms are ever written.
+// not '|', so it stays a single field). <size> is the remembered on-page height
+// in points, or empty for none.
+//
+// Every earlier form is still READ so nothing a user saved is ever lost:
+//   v1 "T|RRGGBB|<face>|<text>"                    (before dates)
+//   v2 "T2|RRGGBB|<date>|<face>|<text>"            (before remembered sizes)
+// Only the newest form is written.
 constexpr wchar_t kSigRegKey[] = L"Software\\PDFast\\Signatures";
 
 std::wstring SerializeDate(const Signature& s)
@@ -142,14 +146,23 @@ void DeserializeDate(const std::wstring& spec, Signature& s)
 	if (!s.hasValidDate()) s.hasDate = false;
 }
 
+std::wstring SerializeSize(const Signature& s)
+{
+	if (!(s.heightPt > 0.0f)) return std::wstring();
+	wchar_t buf[32];
+	swprintf(buf, 32, L"%.2f", s.heightPt);
+	return buf;
+}
+
 std::wstring Serialize(const Signature& s)
 {
 	wchar_t head[64];
 	if (s.kind == Signature::Kind::Typed) {
-		swprintf(head, 64, L"T2|%02X%02X%02X|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color));
-		return std::wstring(head) + SerializeDate(s) + L"|" + s.font + L"|" + s.text;
+		swprintf(head, 64, L"T3|%02X%02X%02X|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color));
+		return std::wstring(head) + SerializeDate(s) + L"|" + SerializeSize(s) + L"|" +
+			s.font + L"|" + s.text;
 	}
-	swprintf(head, 64, L"D2|%02X%02X%02X|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color));
+	swprintf(head, 64, L"D3|%02X%02X%02X|", GetRValue(s.color), GetGValue(s.color), GetBValue(s.color));
 	wchar_t tail[32];
 	swprintf(tail, 32, L"|%.4f|", s.padAspect);
 	std::wstring body;
@@ -162,7 +175,18 @@ std::wstring Serialize(const Signature& s)
 			body += pt;
 		}
 	}
-	return std::wstring(head) + SerializeDate(s) + L"|" + s.font + tail + body;
+	return std::wstring(head) + SerializeDate(s) + L"|" + SerializeSize(s) + L"|" +
+		s.font + tail + body;
+}
+
+// Identity of a signature IGNORING its remembered size, so re-saving the same
+// signature after a resize replaces its gallery entry instead of adding a
+// near-duplicate that differs only in height.
+std::wstring SignatureKey(const Signature& s)
+{
+	Signature copy = s;
+	copy.heightPt = 0.0f;
+	return Serialize(copy);
 }
 
 // Splits off the first `n` '|'-delimited fields, leaving the remainder (which
@@ -193,33 +217,43 @@ bool Deserialize(const std::wstring& in, Signature& out)
 {
 	if (in.size() < 3) return false;
 	std::vector<std::wstring> f;
-	// "T2"/"D2" carry a date field and (for drawn) a font; bare "T"/"D" are
-	// the original date-less forms, still read so older saves survive.
-	const bool v2 = in.size() > 1 && in[1] == L'2';
+	// Record generation: v3 adds a remembered size, v2 added the date (and, for
+	// drawn signatures, a font to render it in), v1 is the original. All are
+	// read; only v3 is ever written.
+	const int ver = in.size() > 1 && in[1] == L'3' ? 3
+		: in.size() > 1 && in[1] == L'2' ? 2 : 1;
+	auto readSize = [&](const std::wstring& s) {
+		out.heightPt = s.empty() ? 0.0f : static_cast<float>(_wtof(s.c_str()));
+		if (!(out.heightPt > 0.0f) || out.heightPt > 2000.0f) out.heightPt = 0.0f;
+	};
 	if (in[0] == L'T') {
-		if (!SplitFields(in, v2 ? 4 : 3, f)) return false;
+		if (!SplitFields(in, ver == 3 ? 5 : ver == 2 ? 4 : 3, f)) return false;
 		out.kind = Signature::Kind::Typed;
 		out.color = ParseHexColor(f[1]);
-		if (v2) {
-			DeserializeDate(f[2], out);
-			out.font = f[3];
-			out.text = f[4];
-		} else {
-			out.font = f[2];
-			out.text = f[3];
-		}
+		if (ver >= 2) DeserializeDate(f[2], out);
+		if (ver >= 3) readSize(f[3]);
+		size_t fontField = ver == 3 ? 4 : ver == 2 ? 3 : 2;
+		out.font = f[fontField];
+		out.text = f[fontField + 1];
 		return !out.empty();
 	}
 	if (in[0] != L'D') return false;
-	if (!SplitFields(in, v2 ? 5 : 3, f)) return false;
+	if (!SplitFields(in, ver == 3 ? 6 : ver == 2 ? 5 : 3, f)) return false;
 	out.kind = Signature::Kind::Drawn;
 	out.color = ParseHexColor(f[1]);
 	size_t aspectField = 2, bodyField = 3;
-	if (v2) {
+	if (ver >= 2) {
 		DeserializeDate(f[2], out);
-		out.font = f[3];
-		aspectField = 4;
-		bodyField = 5;
+		if (ver >= 3) {
+			readSize(f[3]);
+			out.font = f[4];
+			aspectField = 5;
+			bodyField = 6;
+		} else {
+			out.font = f[3];
+			aspectField = 4;
+			bodyField = 5;
+		}
 	}
 	out.padAspect = static_cast<float>(_wtof(f[aspectField].c_str()));
 	if (!(out.padAspect > 0.01f) || out.padAspect > 100.0f) out.padAspect = 3.0f;
@@ -414,6 +448,19 @@ bool RenderSignatureMark(const Signature& sig, int heightPx,
 
 } // namespace
 
+float DefaultSignatureHeightPt(const Signature& s)
+{
+	// ~1cm of signature, which is what a hand-written one occupies on a form.
+	// (72pt = 1 inch, so 30pt is a shade over 1cm.)
+	constexpr float kBase = 30.0f;
+	// A date underneath is a whole extra line plus its gap, so the stamp needs
+	// to be taller for the signature part itself to stay ~kBase. Beside it, it
+	// adds width, not height.
+	if (s.hasValidDate() && s.datePos == SigDatePos::Below)
+		return kBase * (1.0f + kDateEmFrac + kDateGapFrac);
+	return kBase;
+}
+
 std::wstring FormatSignatureDate(const Signature& s)
 {
 	if (!s.hasValidDate()) return std::wstring();
@@ -560,9 +607,12 @@ void SaveSignatures(const std::vector<Signature>& sigs)
 void RememberSignature(std::vector<Signature>& sigs, const Signature& sig)
 {
 	if (sig.empty()) return;
-	const std::wstring key = Serialize(sig);
+	// Matched ignoring size, so re-saving after a resize UPDATES the existing
+	// entry's remembered height rather than creating a second, near-identical
+	// one -- which is what makes "resize once, then reuse at that size" work.
+	const std::wstring key = SignatureKey(sig);
 	sigs.erase(std::remove_if(sigs.begin(), sigs.end(),
-		[&](const Signature& s) { return Serialize(s) == key; }), sigs.end());
+		[&](const Signature& s) { return SignatureKey(s) == key; }), sigs.end());
 	sigs.insert(sigs.begin(), sig);
 	if (sigs.size() > kMaxSavedSignatures) sigs.resize(kMaxSavedSignatures);
 	SaveSignatures(sigs);

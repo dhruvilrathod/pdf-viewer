@@ -85,6 +85,9 @@ not run on macOS or Linux.
   mouse — then click anywhere on the page to place it (drag instead to size it).
 - Placed signatures can be **moved and resized** afterwards: click one with the
   Select tool for drag handles (corners keep the aspect ratio), or press Delete.
+  Resizing one is remembered — the next placement uses that size.
+- **Ctrl+C / Ctrl+V** on a selected signature copies it and drops an identical
+  one wherever your cursor is, for signing several places at the same size.
 - Optionally **add a date**, chosen from a calendar — any date you like, never
   just "today". Four unambiguous formats, placed below or beside the signature
   and written in the same handwriting font so the two read as one.
