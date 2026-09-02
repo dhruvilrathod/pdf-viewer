@@ -83,6 +83,10 @@ not run on macOS or Linux.
 **Sign**
 - **Type** your name and pick a handwriting font, or **draw** a signature with the
   mouse — then click anywhere on the page to place it (drag instead to size it).
+- Opening the panel doesn't take the page over: it keeps its normal pointer,
+  text selection, links and right-click menus. Only once you pick a signature
+  does the pointer become a placement cursor, and **Esc** puts it back down
+  again without closing the panel.
 - Placed signatures can be **moved and resized** afterwards: click one with the
   Select tool for drag handles (corners keep the aspect ratio), or press Delete.
   Resizing one is remembered — the next placement uses that size.

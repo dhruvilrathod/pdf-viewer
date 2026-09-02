@@ -677,8 +677,8 @@ public:
 		// and can be resized straight away.)
 		if (t != tool_) clearStampSelection();
 		tool_ = t;
-		SetCursor(LoadCursor(nullptr, t == Tool::Select ? IDC_ARROW : IDC_CROSS));
-		if (t != Tool::Select && !hoveredLinkText_.empty()) { hoveredLinkText_.clear(); updateStatus(); }
+		refreshCursor();
+		if (!actsLikeSelect() && !hoveredLinkText_.empty()) { hoveredLinkText_.clear(); updateStatus(); }
 		// Leaving the Sign tool must clear the follow-the-cursor ghost, or it
 		// stays painted at wherever the mouse last was.
 		if (wasSign && t != Tool::Sign && sigGhostVisible_) { sigGhostVisible_ = false; invalidate(); }
@@ -688,6 +688,19 @@ public:
 		if (wasSign || t == Tool::Sign) updateStatus();
 	}
 	Tool tool() const { return tool_; }
+	// True when the canvas should behave exactly like the Select tool: normal
+	// arrow/I-beam cursor, text selection, links, form fields, right-click
+	// menus. The Sign tool counts as Select until a signature is actually
+	// ARMED -- having the signature panel open is not itself a mode, so the
+	// document stays fully usable while you pick or build a signature. Only
+	// arming one turns the canvas into "click to place".
+	bool actsLikeSelect() const {
+		return tool_ == Tool::Select || (tool_ == Tool::Sign && !hasPendingSignature());
+	}
+	// Re-evaluates the pointer for wherever it currently is, so arming or
+	// disarming a signature changes it immediately rather than on the next
+	// mouse move.
+	void refreshCursor();
 
 	// --- Sign tool -------------------------------------------------------
 	// Arms the tool with a rasterized signature (premultiplied top-down BGRA,
@@ -2185,12 +2198,12 @@ void CanvasView::onLButtonDown(int mx, int my)
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return;
 
-	// Any non-Select tool click starts a fresh mark, so a leftover signature
+	// A mark-making click starts something fresh, so a leftover signature
 	// selection would just leave stale handles floating over the page. (The
-	// Select branch below does its own, more nuanced, deselect.)
-	if (tool_ != Tool::Select && stampSelected()) clearStampSelection();
+	// select-like branch below does its own, more nuanced, deselect.)
+	if (!actsLikeSelect() && stampSelected()) clearStampSelection();
 
-	if (tool_ == Tool::Select) {
+	if (actsLikeSelect()) {
 		clearTextSelection();
 		AnnotInfo ai = doc_->annotAt(page, { px, py });
 		// A placed signature: select it (showing the 8 resize handles) and
@@ -2222,10 +2235,8 @@ void CanvasView::onLButtonDown(int mx, int my)
 		eraseAt(mx, my);
 		return;
 	}
-	// Sign tool with nothing armed yet: the panel is where a signature gets
-	// made, and updateStatus() is already saying so -- just don't start a
-	// drag that could never place anything.
-	if (tool_ == Tool::Sign && !hasPendingSignature()) return;
+	// (An unarmed Sign tool never reaches here -- actsLikeSelect() sent it
+	// down the Select branch above.)
 	// Begin a drag for Highlight / Draw / Text / Sign.
 	dragging_ = true;
 	dragPage_ = page;
@@ -2256,7 +2267,7 @@ void CanvasView::onMouseMove(int mx, int my)
 		return;
 	}
 	if (!dragging_) {
-		if (tool_ == Tool::Select) updateLinkHover(mx, my);
+		if (actsLikeSelect()) updateLinkHover(mx, my);
 		if (tool_ == Tool::Sign && hasPendingSignature()) {
 			// Follow-the-cursor ghost. Invalidate only the union of the old
 			// and new ghost rects -- a full-canvas invalidate on every mouse
@@ -2521,16 +2532,19 @@ void CanvasView::setPendingSignature(std::vector<BYTE> bgra, int w, int h, float
 	if (heightPt > 0.0f) sigDropHeightPt_ = heightPt;
 	sigPreview_ = MakeArgbBitmap(sigBgra_, w, h);
 	sigGhostVisible_ = false;
+	refreshCursor(); // arming is what turns the pointer into a placement cursor
 	updateStatus();
 	invalidate();
 }
 
 void CanvasView::clearPendingSignature()
 {
+	bool was = hasPendingSignature();
 	sigBgra_.clear();
 	sigW_ = sigH_ = 0;
 	sigPreview_ = PageBitmap();
 	if (sigGhostVisible_) { sigGhostVisible_ = false; invalidate(); }
+	if (was) refreshCursor(); // ... and disarming gives the normal one back
 	updateStatus();
 }
 
@@ -2846,7 +2860,10 @@ void CanvasView::activateLink(const LinkInfo& link)
 
 void CanvasView::onRButtonDown(int mx, int my)
 {
-	if (tool_ != Tool::Select) return;
+	// Available with the signature panel open too, as long as nothing is
+	// armed -- the page keeps its normal right-click menus until you actually
+	// pick a signature to place.
+	if (!actsLikeSelect()) return;
 	int page; float px, py;
 	if (!hitTestPage(mx, my, page, px, py)) return;
 	// A placed signature takes priority over anything underneath it: it's the
@@ -3060,6 +3077,22 @@ void CanvasView::drawTextSelection(HDC dc, int pageIndex, int pageX, int pageY)
 		if (chars[i].lineBreakAfter || chars[i].paragraphBreakAfter) flush();
 	}
 	flush();
+}
+
+void CanvasView::refreshCursor()
+{
+	// Only touch the pointer if it is actually over this canvas -- otherwise
+	// arming a signature would change the cursor over whatever the user is
+	// really pointing at (the panel, the toolbar, another window).
+	POINT pt;
+	if (!GetCursorPos(&pt)) return;
+	if (WindowFromPoint(pt) != hwnd_) return;
+	ScreenToClient(hwnd_, &pt);
+	if (!actsLikeSelect()) { SetCursor(LoadCursor(nullptr, IDC_CROSS)); return; }
+	// Mirror the WM_SETCURSOR path so the pointer is right for whatever is
+	// under it (I-beam over text, hand over a link), not just a plain arrow.
+	HCURSOR c = (doc_ && doc_->isOpen()) ? cursorForSelectAt(pt.x, pt.y) : nullptr;
+	SetCursor(c ? c : LoadCursor(nullptr, IDC_ARROW));
 }
 
 HCURSOR CanvasView::cursorForSelectAt(int mx, int my)
@@ -4367,13 +4400,12 @@ void CanvasView::updateStatus()
 		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 		return;
 	}
-	// While the Sign tool is active the status bar becomes its instruction
-	// line -- the tool is modal in feel (arm a signature, then click a spot)
-	// and there's no other always-visible place to say which step you're on.
-	if (tool_ == Tool::Sign && doc_ && doc_->isOpen()) {
-		statusText_ = hasPendingSignature()
-			? L"Click the page to place your signature, or drag to size it. Esc to stop."
-			: L"Type or draw a signature in the panel, then choose \"Use This Signature\".";
+	// Only while a signature is actually ARMED does the status bar become an
+	// instruction line -- that's the one genuinely modal moment. With the
+	// panel merely open the document behaves normally, so the status bar
+	// shows the normal page/zoom readout too.
+	if (hasPendingSignature() && doc_ && doc_->isOpen()) {
+		statusText_ = L"Click the page to place your signature, or drag to size it. Esc to put it down.";
 		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 		if (onViewChanged_) onViewChanged_();
 		return;
@@ -4445,7 +4477,10 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_LBUTTONUP: self->onLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_SETCURSOR:
 		if (LOWORD(lp) == HTCLIENT) {
-			if (self->tool_ != Tool::Select) {
+			// Crosshair only for tools that actually mark the page -- which
+			// includes Sign ONLY once a signature is armed. With the panel
+			// merely open, the pointer stays exactly as it is anywhere else.
+			if (!self->actsLikeSelect()) {
 				SetCursor(LoadCursor(nullptr, IDC_CROSS));
 				return TRUE;
 			}
@@ -4481,20 +4516,17 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		case VK_HOME:  self->onVScroll(SB_TOP); return 0;
 		case VK_END:   self->onVScroll(SB_BOTTOM); return 0;
 		case VK_ESCAPE:
-			// Escape means "stop signing" -- back to the Select tool, so the
-			// pointer returns to a normal arrow. This has to come BEFORE the
-			// deselect below: placing a signature leaves it selected, so a
-			// deselect-first Escape would swallow the keystroke and strand the
-			// user in the Sign tool still holding a crosshair.
-			if (self->tool_ == Tool::Sign) {
+			// Escape puts the armed signature down -- pointer back to normal,
+			// page fully usable again. It deliberately leaves the panel OPEN
+			// and the tool selected: you're still signing, you just aren't
+			// holding a signature, so the next one is one click away in the
+			// panel rather than a trip back to the toolbar.
+			if (self->hasPendingSignature()) {
+				self->clearPendingSignature();
 				self->clearStampSelection();
-				// onExitTextTool_ is "drop back to Select" (the frame binds it
-				// to selectTool(IDM_TOOL_SELECT)), which also closes the
-				// signature panel and disarms the pending signature.
-				if (self->onExitTextTool_) self->onExitTextTool_();
 				return 0;
 			}
-			// Under any other tool, Escape just drops a signature selection.
+			// Nothing armed: fall back to dropping a signature selection.
 			if (self->stampSelected()) { self->clearStampSelection(); return 0; }
 			break;
 		case VK_DELETE:
@@ -8186,7 +8218,16 @@ LRESULT CALLBACK FrameWindow::SigTextEditSubclass(HWND hwnd, UINT msg, WPARAM wp
 		// Enter is the obvious "I'm done typing my name" gesture -- without
 		// this it would just beep, since the frame isn't a dialog.
 		if (wp == VK_RETURN) { self->sigUseCurrent(); return 0; }
-		if (wp == VK_ESCAPE) { self->showSignaturePanel(false); self->selectTool(IDM_TOOL_SELECT); return 0; }
+		// Consistent with Escape everywhere else while signing: put the armed
+		// signature down, but leave the panel open. Only close it when there
+		// was nothing armed to put down.
+		if (wp == VK_ESCAPE) {
+			if (self->canvas_ && self->canvas_->hasPendingSignature())
+				self->canvas_->clearPendingSignature();
+			else
+				{ self->showSignaturePanel(false); self->selectTool(IDM_TOOL_SELECT); }
+			return 0;
+		}
 		if (ConsumeCtrlBackspaceWordDelete(hwnd, wp)) return 0;
 		if (ConsumeCtrlSelectAll(hwnd, wp)) return 0;
 	}
@@ -9687,10 +9728,13 @@ void FrameWindow::onCommand(int id)
 		break;
 	case IDM_EDIT_PASTE: if (canvas_) canvas_->pasteStamp(); break;
 	case IDM_CANCEL_SIGN:
-		// Escape from anywhere while signing. Deliberately a no-op under every
-		// other tool, so the message loop can fire it on any Escape without
-		// having to know what else that keystroke might be for.
-		if (canvas_ && canvas_->tool() == CanvasView::Tool::Sign) selectTool(IDM_TOOL_SELECT);
+		// Escape from anywhere -- notably while focus sits in the signature
+		// panel, whose buttons and lists would otherwise swallow the key. Only
+		// puts the armed signature down; the panel stays open and the tool
+		// stays selected. Deliberately a no-op when nothing is armed, so the
+		// message loop can fire it on any Escape without having to know what
+		// else that keystroke might be for.
+		if (canvas_ && canvas_->hasPendingSignature()) canvas_->clearPendingSignature();
 		break;
 	case IDM_EDIT_SELECTALL: if (canvas_) canvas_->selectAll(); break;
 	case IDM_EDIT_FIND: showSearchBar(true); break;

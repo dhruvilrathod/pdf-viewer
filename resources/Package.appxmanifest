@@ -21,7 +21,7 @@
   <Identity
       Name="REPLACE_WITH_PARTNER_CENTER_PACKAGE_IDENTITY_NAME"
       Publisher="REPLACE_WITH_PARTNER_CENTER_PUBLISHER_ID"
-      Version="1.12.1.0" />
+      Version="1.12.2.0" />
 
   <Properties>
     <DisplayName>PDFast</DisplayName>
