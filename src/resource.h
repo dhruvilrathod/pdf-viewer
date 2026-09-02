@@ -123,6 +123,8 @@
 #define IDM_TOOLS_WEBPDF       1221  // Tools menu + empty-state tile: web page to PDF
 #define IDM_TOOLS_FLATTEN_EDITS 1222 // Tools menu: bake annotations/form fields into content, keep page text selectable
 #define IDM_TOOL_ERASE         1223 // toolbar radio tool: deletes a whole ink stroke on touch (joins Select/Highlight/Draw/AddText/Redact)
+#define IDM_TOOL_SIGN          1224 // toolbar radio tool: places a typed/drawn signature (opens the signature side panel)
+#define IDM_TOOLS_SIGN_LOCK    1225 // Tools menu + signature panel: bake everything in and make the document read-only
 #define IDM_EMPTY_FLATTEN_IMAGE 1226 // empty-state "Flatten to Image" tile: Open, then auto-flatten-to-image
 #define IDM_EMPTY_FLATTEN_EDITS 1227 // empty-state "Flatten Edits Only" tile: Open, then auto-flatten-edits-only
 
@@ -133,6 +135,40 @@
 // Right-click context menu over an active text selection (Select tool only)
 #define IDM_SEL_COPY             1230
 #define IDM_SEL_EDIT_RICHTEXT    1231
+
+// Empty-state "Sign PDF" tile: Open, then auto-open the signature panel
+#define IDM_EMPTY_SIGN           1232
+// Right-click context menu over a placed signature (Select tool only)
+#define IDM_SIG_REMOVE           1233
+
+// Signature side panel (right-docked, mutually exclusive with the print /
+// rich-text panels). Type or draw a signature, reuse a saved one, then click
+// the page to place it; "Finish & Lock" bakes everything in.
+#define IDC_SIG_TITLE        1174
+#define IDC_SIG_MODE_TYPE    1175
+#define IDC_SIG_MODE_DRAW    1176
+#define IDC_SIG_TEXT_LABEL   1177
+#define IDC_SIG_TEXT_EDIT    1178
+#define IDC_SIG_FONT_LIST    1179
+#define IDC_SIG_PAD_LABEL    1180
+#define IDC_SIG_PAD          1181
+#define IDC_SIG_CLEAR        1182
+#define IDC_SIG_COLOR_LABEL  1183
+#define IDC_SIG_COLOR_BLACK  1184
+#define IDC_SIG_COLOR_BLUE   1185
+#define IDC_SIG_USE          1186
+#define IDC_SIG_SAVED_LABEL  1187
+#define IDC_SIG_GALLERY      1188
+#define IDC_SIG_LOCK         1189
+#define IDC_SIG_CLOSE        1190
+// Optional date, composed into the same stamp as the signature (see
+// signature.h). Always an explicit picked date, never "today" resolved later.
+#define IDC_SIG_DATE_CHECK     1191
+#define IDC_SIG_DATE_PICKER    1192
+#define IDC_SIG_DATE_FORMAT    1193
+#define IDC_SIG_DATE_POS_LABEL 1194
+#define IDC_SIG_DATE_BELOW     1195
+#define IDC_SIG_DATE_RIGHT     1196
 
 // Web-to-PDF bar (URL text box + Convert button)
 #define IDC_WEBPDF_LABEL   1134
