@@ -961,9 +961,10 @@ bool PdfDocument::addRedaction(int page, PageRectPt rect, std::string& err)
 		pdf_set_annot_rect(ctx_, annot, normRect(rect));
 		// Redact annotations don't support an interior/fill color (only a
 		// border color) -- pdf_set_annot_interior_color throws for this
-		// subtype. The black-box fill itself comes from applyRedactions()'s
-		// black_boxes option at apply time; before that, the border is the
-		// only visual cue this app draws for a pending mark.
+		// subtype. The box fill itself (black or white, whichever the redact
+		// bar has selected) is drawn by applyRedactions() at apply time;
+		// before that, the border is the only visual cue this app draws for
+		// a pending mark.
 		float black[3] = { 0.0f, 0.0f, 0.0f };
 		pdf_set_annot_color(ctx_, annot, 3, black);
 		pdf_update_annot(ctx_, annot);
@@ -3026,21 +3027,66 @@ int PdfDocument::pendingRedactionCount()
 	return total;
 }
 
-bool PdfDocument::applyRedactions(std::string& err)
+bool PdfDocument::applyRedactions(bool whiteBox, std::string& err)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	fz_try(ctx_) {
 		pdf_redact_options opts = {};
-		opts.black_boxes = 1;
+		// MuPDF's own black_boxes fill is hardcoded to black (pdf_redact_end_page
+		// in pdf-clean.c always emits "0 g" before drawing each mark's rect), so
+		// for white we turn that off and draw the box ourselves below, using the
+		// same rect-as-content-stream-coordinates trick MuPDF's own path uses.
+		opts.black_boxes = whiteBox ? 0 : 1;
 		opts.image_method = PDF_REDACT_IMAGE_PIXELS;
 		opts.line_art = PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED;
 		opts.text = PDF_REDACT_TEXT_REMOVE;
 		int n = fz_count_pages(ctx_, doc_);
 		for (int i = 0; i < n; ++i) {
 			pdf_page* pg = pdf_load_page(ctx_, pdf, i);
-			fz_try(ctx_) { pdf_redact_page(ctx_, pdf, pg, &opts); }
+			fz_try(ctx_) {
+				std::vector<fz_rect> whiteRects;
+				if (whiteBox) {
+					// Must capture the marks' rects before pdf_redact_page runs --
+					// it deletes every Redact annotation as part of applying.
+					for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) {
+						if (pdf_annot_type(ctx_, a) == PDF_ANNOT_REDACT)
+							whiteRects.push_back(pdf_annot_rect(ctx_, a));
+					}
+				}
+				pdf_redact_page(ctx_, pdf, pg, &opts);
+				if (!whiteRects.empty()) {
+					pdf_obj* page_ref = pdf_lookup_page_obj(ctx_, pdf, i);
+					fz_buffer* extra = fz_new_buffer(ctx_, 256);
+					fz_try(ctx_) {
+						fz_append_string(ctx_, extra, "1 g\n");
+						for (const fz_rect& r : whiteRects) {
+							fz_append_printf(ctx_, extra, "%g %g %g %g re f\n",
+								r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+						}
+						// Appended as a new content stream rather than replacing the
+						// existing one(s), same idiom flattenAnnotationsToContent()
+						// uses -- order in the /Contents array is draw order, so this
+						// paints on top of whatever pdf_redact_page just left behind.
+						pdf_obj* contentsRef = pdf_add_stream(ctx_, pdf, extra, nullptr, 0);
+						pdf_obj* oldContents = pdf_dict_get(ctx_, page_ref, PDF_NAME(Contents));
+						pdf_obj* newContents;
+						if (pdf_is_array(ctx_, oldContents)) {
+							newContents = pdf_copy_array(ctx_, oldContents);
+							pdf_array_push(ctx_, newContents, contentsRef);
+						} else {
+							newContents = pdf_new_array(ctx_, pdf, 2);
+							if (oldContents) pdf_array_push(ctx_, newContents, oldContents);
+							pdf_array_push(ctx_, newContents, contentsRef);
+						}
+						pdf_drop_obj(ctx_, contentsRef);
+						pdf_dict_put_drop(ctx_, page_ref, PDF_NAME(Contents), newContents);
+					}
+					fz_always(ctx_) { fz_drop_buffer(ctx_, extra); }
+					fz_catch(ctx_) { fz_rethrow(ctx_); }
+				}
+			}
 			fz_always(ctx_) { fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg)); }
 			fz_catch(ctx_) { fz_rethrow(ctx_); }
 		}

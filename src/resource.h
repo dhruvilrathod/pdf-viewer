@@ -97,6 +97,7 @@
 #define IDC_REDACT_APPLY   1124
 #define IDC_REDACT_CLEAR   1125
 #define IDC_REDACT_DONE    1126
+#define IDC_REDACT_COLOR   1234  // toggles the box color used at Apply time between black/white
 
 // Organize side-panel action strip (bottom of the thumbnail column)
 #define IDC_ORGANIZE_INSERT  1127

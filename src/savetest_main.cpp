@@ -49,6 +49,24 @@ int wmain(int argc, wchar_t** argv)
 		auto outPath = [&](const wchar_t* suffix) { return std::wstring(output) + suffix; };
 		int failures = 0;
 
+		// Samples the rendered pixel at page-space point (pdfX, pdfY) on `page`
+		// (scale 1.0, so device pixels == page points) -- used to check the
+		// actual color of a baked redaction box rather than just that
+		// rendering didn't crash. PageRectPt's y-axis runs top-down (same
+		// direction as pageToView()'s in viewer_window.cpp, and as MuPDF's own
+		// page-space convention -- it flips the raw bottom-up PDF space
+		// internally), so this is a direct 1:1 mapping, no y-flip.
+		auto samplePixel = [](PdfDocument& d, int page, float pdfX, float pdfY) -> COLORREF {
+			PageBitmap bmp = d.renderPage(page, 1.0f);
+			if (!bmp.hbmp) return CLR_INVALID;
+			HDC hdc = CreateCompatibleDC(nullptr);
+			HGDIOBJ old = SelectObject(hdc, bmp.hbmp);
+			COLORREF c = GetPixel(hdc, static_cast<int>(pdfX), static_cast<int>(pdfY));
+			SelectObject(hdc, old);
+			DeleteDC(hdc);
+			return c;
+		};
+
 		// --- rebuildFromPages (backs Organize's Done and Merge) -----------
 		{
 			std::printf("[rebuildFromPages]\n");
@@ -368,7 +386,7 @@ int wmain(int argc, wchar_t** argv)
 				int pending = doc.pendingRedactionCount();
 				std::printf("  pendingRedactionCount=%d (expect 1)\n", pending);
 				if (pending != 1) ++failures;
-				if (!doc.applyRedactions(e)) {
+				if (!doc.applyRedactions(false, e)) {
 					std::printf("  FAIL: applyRedactions: %s\n", e.c_str());
 					++failures;
 				} else {
@@ -393,7 +411,54 @@ int wmain(int argc, wchar_t** argv)
 								if (!b.hbmp) { std::printf("  RENDER FAILED on redacted page %d\n", p); ++failures; }
 							}
 							std::printf("  reopened redacted OK: pageCount=%d\n", doc2.pageCount());
+							COLORREF c = samplePixel(doc2, 0, (mark.x0 + mark.x1) / 2, (mark.y0 + mark.y1) / 2);
+							std::printf("  box pixel = RGB(%d,%d,%d) (expect near-black)\n",
+								GetRValue(c), GetGValue(c), GetBValue(c));
+							if (GetRValue(c) > 20 || GetGValue(c) > 20 || GetBValue(c) > 20) ++failures;
 						}
+					}
+				}
+			}
+		}
+
+		// --- applyRedactions(whiteBox=true) --------------------------------
+		{
+			std::printf("[redact-white]\n");
+			PdfDocument doc;
+			if (!openFresh(doc)) return 1;
+			PageRectPt bound = doc.pageBound(0);
+			PageRectPt mark{ bound.x0 + 10, bound.y0 + 10, bound.x0 + 200, bound.y0 + 60 };
+			std::string e;
+			if (!doc.addRedaction(0, mark, e)) {
+				std::printf("  FAIL: addRedaction: %s\n", e.c_str());
+				++failures;
+			} else if (!doc.applyRedactions(true, e)) {
+				std::printf("  FAIL: applyRedactions(white): %s\n", e.c_str());
+				++failures;
+			} else {
+				int pendingAfter = doc.pendingRedactionCount();
+				std::printf("  applyRedactions(white) OK: pendingAfter=%d (expect 0)\n", pendingAfter);
+				if (pendingAfter != 0) ++failures;
+				std::wstring rPath = outPath(L"_redacted_white.pdf");
+				if (!doc.save(rPath.c_str(), false, e)) {
+					std::printf("  FAIL: save redacted-white: %s\n", e.c_str());
+					++failures;
+				} else {
+					PdfDocument doc2;
+					std::string e2; bool npw2 = false;
+					if (!doc2.open(rPath.c_str(), e2, npw2)) {
+						std::printf("  FAIL: reopen redacted-white: %s\n", e2.c_str());
+						++failures;
+					} else {
+						for (int p = 0; p < doc2.pageCount(); ++p) {
+							PageBitmap b = doc2.renderPage(p, 1.0f);
+							if (!b.hbmp) { std::printf("  RENDER FAILED on redacted-white page %d\n", p); ++failures; }
+						}
+						std::printf("  reopened redacted-white OK: pageCount=%d\n", doc2.pageCount());
+						COLORREF c = samplePixel(doc2, 0, (mark.x0 + mark.x1) / 2, (mark.y0 + mark.y1) / 2);
+						std::printf("  box pixel = RGB(%d,%d,%d) (expect near-white)\n",
+							GetRValue(c), GetGValue(c), GetBValue(c));
+						if (GetRValue(c) < 235 || GetGValue(c) < 235 || GetBValue(c) < 235) ++failures;
 					}
 				}
 			}

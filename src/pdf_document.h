@@ -207,8 +207,9 @@ public:
 	bool addImageStamp(int page, PageRectPt rect, const unsigned char* bgra,
 		int w, int h, std::string& err);
 
-	// Marks a region for redaction (shown as a solid black box). Nothing is
-	// actually removed from the page until applyRedactions().
+	// Marks a region for redaction (shown as a solid box, black or white --
+	// see applyRedactions()). Nothing is actually removed from the page until
+	// applyRedactions().
 	bool addRedaction(int page, PageRectPt rect, std::string& err);
 
 	// Forms.
@@ -338,10 +339,15 @@ public:
 	// redacting anything. Backs the redact bar's "Clear All".
 	bool clearPendingRedactions(std::string& err);
 	// Permanently strips text/vector/image content under every pending
-	// redaction mark (pdf_redact_page, black boxes drawn in their place) and
+	// redaction mark (pdf_redact_page, a solid box drawn in their place) and
 	// removes the marks themselves. Irreversible once applied, even before
-	// the next save.
-	bool applyRedactions(std::string& err);
+	// the next save. `whiteBox` draws white instead of the default black --
+	// MuPDF's own black_boxes option is hardcoded to black ("0 g" in
+	// pdf_redact_end_page), so the white case is done ourselves: black_boxes
+	// is left off, and a white-filled rect is appended as a fresh content
+	// stream for each mark's rect (captured before pdf_redact_page deletes
+	// the marks), mirroring exactly what MuPDF's own black-box path draws.
+	bool applyRedactions(bool whiteBox, std::string& err);
 
 	// Saves the document. `incremental` appends changes to the existing file
 	// (fast, only valid when saving over the file it was opened from).

@@ -747,6 +747,7 @@ public:
 	COLORREF color() { return (inlineEdit_ && inlineShowPopup_) ? textColor_ : activeColor(); }
 	void setPenWidth(float w) { penWidth_ = w; }
 	void setOpacity(float o) { opacity_ = o; }
+	void setRedactBoxWhite(bool white) { redactBoxWhite_ = white; }
 
 	// Search. Returns number of matches found.
 	int search(const std::wstring& text);
@@ -1053,6 +1054,10 @@ private:
 	COLORREF highlightColor_ = RGB(255, 235, 0); // yellow
 	COLORREF drawColor_ = RGB(0, 0, 0);          // black
 	COLORREF textColor_ = RGB(0, 0, 0);          // black
+	// Mirrors FrameWindow::redactWhiteBox_, pushed via setRedactBoxWhite() --
+	// just cosmetic, so the in-progress drag preview matches whatever
+	// applyRedactions() will actually paint.
+	bool redactBoxWhite_ = false;
 	COLORREF& activeColor() {
 		switch (tool_) {
 		case Tool::Highlight: return highlightColor_;
@@ -1430,6 +1435,7 @@ private:
 	void updateRedactBar();
 	void applyRedactionsCmd();
 	void clearRedactions();
+	void toggleRedactColor();
 
 	// Organize side panel (extends ThumbPanel::organizeMode_).
 	void enterOrganizeMode(std::vector<PdfDocument::PagePlanEntry> seed);
@@ -1702,9 +1708,12 @@ private:
 	HWND redactLabel_ = nullptr;
 	HWND redactApply_ = nullptr;
 	HWND redactClear_ = nullptr;
+	HWND redactColorBtn_ = nullptr;
 	HWND redactDone_ = nullptr;
 	bool redactBarVisible_ = false;
 	int redactBarH_ = 0;
+	// Box color applyRedactionsCmd() uses; toggled by redactColorBtn_.
+	bool redactWhiteBox_ = false;
 
 	// Print side panel -- replaces the native print dialog. Right-docked
 	// (canvas shrinks to make room, see layout()); settings changes drive
@@ -4188,7 +4197,7 @@ void CanvasView::onPaint()
 			RECT r = { std::min(dragStartX_, dragCurX_), std::min(dragStartY_, dragCurY_),
 				std::max(dragStartX_, dragCurX_), std::max(dragStartY_, dragCurY_) };
 			if (tool_ == Tool::Highlight) FillAlpha(mem, r, highlightColor_, 60);
-			else if (tool_ == Tool::Redact) FillAlpha(mem, r, RGB(0, 0, 0), 180);
+			else if (tool_ == Tool::Redact) FillAlpha(mem, r, redactBoxWhite_ ? RGB(255, 255, 255) : RGB(0, 0, 0), 180);
 			HPEN pen = CreatePen(PS_DOT, 1, RGB(40, 40, 40));
 			HGDIOBJ oldPen = SelectObject(mem, pen);
 			HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
@@ -6568,10 +6577,13 @@ void FrameWindow::createChildren()
 	redactClear_ = CreateWindowExW(0, L"BUTTON", L"Clear All",
 		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
 		reinterpret_cast<HMENU>(IDC_REDACT_CLEAR), hInst_, nullptr);
+	redactColorBtn_ = CreateWindowExW(0, L"BUTTON", L"Box Color: Black",
+		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
+		reinterpret_cast<HMENU>(IDC_REDACT_COLOR), hInst_, nullptr);
 	redactDone_ = CreateWindowExW(0, L"BUTTON", L"Done",
 		WS_CHILD | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd_,
 		reinterpret_cast<HMENU>(IDC_REDACT_DONE), hInst_, nullptr);
-	for (HWND h : { redactLabel_, redactApply_, redactClear_, redactDone_ })
+	for (HWND h : { redactLabel_, redactApply_, redactClear_, redactColorBtn_, redactDone_ })
 		SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
 	redactBarH_ = Scale(34, GetDpiForWindow(hwnd_));
 
@@ -7208,8 +7220,9 @@ void FrameWindow::updateRedactBar()
 	bool show = canvas_ && doc_ && doc_->isOpen() && doc_->isPdf() && canvas_->tool() == CanvasView::Tool::Redact;
 	redactBarVisible_ = show;
 	int sw = show ? SW_SHOW : SW_HIDE;
-	for (HWND h : { redactLabel_, redactApply_, redactClear_, redactDone_ })
+	for (HWND h : { redactLabel_, redactApply_, redactClear_, redactColorBtn_, redactDone_ })
 		ShowWindow(h, sw);
+	if (canvas_) canvas_->setRedactBoxWhite(redactWhiteBox_);
 	if (show) {
 		int n = doc_->pendingRedactionCount();
 		wchar_t buf[160];
@@ -7218,6 +7231,7 @@ void FrameWindow::updateRedactBar()
 		SetWindowTextW(redactLabel_, buf);
 		EnableWindow(redactApply_, n > 0);
 		EnableWindow(redactClear_, n > 0);
+		SetWindowTextW(redactColorBtn_, redactWhiteBox_ ? L"Box Color: White" : L"Box Color: Black");
 	}
 	layout();
 }
@@ -7541,7 +7555,7 @@ void FrameWindow::applyRedactionsCmd()
 	if (r != IDYES) return;
 	if (canvas_) canvas_->flushPendingEdit();
 	std::string err;
-	if (!doc_->applyRedactions(err)) {
+	if (!doc_->applyRedactions(redactWhiteBox_, err)) {
 		std::wstring wmsg(err.begin(), err.end());
 		MessageBoxW(hwnd_, wmsg.empty() ? L"Failed to apply redactions." : wmsg.c_str(),
 			L"Apply Redactions", MB_OK | MB_ICONERROR);
@@ -7561,6 +7575,13 @@ void FrameWindow::clearRedactions()
 		if (canvas_) canvas_->refreshAfterSave();
 		if (thumbs_) thumbs_->refreshAfterSave();
 	}
+	updateRedactBar();
+}
+
+void FrameWindow::toggleRedactColor()
+{
+	redactWhiteBox_ = !redactWhiteBox_;
+	if (canvas_) canvas_->setRedactBoxWhite(redactWhiteBox_);
 	updateRedactBar();
 }
 
@@ -8484,10 +8505,12 @@ void FrameWindow::layout()
 		int btnW1 = Scale(130, dpi);
 		int btnW2 = Scale(80, dpi);
 		int btnW3 = Scale(60, dpi);
+		int btnW4 = Scale(110, dpi);
 		int x = fullW0 - pad - btnW3;
 		MoveWindow(redactDone_, x, y, btnW3, h, TRUE); x -= pad + btnW2;
 		MoveWindow(redactClear_, x, y, btnW2, h, TRUE); x -= pad + btnW1;
-		MoveWindow(redactApply_, x, y, btnW1, h, TRUE); x -= pad;
+		MoveWindow(redactApply_, x, y, btnW1, h, TRUE); x -= pad + btnW4;
+		MoveWindow(redactColorBtn_, x, y, btnW4, h, TRUE); x -= pad;
 		MoveWindow(redactLabel_, Scale(6, dpi), y, std::max(0, x - Scale(6, dpi)), h, TRUE);
 		top += redactBarH_;
 	}
@@ -9774,6 +9797,7 @@ void FrameWindow::onCommand(int id)
 	case IDC_WEBPDF_CLOSE: showWebPdfBar(false); break;
 	case IDC_REDACT_APPLY: applyRedactionsCmd(); break;
 	case IDC_REDACT_CLEAR: clearRedactions(); break;
+	case IDC_REDACT_COLOR: toggleRedactColor(); break;
 	case IDC_REDACT_DONE: selectTool(IDM_TOOL_SELECT); break;
 	case IDM_TOOLS_MENU: showToolsMenu(); break;
 	case IDM_TOOLS_ORGANIZE: enterOrganizeMode({}); break;
