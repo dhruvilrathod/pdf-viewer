@@ -476,15 +476,27 @@ bool ChooseFontMapped(HWND owner, std::string& fontOut, float& sizeOut, COLORREF
 	return true;
 }
 
+// A dropped file's full path, without DragQueryFile's fixed-buffer MAX_PATH
+// truncation (deep synced-folder paths run past 260 chars).
+std::wstring DroppedFilePath(HDROP drop, UINT index)
+{
+	UINT len = DragQueryFileW(drop, index, nullptr, 0);
+	if (len == 0) return L"";
+	std::wstring p(len + 1, L'\0');
+	UINT got = DragQueryFileW(drop, index, p.data(), len + 1);
+	p.resize(got);
+	return p;
+}
+
 std::wstring OpenFileDialog(HWND owner)
 {
-	wchar_t file[MAX_PATH] = L"";
+	wchar_t file[32768] = L"";
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = owner;
 	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
 	ofn.lpstrFile = file;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.nMaxFile = 32768;
 	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
 	ofn.lpstrTitle = L"Open PDF";
 	if (GetOpenFileNameW(&ofn)) return file;
@@ -5224,9 +5236,10 @@ void FileListPanel::onDropFiles(HDROP drop)
 {
 	UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
 	std::vector<std::wstring> dropped;
-	wchar_t path[MAX_PATH];
-	for (UINT i = 0; i < n; ++i)
-		if (DragQueryFileW(drop, i, path, MAX_PATH)) dropped.push_back(path);
+	for (UINT i = 0; i < n; ++i) {
+		std::wstring p = DroppedFilePath(drop, i);
+		if (!p.empty()) dropped.push_back(std::move(p));
+	}
 	DragFinish(drop);
 	if (!dropped.empty()) addFiles(dropped);
 }
@@ -7387,14 +7400,14 @@ void FrameWindow::doSaveRangeAsPdf()
 	size_t dot = stem.find_last_of(L'.');
 	if (dot != std::wstring::npos) stem = stem.substr(0, dot);
 	if (stem.empty()) stem = L"Document";
-	wchar_t file[MAX_PATH] = L"";
+	wchar_t file[32768] = L"";
 	wcsncpy_s(file, (stem + L"-pages.pdf").c_str(), _TRUNCATE);
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = hwnd_;
 	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0";
 	ofn.lpstrFile = file;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.nMaxFile = 32768;
 	ofn.lpstrDefExt = L"pdf";
 	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 	ofn.lpstrTitle = L"Save Pages as PDF";
@@ -7407,10 +7420,10 @@ void FrameWindow::doSaveRangeAsPdf()
 			L"Save as PDF", MB_OK | MB_ICONERROR);
 		return; // leave the panel open so the user can retry
 	}
-	wchar_t msg[MAX_PATH + 96];
-	swprintf(msg, MAX_PATH + 96, L"Saved %d page%s to:\n%s",
-		static_cast<int>(pages.size()), pages.size() == 1 ? L"" : L"s", file);
-	MessageBoxW(hwnd_, msg, L"Save as PDF", MB_OK | MB_ICONINFORMATION);
+	wchar_t pageWord[3] = L"";
+	if (pages.size() != 1) wcscpy_s(pageWord, L"s");
+	std::wstring msg = L"Saved " + std::to_wstring(pages.size()) + L" page" + pageWord + L" to:\n" + file;
+	MessageBoxW(hwnd_, msg.c_str(), L"Save as PDF", MB_OK | MB_ICONINFORMATION);
 	showPrintPanel(false);
 }
 
@@ -7726,7 +7739,7 @@ void FrameWindow::finishConvertToPdf(const std::vector<std::wstring>& files)
 	size_t dot = base.find_last_of(L'.');
 	if (dot != std::wstring::npos) base = base.substr(0, dot);
 	std::wstring outPath = folder + L"\\" + base + L".pdf";
-	for (int n = 1; GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES && n <= 20; ++n) {
+	for (int n = 1; GetFileAttributesW(LongPathW(outPath).c_str()) != INVALID_FILE_ATTRIBUTES && n <= 20; ++n) {
 		wchar_t suffix[32];
 		swprintf(suffix, 32, n == 1 ? L"_converted.pdf" : L"_converted%d.pdf", n);
 		outPath = folder + L"\\" + base + suffix;
@@ -8107,14 +8120,14 @@ void FrameWindow::runWebToPdf()
 	// host (e.g. "example.com") contains a dot, so the Save dialog would
 	// treat ".com" as an already-given extension and skip appending
 	// lpstrDefExt -- append ".pdf" explicitly instead of relying on that.
-	wchar_t file[MAX_PATH] = L"";
+	wchar_t file[32768] = L"";
 	wcscpy_s(file, (host + L".pdf").c_str());
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = hwnd_;
 	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0";
 	ofn.lpstrFile = file;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.nMaxFile = 32768;
 	ofn.lpstrDefExt = L"pdf";
 	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 	ofn.lpstrTitle = L"Save Web Page as PDF";
@@ -9103,13 +9116,13 @@ void FrameWindow::zipSelectedTabs(std::vector<int> indices)
 	}
 	if (paths.empty()) { MessageBeep(MB_ICONWARNING); return; }
 
-	wchar_t file[MAX_PATH] = L"Documents.zip";
+	wchar_t file[32768] = L"Documents.zip";
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = hwnd_;
 	ofn.lpstrFilter = L"Zip Archive (*.zip)\0*.zip\0";
 	ofn.lpstrFile = file;
-	ofn.nMaxFile = MAX_PATH;
+	ofn.nMaxFile = 32768;
 	ofn.lpstrDefExt = L"zip";
 	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 	ofn.lpstrTitle = L"Zip Selected Tabs";
@@ -10116,14 +10129,14 @@ void FrameWindow::saveDocument(bool saveAs)
 	DocTab* at = tabs_[activeTab_].get();
 	std::wstring target = at->path;
 	if (saveAs || at->path.empty()) {
-		wchar_t file[MAX_PATH] = L"";
+		wchar_t file[32768] = L"";
 		if (!at->name.empty()) wcscpy_s(file, at->name.c_str());
 		OPENFILENAMEW ofn = {};
 		ofn.lStructSize = sizeof(ofn);
 		ofn.hwndOwner = hwnd_;
 		ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0";
 		ofn.lpstrFile = file;
-		ofn.nMaxFile = MAX_PATH;
+		ofn.nMaxFile = 32768;
 		ofn.lpstrDefExt = L"pdf";
 		ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 		ofn.lpstrTitle = L"Save PDF As";
@@ -10470,9 +10483,10 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_DROPFILES: {
 		HDROP drop = reinterpret_cast<HDROP>(wp);
 		UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-		wchar_t path[MAX_PATH];
-		for (UINT i = 0; i < n; ++i)
-			if (DragQueryFileW(drop, i, path, MAX_PATH)) self->openDocument(path);
+		for (UINT i = 0; i < n; ++i) {
+			std::wstring p = DroppedFilePath(drop, i);
+			if (!p.empty()) self->openDocument(p.c_str());
+		}
 		DragFinish(drop);
 		return 0;
 	}

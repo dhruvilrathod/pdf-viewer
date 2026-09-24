@@ -17,6 +17,11 @@ extern "C" {
 }
 
 namespace {
+std::wstring longPath(const std::wstring& p);
+}
+std::wstring LongPathW(const std::wstring& p) { return longPath(p); }
+
+namespace {
 
 // Convert a wide (UTF-16) path to UTF-8 for MuPDF, which takes UTF-8 paths
 // and re-widens them internally for the Win32 file APIs.
@@ -28,6 +33,23 @@ std::string toUtf8(const wchar_t* w)
 	std::string s(static_cast<size_t>(n - 1), '\0');
 	WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
 	return s;
+}
+
+// Win32 file APIs (and the CRT's _wfopen that MuPDF uses) reject paths of
+// MAX_PATH (260) chars or more unless they carry the "\\?\" prefix -- deep
+// OneDrive/SharePoint folders routinely exceed that. Only paths near the
+// limit are touched so everything shorter behaves exactly as before; the
+// threshold leaves headroom for the ".pdfviewer_tmp" style suffixes that get
+// appended to a target path.
+std::wstring longPath(const std::wstring& p)
+{
+	if (p.size() < 240) return p;
+	if (p.compare(0, 4, L"\\\\?\\") == 0) return p;
+	std::wstring q = p;
+	std::replace(q.begin(), q.end(), L'/', L'\\');
+	if (q.compare(0, 2, L"\\\\") == 0) return L"\\\\?\\UNC\\" + q.substr(2);
+	if (q.size() > 2 && q[1] == L':' && q[2] == L'\\') return L"\\\\?\\" + q;
+	return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +288,8 @@ bool PdfDocument::open(const wchar_t* path, std::string& error, bool& needsPassw
 	if (!ctx_) { error = "MuPDF context not initialized"; return false; }
 
 	close();
-	std::string upath = toUtf8(path);
+	std::wstring lpath = longPath(path);
+	std::string upath = toUtf8(lpath.c_str());
 
 	// Read the whole file into an in-memory buffer and open from that,
 	// rather than fz_open_document(path) -- the latter keeps a FILE* open
@@ -288,7 +311,7 @@ bool PdfDocument::open(const wchar_t* path, std::string& error, bool& needsPassw
 		return false;
 	}
 
-	openedPath_ = path;
+	openedPath_ = lpath;
 
 	if (fz_needs_password(ctx_, doc_)) {
 		needsPassword = true;
@@ -1494,7 +1517,7 @@ int PdfDocument::openExternalFile(const wchar_t* path, std::string& err)
 {
 	if (!ctx_) { err = "no context"; return -1; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
-	std::string upath = toUtf8(path);
+	std::string upath = toUtf8(longPath(path).c_str());
 	fz_document* d = nullptr;
 	fz_try(ctx_) {
 		d = fz_open_document(ctx_, upath.c_str());
@@ -1860,7 +1883,7 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 	// verify the result actually opens and renders, and only then replace
 	// the original. This makes a bad/interrupted write unable to destroy
 	// the user's file, regardless of what causes it.
-	std::wstring wtarget(path);
+	std::wstring wtarget = longPath(path);
 	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
 	std::string utemp = toUtf8(wtemp.c_str());
 
@@ -1991,7 +2014,7 @@ bool PdfDocument::exportPages(const std::vector<int>& pageIndices, const wchar_t
 	// Same never-overwrite-directly discipline as writeAndReplace(), but this
 	// document's own live handle/openedPath_ are untouched -- exportPages()
 	// produces a standalone file, not a save of *this* document.
-	std::wstring wtarget(path);
+	std::wstring wtarget = longPath(path);
 	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
 	std::string utemp = toUtf8(wtemp.c_str());
 	bool wrote = false;
@@ -2076,7 +2099,7 @@ bool graftAllPagesFrom(fz_context* ctx, pdf_document* dst, const char* srcUtf8Pa
 // legacy ANSI (system codepage) as a last-resort fallback for older files.
 std::wstring readTextFileWide(const wchar_t* path)
 {
-	HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+	HANDLE h = CreateFileW(longPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (h == INVALID_HANDLE_VALUE) return {};
 	LARGE_INTEGER sz{};
 	GetFileSizeEx(h, &sz);
@@ -2273,7 +2296,7 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 
 	for (const auto& path : paths) {
 		ConvertKind kind = classifyForConvert(path);
-		std::string upath = toUtf8(path.c_str());
+		std::string upath = toUtf8(longPath(path).c_str());
 		if (kind == ConvertKind::Image) {
 			fz_image* img = nullptr;
 			fz_try(ctx) {
@@ -2358,7 +2381,7 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 
 	// Same write-to-temp-verify-move discipline as exportPages() -- this
 	// isn't a live document, so no in-memory state to worry about either way.
-	std::wstring wtarget(outPath);
+	std::wstring wtarget = longPath(outPath);
 	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
 	std::string utemp = toUtf8(wtemp.c_str());
 	int pageCount = 0;
@@ -2407,7 +2430,7 @@ bool PdfDocument::ZipFiles(const std::vector<std::wstring>& paths, const wchar_t
 
 	// Same write-to-temp-then-rename discipline as ConvertFilesToPdf() --
 	// a half-written zip never becomes the visible output file.
-	std::wstring wtarget(outPath);
+	std::wstring wtarget = longPath(outPath);
 	std::wstring wtemp = wtarget + L".pdfviewer_tmp";
 	std::string utemp = toUtf8(wtemp.c_str());
 
@@ -2441,7 +2464,7 @@ bool PdfDocument::ZipFiles(const std::vector<std::wstring>& paths, const wchar_t
 
 	bool anyOk = false;
 	for (const auto& path : paths) {
-		std::string upath = toUtf8(path.c_str());
+		std::string upath = toUtf8(longPath(path).c_str());
 		std::string entryName = toUtf8(entryNameFor(path).c_str());
 		fz_buffer* buf = nullptr;
 		fz_try(ctx) {

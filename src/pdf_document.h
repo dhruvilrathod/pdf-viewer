@@ -18,6 +18,10 @@ extern "C" { typedef struct pdf_annot pdf_annot; }
 
 struct PageSizePt { float w = 0.0f; float h = 0.0f; }; // page size in points (1/72")
 
+// Adds the "\\?\" long-path prefix to an absolute path near/over MAX_PATH so
+// Win32/CRT file APIs accept it; shorter paths come back unchanged.
+std::wstring LongPathW(const std::wstring& p);
+
 // An axis-aligned rectangle in a page's coordinate space (points).
 struct PageRectPt { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; };
 
