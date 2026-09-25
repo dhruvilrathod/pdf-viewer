@@ -210,6 +210,15 @@ public:
 	// no certificate, no signing time, no audit trail, by design.
 	bool addImageStamp(int page, PageRectPt rect, const unsigned char* bgra,
 		int w, int h, std::string& err);
+	// Same kind of movable/resizable image stamp, from an encoded image file's
+	// bytes (PNG/JPEG/BMP/GIF/TIFF...), kept in that encoding and turned
+	// upright per any EXIF orientation. Backs Insert Image and pasting an
+	// image; Flatten Edits Only bakes it into the page like any other stamp.
+	bool addEncodedImageStamp(int page, PageRectPt rect, const std::vector<unsigned char>& bytes,
+		std::string& err);
+	// Upright size of an encoded image in points, at its own DPI (96 if none).
+	bool encodedImageSizePt(const std::vector<unsigned char>& bytes, float& wPt, float& hPt,
+		std::string& err);
 
 	// Marks a region for redaction (shown as a solid box, black or white --
 	// see applyRedactions()). Nothing is actually removed from the page until

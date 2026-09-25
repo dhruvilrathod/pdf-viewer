@@ -488,17 +488,106 @@ std::wstring DroppedFilePath(HDROP drop, UINT index)
 	return p;
 }
 
-std::wstring OpenFileDialog(HWND owner)
+bool IsImageFileName(const std::wstring& path)
+{
+	size_t dot = path.find_last_of(L'.');
+	if (dot == std::wstring::npos) return false;
+	std::wstring ext = path.substr(dot + 1);
+	for (const wchar_t* e : { L"png", L"jpg", L"jpeg", L"jfif", L"bmp", L"gif", L"tif", L"tiff" })
+		if (_wcsicmp(ext.c_str(), e) == 0) return true;
+	return false;
+}
+
+bool ReadFileBytes(const std::wstring& path, std::vector<unsigned char>& out)
+{
+	HANDLE h = CreateFileW(LongPathW(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr, OPEN_EXISTING, 0, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return false;
+	LARGE_INTEGER sz{};
+	bool ok = GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart < (512LL << 20);
+	if (ok) {
+		out.resize(static_cast<size_t>(sz.QuadPart));
+		DWORD got = 0;
+		ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &got, nullptr) && got == out.size();
+	}
+	CloseHandle(h);
+	return ok;
+}
+
+// Pulls an image off the clipboard as encoded file bytes MuPDF can decode:
+// a copied image FILE (Explorer) first, then the "PNG" format browsers and
+// Office put there (keeps transparency), then plain CF_DIB (screenshots,
+// Paint) wrapped in a BMP file header.
+bool ReadClipboardImage(HWND owner, std::vector<unsigned char>& out)
+{
+	static const UINT cfPng = RegisterClipboardFormatW(L"PNG");
+	bool opened = false;
+	for (int i = 0; i < 10 && !(opened = OpenClipboard(owner) != FALSE); ++i) Sleep(20);
+	if (!opened) return false;
+	bool ok = false;
+	if (HANDLE hd = GetClipboardData(CF_HDROP)) {
+		HDROP drop = static_cast<HDROP>(hd);
+		UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+		for (UINT i = 0; i < n && !ok; ++i) {
+			std::wstring p = DroppedFilePath(drop, i);
+			if (IsImageFileName(p)) ok = ReadFileBytes(p, out);
+		}
+	}
+	if (!ok && cfPng) {
+		if (HANDLE hg = GetClipboardData(cfPng)) {
+			SIZE_T n = GlobalSize(hg);
+			if (const void* p = GlobalLock(hg)) {
+				const unsigned char* b = static_cast<const unsigned char*>(p);
+				out.assign(b, b + n);
+				GlobalUnlock(hg);
+				ok = n > 8;
+			}
+		}
+	}
+	if (!ok) {
+		if (HANDLE hg = GetClipboardData(CF_DIB)) {
+			SIZE_T n = GlobalSize(hg);
+			if (const void* p = GlobalLock(hg)) {
+				const auto* bih = static_cast<const BITMAPINFOHEADER*>(p);
+				if (n >= sizeof(BITMAPINFOHEADER) && bih->biSize >= sizeof(BITMAPINFOHEADER) && bih->biSize <= n) {
+					// A .bmp file is the DIB plus a 14-byte header whose one
+					// non-obvious field is where the pixels start: after the
+					// info header, BI_BITFIELDS masks (only trailing a plain
+					// 40-byte header), and any palette.
+					DWORD colors = bih->biClrUsed ? bih->biClrUsed
+						: (bih->biBitCount <= 8 ? (1u << bih->biBitCount) : 0);
+					DWORD masks = (bih->biSize == sizeof(BITMAPINFOHEADER) && bih->biCompression == BI_BITFIELDS) ? 12 : 0;
+					BITMAPFILEHEADER fh = {};
+					fh.bfType = 0x4D42; // "BM"
+					fh.bfSize = static_cast<DWORD>(sizeof(fh) + n);
+					fh.bfOffBits = static_cast<DWORD>(sizeof(fh) + bih->biSize + masks + colors * 4);
+					out.resize(sizeof(fh) + n);
+					memcpy(out.data(), &fh, sizeof(fh));
+					memcpy(out.data() + sizeof(fh), p, n);
+					ok = true;
+				}
+				GlobalUnlock(hg);
+			}
+		}
+	}
+	CloseClipboard();
+	if (!ok) out.clear();
+	return ok;
+}
+
+std::wstring OpenFileDialog(HWND owner,
+	const wchar_t* filter = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0",
+	const wchar_t* title = L"Open PDF")
 {
 	wchar_t file[32768] = L"";
 	OPENFILENAMEW ofn = {};
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = owner;
-	ofn.lpstrFilter = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
+	ofn.lpstrFilter = filter;
 	ofn.lpstrFile = file;
 	ofn.nMaxFile = 32768;
 	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-	ofn.lpstrTitle = L"Open PDF";
+	ofn.lpstrTitle = title;
 	if (GetOpenFileNameW(&ofn)) return file;
 	return L"";
 }
@@ -738,6 +827,15 @@ public:
 	// middle of the view if the cursor isn't over one) and selects it.
 	bool pasteStamp();
 	bool hasCopiedStamp() const { return stampClipIndex_ >= 0; }
+	// Clipboard sequence number when the stamp above was copied: an image
+	// copied anywhere AFTER that is what a Ctrl+V should paste instead.
+	DWORD stampClipSeq() const { return stampClipSeq_; }
+	// Adds an encoded image (PNG/JPEG/...) as a new stamp -- centred on `at`
+	// (canvas client coords) when that's over a page, else on the current
+	// page -- at its natural size capped to 60% of the page, then selects it
+	// so it can be moved/resized straight away.
+	bool placeEncodedImage(const std::vector<unsigned char>& bytes, const POINT* at, std::string& err);
+	POINT lastMousePos() const { return { lastMouseX_, lastMouseY_ }; }
 	// Commits whatever the user is currently typing (form field or new
 	// text-box annotation) so Save never silently drops in-progress edits.
 	void flushPendingEdit() { if (inlineEdit_) commitInlineEdit(true); }
@@ -1009,6 +1107,7 @@ private:
 	// serialised out and back.
 	int stampClipPage_ = -1;
 	int stampClipIndex_ = -1;
+	DWORD stampClipSeq_ = 0;
 	float stampClipW_ = 0.0f, stampClipH_ = 0.0f;
 	// Where the cursor last was over a page, so a paste can land there.
 	int lastMouseX_ = 0, lastMouseY_ = 0;
@@ -1438,6 +1537,12 @@ private:
 	void doCompress();
 	void doMerge();
 	void doConvertToPdf();
+	// Images as movable stamps (Tools > Insert Image, Ctrl+V, dropping an
+	// image file onto an open PDF). `canvasPt` is where to centre it, in
+	// canvas client coords, or null for the current page's centre.
+	void pasteCmd();
+	void insertImageFromFile();
+	bool placeImageBytes(const std::vector<unsigned char>& bytes, const POINT* canvasPt);
 
 	// Split bar (see splitVisible_'s comment).
 	void showSplitBar(bool show);
@@ -2500,6 +2605,39 @@ bool CanvasView::copySelectedStamp()
 	stampClipIndex_ = stampSelIndex_;
 	stampClipW_ = stampSelRect_.x1 - stampSelRect_.x0;
 	stampClipH_ = stampSelRect_.y1 - stampSelRect_.y0;
+	stampClipSeq_ = GetClipboardSequenceNumber();
+	return true;
+}
+
+bool CanvasView::placeEncodedImage(const std::vector<unsigned char>& bytes, const POINT* at, std::string& err)
+{
+	if (!doc_ || !doc_->isOpen() || !doc_->isPdf()) { err = "Open a PDF first."; return false; }
+	float w = 0.0f, h = 0.0f;
+	if (!doc_->encodedImageSizePt(bytes, w, h, err)) return false;
+
+	int page = -1; float cx = 0.0f, cy = 0.0f;
+	if (!at || !hitTestPage(at->x, at->y, page, cx, cy)) {
+		page = currentPage_;
+		if (page < 0 || page >= doc_->pageCount()) { err = "no page to place the image on"; return false; }
+		PageRectPt b = doc_->pageBound(page);
+		cx = (b.x0 + b.x1) / 2; cy = (b.y0 + b.y1) / 2;
+	}
+	PageRectPt b = doc_->pageBound(page);
+	float pw = b.x1 - b.x0, ph = b.y1 - b.y0;
+	float scale = std::min({ 1.0f, 0.6f * pw / w, 0.6f * ph / h });
+	w *= scale; h *= scale;
+	// Centred on the target point, then nudged back inside the page so no
+	// part of it lands off the edge.
+	float x0 = std::clamp(cx - w / 2, b.x0, std::max(b.x0, b.x1 - w));
+	float y0 = std::clamp(cy - h / 2, b.y0, std::max(b.y0, b.y1 - h));
+	PageRectPt dst{ x0, y0, x0 + w, y0 + h };
+	if (!doc_->addEncodedImageStamp(page, dst, bytes, err)) return false;
+
+	invalidatePage(page);
+	invalidate();
+	if (onChanged_) onChanged_();
+	AnnotInfo placed = doc_->annotAt(page, { (dst.x0 + dst.x1) / 2, (dst.y0 + dst.y1) / 2 });
+	if (placed.kind == AnnotKind::Stamp) selectStamp(page, placed);
 	return true;
 }
 
@@ -2893,7 +3031,7 @@ void CanvasView::onRButtonDown(int mx, int my)
 	// popup; highlights/ink go via the eraser).
 	if (doc_ && doc_->isPdf() && doc_->annotAt(page, { px, py }).kind == AnnotKind::Stamp) {
 		HMENU sigMenu = CreatePopupMenu();
-		AppendMenuW(sigMenu, MF_STRING, IDM_SIG_REMOVE, L"Remove Signature");
+		AppendMenuW(sigMenu, MF_STRING, IDM_SIG_REMOVE, L"Remove");
 		POINT sp{ mx, my };
 		ClientToScreen(hwnd_, &sp);
 		int cmd = TrackPopupMenu(sigMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, sp.x, sp.y, 0, hwnd_, nullptr);
@@ -7720,6 +7858,66 @@ void FrameWindow::finishMerge(const std::vector<std::wstring>& files)
 	layout();
 }
 
+bool FrameWindow::placeImageBytes(const std::vector<unsigned char>& bytes, const POINT* canvasPt)
+{
+	if (!canvas_ || !doc_ || !doc_->isOpen() || !doc_->isPdf()) {
+		MessageBoxW(hwnd_, L"Open a PDF first, then add the image to it.", L"Insert Image",
+			MB_OK | MB_ICONINFORMATION);
+		return false;
+	}
+	canvas_->flushPendingEdit();
+	// The move/resize handles only work under Select (or Sign, which shares
+	// them); from any other tool the new image would land unselected.
+	CanvasView::Tool t = canvas_->tool();
+	if (t != CanvasView::Tool::Select && t != CanvasView::Tool::Sign) selectTool(IDM_TOOL_SELECT);
+	std::string err;
+	if (!canvas_->placeEncodedImage(bytes, canvasPt, err)) {
+		std::wstring wmsg = L"Could not add the image.";
+		if (!err.empty()) wmsg += L"\n\n" + std::wstring(err.begin(), err.end());
+		MessageBoxW(hwnd_, wmsg.c_str(), L"Insert Image", MB_OK | MB_ICONWARNING);
+		return false;
+	}
+	updateTitle();
+	return true;
+}
+
+void FrameWindow::insertImageFromFile()
+{
+	if (!doc_ || !doc_->isOpen() || !doc_->isPdf()) {
+		MessageBoxW(hwnd_, L"Open a PDF first, then add the image to it.", L"Insert Image",
+			MB_OK | MB_ICONINFORMATION);
+		return;
+	}
+	std::wstring path = OpenFileDialog(hwnd_,
+		L"Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff)\0*.png;*.jpg;*.jpeg;*.jfif;*.bmp;*.gif;*.tif;*.tiff\0All Files (*.*)\0*.*\0",
+		L"Insert Image");
+	if (path.empty()) return;
+	std::vector<unsigned char> bytes;
+	if (!ReadFileBytes(path, bytes)) {
+		MessageBoxW(hwnd_, L"Could not read that file.", L"Insert Image", MB_OK | MB_ICONWARNING);
+		return;
+	}
+	placeImageBytes(bytes, nullptr);
+}
+
+void FrameWindow::pasteCmd()
+{
+	if (!canvas_) return;
+	// A signature copied with Ctrl+C wins only while nothing newer has been
+	// copied anywhere -- otherwise a screenshot taken afterwards would be
+	// unpasteable until the app forgot the old signature copy.
+	bool stampIsNewest = canvas_->hasCopiedStamp() && GetClipboardSequenceNumber() == canvas_->stampClipSeq();
+	if (!stampIsNewest) {
+		std::vector<unsigned char> bytes;
+		if (ReadClipboardImage(hwnd_, bytes)) {
+			POINT at = canvas_->lastMousePos();
+			placeImageBytes(bytes, &at);
+			return;
+		}
+	}
+	canvas_->pasteStamp();
+}
+
 void FrameWindow::doConvertToPdf()
 {
 	fileListPanel_->setFiles({});
@@ -9762,7 +9960,8 @@ void FrameWindow::onCommand(int id)
 		if (canvas_ && canvas_->copySelectedStamp()) break;
 		if (canvas_) canvas_->copySelectionToClipboard();
 		break;
-	case IDM_EDIT_PASTE: if (canvas_) canvas_->pasteStamp(); break;
+	case IDM_EDIT_PASTE: pasteCmd(); break;
+	case IDM_TOOLS_INSERT_IMAGE: insertImageFromFile(); break;
 	case IDM_CANCEL_SIGN:
 		// Escape from anywhere -- notably while focus sits in the signature
 		// panel, whose buttons and lists would otherwise swallow the key. Only
@@ -9960,6 +10159,8 @@ void FrameWindow::showToolsMenu()
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_ORGANIZE, L"Organize Pages");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_MERGE, L"Merge PDFs...");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_SPLIT, L"Split PDF...");
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	AppendMenuW(m, MF_STRING, IDM_TOOLS_INSERT_IMAGE, L"Insert Image...");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_RESIZE_A4, L"Resize Pages to A4");
 	AppendMenuW(m, MF_STRING, IDM_TOOLS_FLATTEN, L"Flatten to Image (Read-Only)");
@@ -10483,9 +10684,22 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_DROPFILES: {
 		HDROP drop = reinterpret_cast<HDROP>(wp);
 		UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+		// An image dropped onto an open PDF is placed on it where it was
+		// dropped; anything else (or with no PDF open) opens as a document.
+		POINT at{};
+		DragQueryPoint(drop, &at);
+		if (self->canvas_) MapWindowPoints(hwnd, self->canvas_->hwnd(), &at, 1);
 		for (UINT i = 0; i < n; ++i) {
 			std::wstring p = DroppedFilePath(drop, i);
-			if (!p.empty()) self->openDocument(p.c_str());
+			if (p.empty()) continue;
+			bool pdfOpen = self->doc_ && self->doc_->isOpen() && self->doc_->isPdf();
+			std::vector<unsigned char> bytes;
+			if (pdfOpen && IsImageFileName(p) && ReadFileBytes(p, bytes)) {
+				self->placeImageBytes(bytes, &at);
+				at.x += 24; at.y += 24; // several images: cascade rather than stack exactly
+			} else {
+				self->openDocument(p.c_str());
+			}
 		}
 		DragFinish(drop);
 		return 0;

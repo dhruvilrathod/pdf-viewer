@@ -937,6 +937,131 @@ int wmain(int argc, wchar_t** argv)
 		return failures == 0 ? 0 : 1;
 	}
 
+	// --imagetest mode: Insert Image / paste-an-image, headlessly. Builds a
+	// blank page, places a half-transparent PNG and an EXIF-rotated JPEG via
+	// addEncodedImageStamp(), then checks real pixel colours after save+reopen
+	// and again after flattenAnnotationsToContent() (which must leave no
+	// annotations behind). `input` is unused. Writes <output>, <output>.flat.pdf
+	// and <output>.page0.png.
+	if (argc > 3 && wcscmp(argv[3], L"--imagetest") == 0) {
+		Gdiplus::GdiplusStartupInput gdipIn;
+		ULONG_PTR gdipToken = 0;
+		if (Gdiplus::GdiplusStartup(&gdipToken, &gdipIn, nullptr) != Gdiplus::Ok) return 1;
+		struct GdipShutdown { ULONG_PTR t; ~GdipShutdown() { Gdiplus::GdiplusShutdown(t); } } gdipGuard{ gdipToken };
+
+		// Left half red, right half blue; `clearRight` makes the blue half
+		// fully transparent instead.
+		auto encode = [](const wchar_t* mime, bool clearRight) {
+			std::vector<unsigned char> out;
+			Gdiplus::Bitmap bmp(200, 100, PixelFormat32bppARGB);
+			for (int y = 0; y < 100; ++y)
+				for (int x = 0; x < 200; ++x)
+					bmp.SetPixel(x, y, x < 100 ? Gdiplus::Color(255, 255, 0, 0)
+						: Gdiplus::Color(clearRight ? 0 : 255, 0, 0, 255));
+			UINT n = 0, sz = 0;
+			Gdiplus::GetImageEncodersSize(&n, &sz);
+			std::vector<BYTE> buf(sz);
+			auto* codecs = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buf.data());
+			Gdiplus::GetImageEncoders(n, sz, codecs);
+			IStream* st = nullptr;
+			CreateStreamOnHGlobal(nullptr, TRUE, &st);
+			for (UINT i = 0; i < n; ++i)
+				if (wcscmp(codecs[i].MimeType, mime) == 0) bmp.Save(st, &codecs[i].Clsid, nullptr);
+			HGLOBAL hg = nullptr;
+			GetHGlobalFromStream(st, &hg);
+			STATSTG stat = {};
+			st->Stat(&stat, STATFLAG_NONAME);
+			const unsigned char* p = static_cast<const unsigned char*>(GlobalLock(hg));
+			out.assign(p, p + stat.cbSize.QuadPart);
+			GlobalUnlock(hg);
+			st->Release();
+			return out;
+		};
+		std::vector<unsigned char> png = encode(L"image/png", true);
+		std::vector<unsigned char> jpg = encode(L"image/jpeg", false);
+		// Tag the JPEG with EXIF orientation 6 ("rotate 90 CW to view"), the
+		// way a phone camera stores a portrait photo: displayed upright it is
+		// 100 wide x 200 tall with the red half on TOP.
+		const unsigned char app1[] = {
+			0xFF, 0xE1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0, 'I', 'I', 0x2A, 0x00, 8, 0, 0, 0,
+			1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0 };
+		jpg.insert(jpg.begin() + 2, std::begin(app1), std::end(app1));
+
+		std::wstring txt = std::wstring(output) + L".blank.txt";
+		if (FILE* f = _wfopen(txt.c_str(), L"wb")) std::fclose(f);
+		std::wstring blank = std::wstring(output) + L".blank.pdf";
+		std::string e;
+		if (!PdfDocument::ConvertFilesToPdf({ txt }, blank.c_str(), e, nullptr)) { std::printf("blank page FAILED: %s\n", e.c_str()); return 2; }
+		DeleteFileW(txt.c_str());
+
+		PdfDocument doc; bool npw = false;
+		if (!doc.open(blank.c_str(), e, npw)) { std::printf("open FAILED: %s\n", e.c_str()); return 3; }
+		float pw = 0, ph = 0, jw = 0, jh = 0;
+		if (!doc.encodedImageSizePt(png, pw, ph, e) || !doc.encodedImageSizePt(jpg, jw, jh, e)) {
+			std::printf("size FAILED: %s\n", e.c_str()); return 4;
+		}
+		std::printf("natural size: png %.0fx%.0f pt, exif jpeg %.0fx%.0f pt (expect 150x75, 75x150)\n", pw, ph, jw, jh);
+		int failures = 0;
+		if (!(jh > jw)) { std::printf("FAIL: EXIF rotation did not swap the JPEG's axes\n"); ++failures; }
+		if (!doc.addEncodedImageStamp(0, { 50, 50, 250, 150 }, png, e) ||
+			!doc.addEncodedImageStamp(0, { 300, 50, 400, 250 }, jpg, e)) {
+			std::printf("addEncodedImageStamp FAILED: %s\n", e.c_str()); return 5;
+		}
+
+		auto sample = [](PdfDocument& d, int x, int y) {
+			PageBitmap bmp = d.renderPage(0, 1.0f);
+			HDC hdc = CreateCompatibleDC(nullptr);
+			HGDIOBJ old = SelectObject(hdc, bmp.hbmp);
+			COLORREF c = GetPixel(hdc, x, y);
+			SelectObject(hdc, old); DeleteDC(hdc);
+			return c;
+		};
+		auto isNear = [](COLORREF c, int r, int g, int b) {
+			return std::abs(GetRValue(c) - r) < 40 && std::abs(GetGValue(c) - g) < 40 && std::abs(GetBValue(c) - b) < 40;
+		};
+		auto check = [&](PdfDocument& d, const char* stage) {
+			struct { int x, y, r, g, b; const char* what; } pts[] = {
+				{ 100, 100, 255, 0, 0, "png left half = red" },
+				{ 200, 100, 255, 255, 255, "png right half = transparent (white page shows)" },
+				{ 350, 100, 255, 0, 0, "exif jpeg top half = red" },
+				{ 350, 200, 0, 0, 255, "exif jpeg bottom half = blue" },
+			};
+			for (auto& p : pts) {
+				COLORREF c = sample(d, p.x, p.y);
+				bool ok = isNear(c, p.r, p.g, p.b);
+				std::printf("  [%s] %-48s RGB(%3d,%3d,%3d) %s\n", stage, p.what,
+					GetRValue(c), GetGValue(c), GetBValue(c), ok ? "ok" : "FAIL");
+				if (!ok) ++failures;
+			}
+		};
+
+		if (!doc.save(output, false, e)) { std::printf("save FAILED: %s\n", e.c_str()); return 6; }
+		PdfDocument doc2;
+		if (!doc2.open(output, e, npw)) { std::printf("reopen FAILED: %s\n", e.c_str()); return 7; }
+		std::printf("saved + reopened: %zu annot(s) on page 0 (expect 2)\n", doc2.pageAnnots(0).size());
+		if (doc2.pageAnnots(0).size() != 2) ++failures;
+		check(doc2, "stamps");
+		{
+			PageBitmap pb = doc2.renderPage(0, 1.0f);
+			Gdiplus::Bitmap bmp(pb.hbmp, nullptr);
+			CLSID pngClsid = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+			std::wstring out = std::wstring(output) + L".page0.png";
+			bmp.Save(out.c_str(), &pngClsid, nullptr);
+		}
+
+		if (!doc2.flattenAnnotationsToContent(e)) { std::printf("flatten FAILED: %s\n", e.c_str()); return 8; }
+		std::wstring flat = std::wstring(output) + L".flat.pdf";
+		if (!doc2.save(flat.c_str(), false, e)) { std::printf("flat save FAILED: %s\n", e.c_str()); return 9; }
+		PdfDocument doc3;
+		if (!doc3.open(flat.c_str(), e, npw)) { std::printf("flat reopen FAILED: %s\n", e.c_str()); return 10; }
+		std::printf("flattened + reopened: %zu annot(s) on page 0 (expect 0)\n", doc3.pageAnnots(0).size());
+		if (!doc3.pageAnnots(0).empty()) ++failures;
+		check(doc3, "flat");
+		DeleteFileW(blank.c_str());
+		std::printf("\n--imagetest failures: %d\n", failures);
+		return failures == 0 ? 0 : 1;
+	}
+
 	// --signtest mode: exercises the Sign tool's PDF layer headlessly --
 	// RenderSignature() (both typed and drawn) -> addImageStamp() -> save ->
 	// reopen -> render, then a second pass through flattenAnnotationsToContent()

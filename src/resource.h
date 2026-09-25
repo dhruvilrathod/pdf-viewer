@@ -35,7 +35,7 @@
 #define IDM_EDIT_FINDPREV    1042
 #define IDM_EDIT_COPY        1043
 #define IDM_EDIT_SELECTALL   1044
-#define IDM_EDIT_PASTE       1045  // Ctrl+V: paste a copied signature at the cursor
+#define IDM_EDIT_PASTE       1045  // Ctrl+V: paste a clipboard image, or a copied signature, at the cursor
 #define IDM_CANCEL_SIGN      1046  // Escape while signing: back to Select (no-op otherwise)
 
 #define IDM_HELP_ABOUT       1030
@@ -98,6 +98,7 @@
 #define IDC_REDACT_CLEAR   1125
 #define IDC_REDACT_DONE    1126
 #define IDC_REDACT_COLOR   1234  // toggles the box color used at Apply time between black/white
+#define IDM_TOOLS_INSERT_IMAGE 1235  // Tools menu: place an image file on the page as a movable stamp
 
 // Organize side-panel action strip (bottom of the thumbnail column)
 #define IDC_ORGANIZE_INSERT  1127

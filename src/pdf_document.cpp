@@ -569,6 +569,72 @@ fz_rect normRect(PageRectPt r)
 	return out;
 }
 
+// EXIF orientations 2/4/6/8 (MuPDF's numbering) are quarter turns, so the
+// upright picture is the stored one with width and height swapped.
+bool orientationSwapsAxes(uint8_t o) { return o != 0 && (o & 1) == 0; }
+
+// The image's upright size in points, at its own encoded resolution (96 DPI
+// when it carries none -- screenshots and most web images).
+void imageDisplaySizePt(fz_context* ctx, fz_image* img, float& wPt, float& hPt)
+{
+	int xres = 0, yres = 0;
+	fz_image_resolution(img, &xres, &yres);
+	if (xres <= 0) xres = 96;
+	if (yres <= 0) yres = 96;
+	float w = img->w * 72.0f / xres, h = img->h * 72.0f / yres;
+	if (orientationSwapsAxes(fz_image_orientation(ctx, img))) std::swap(w, h);
+	wPt = w; hPt = h;
+}
+
+// Adds a Stamp annotation over `r` whose appearance is `img`, stretched to
+// fill it and turned upright per its EXIF orientation. Throws on failure.
+void createImageStampAnnot(fz_context* ctx, pdf_document* pdf, int page, fz_rect r, fz_image* img)
+{
+	pdf_page* pg = nullptr;
+	pdf_annot* annot = nullptr;
+	pdf_obj* imgRef = nullptr;
+	pdf_obj* res = nullptr;
+	fz_buffer* contents = nullptr;
+	fz_try(ctx) {
+		pg = pdf_load_page(ctx, pdf, page);
+		annot = pdf_create_annot(ctx, pg, PDF_ANNOT_STAMP);
+		pdf_set_annot_rect(ctx, annot, r);
+		// Must print: a signature or pasted image has to show up on paper and
+		// in every other viewer, not just on screen here.
+		pdf_set_annot_flags(ctx, annot, PDF_ANNOT_IS_PRINT);
+
+		float bw = r.x1 - r.x0, bh = r.y1 - r.y0;
+		imgRef = pdf_add_image(ctx, pdf, img);
+		res = pdf_new_dict(ctx, pdf, 1);
+		pdf_obj* xobj = pdf_dict_put_dict(ctx, res, PDF_NAME(XObject), 1);
+		pdf_dict_puts(ctx, xobj, "Im0", imgRef);
+		// fz_image_orientation_matrix works in MuPDF's y-down image space;
+		// conjugating it with a unit-square y-flip (F*O*F) expresses the same
+		// turn in PDF's y-up image space, where "Do" draws row 0 at the top.
+		fz_matrix flip = { 1, 0, 0, -1, 0, 1 };
+		fz_matrix o = fz_concat(fz_concat(flip, fz_image_orientation_matrix(ctx, img)), flip);
+		contents = fz_new_buffer(ctx, 96);
+		// An image XObject always draws into the unit square of the current
+		// transform, so this scales it to exactly fill the form's BBox --
+		// which the viewer in turn maps onto the annotation's /Rect.
+		fz_append_printf(ctx, contents, "q %g 0 0 %g 0 0 cm %g %g %g %g %g %g cm /Im0 Do Q",
+			bw, bh, o.a, o.b, o.c, o.d, o.e, o.f);
+		// Sets /AP /N directly (and marks the annotation as already
+		// resynthesised), so do NOT follow this with pdf_update_annot --
+		// that would hand the appearance back to MuPDF's own generator.
+		pdf_set_annot_appearance(ctx, annot, "N", nullptr, fz_identity,
+			fz_make_rect(0, 0, bw, bh), res, contents);
+	}
+	fz_always(ctx) {
+		if (contents) fz_drop_buffer(ctx, contents);
+		if (res) pdf_drop_obj(ctx, res);
+		if (imgRef) pdf_drop_obj(ctx, imgRef);
+		if (annot) pdf_drop_annot(ctx, annot);
+		if (pg) fz_drop_page(ctx, reinterpret_cast<fz_page*>(pg));
+	}
+	fz_catch(ctx) { fz_rethrow(ctx); }
+}
+
 } // namespace
 
 std::vector<PageRectPt> PdfDocument::textQuadsInRect(int page, PageRectPt rect)
@@ -905,13 +971,8 @@ bool PdfDocument::addImageStamp(int page, PageRectPt rect, const unsigned char* 
 	if (r.x1 - r.x0 < 1.0f || r.y1 - r.y0 < 1.0f) { err = "target area too small"; return false; }
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
-	pdf_page* pg = nullptr;
-	pdf_annot* annot = nullptr;
 	fz_pixmap* pix = nullptr;
 	fz_image* img = nullptr;
-	pdf_obj* imgRef = nullptr;
-	pdf_obj* res = nullptr;
-	fz_buffer* contents = nullptr;
 	bool ok = false;
 	fz_try(ctx_) {
 		// MuPDF pixmaps with an alpha channel are premultiplied, same as the
@@ -928,43 +989,71 @@ bool PdfDocument::addImageStamp(int page, PageRectPt rect, const unsigned char* 
 			}
 		}
 		img = fz_new_image_from_pixmap(ctx_, pix, nullptr);
-
-		pg = pdf_load_page(ctx_, pdf, page);
-		annot = pdf_create_annot(ctx_, pg, PDF_ANNOT_STAMP);
-		pdf_set_annot_rect(ctx_, annot, r);
-		// Must print: the whole point of a signature is that it shows up on
-		// paper and in every other viewer, not just on screen here.
-		pdf_set_annot_flags(ctx_, annot, PDF_ANNOT_IS_PRINT);
-
-		float bw = r.x1 - r.x0, bh = r.y1 - r.y0;
-		imgRef = pdf_add_image(ctx_, pdf, img);
-		res = pdf_new_dict(ctx_, pdf, 1);
-		pdf_obj* xobj = pdf_dict_put_dict(ctx_, res, PDF_NAME(XObject), 1);
-		pdf_dict_puts(ctx_, xobj, "Im0", imgRef);
-		contents = fz_new_buffer(ctx_, 64);
-		// An image XObject always draws into the unit square of the current
-		// transform, so this scales it to exactly fill the form's BBox --
-		// which the viewer in turn maps onto the annotation's /Rect.
-		fz_append_printf(ctx_, contents, "q %g 0 0 %g 0 0 cm /Im0 Do Q", bw, bh);
-		// Sets /AP /N directly (and marks the annotation as already
-		// resynthesised), so do NOT follow this with pdf_update_annot --
-		// that would hand the appearance back to MuPDF's own generator.
-		pdf_set_annot_appearance(ctx_, annot, "N", nullptr, fz_identity,
-			fz_make_rect(0, 0, bw, bh), res, contents);
+		createImageStampAnnot(ctx_, pdf, page, r, img);
 		ok = true;
 	}
 	fz_always(ctx_) {
-		if (contents) fz_drop_buffer(ctx_, contents);
-		if (res) pdf_drop_obj(ctx_, res);
-		if (imgRef) pdf_drop_obj(ctx_, imgRef);
 		if (img) fz_drop_image(ctx_, img);
 		if (pix) fz_drop_pixmap(ctx_, pix);
-		if (annot) pdf_drop_annot(ctx_, annot);
-		if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg));
 	}
 	fz_catch(ctx_) {
 		err = fz_caught_message(ctx_); ok = false;
 	}
+	if (ok) dirty_ = true;
+	return ok;
+}
+
+bool PdfDocument::encodedImageSizePt(const std::vector<unsigned char>& bytes, float& wPt, float& hPt,
+	std::string& err)
+{
+	if (bytes.empty()) { err = "empty image"; return false; }
+	if (!ctx_) { err = "no context"; return false; }
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_buffer* buf = nullptr;
+	fz_image* img = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		buf = fz_new_buffer_from_copied_data(ctx_, bytes.data(), bytes.size());
+		img = fz_new_image_from_buffer(ctx_, buf);
+		imageDisplaySizePt(ctx_, img, wPt, hPt);
+		ok = wPt > 0 && hPt > 0;
+		if (!ok) err = "image has no size";
+	}
+	fz_always(ctx_) {
+		if (img) fz_drop_image(ctx_, img);
+		if (buf) fz_drop_buffer(ctx_, buf);
+	}
+	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }
+	return ok;
+}
+
+bool PdfDocument::addEncodedImageStamp(int page, PageRectPt rect, const std::vector<unsigned char>& bytes,
+	std::string& err)
+{
+	if (bytes.empty()) { err = "empty image"; return false; }
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	fz_rect r = normRect(rect);
+	if (r.x1 - r.x0 < 1.0f || r.y1 - r.y0 < 1.0f) { err = "target area too small"; return false; }
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_buffer* buf = nullptr;
+	fz_image* img = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		// Kept in its original encoding: pdf_add_image passes a JPEG through
+		// as-is (DCTDecode) and turns a PNG's alpha into an /SMask, so a photo
+		// isn't bloated into raw pixels and a transparent logo stays transparent.
+		buf = fz_new_buffer_from_copied_data(ctx_, bytes.data(), bytes.size());
+		img = fz_new_image_from_buffer(ctx_, buf);
+		createImageStampAnnot(ctx_, pdf, page, r, img);
+		ok = true;
+	}
+	fz_always(ctx_) {
+		if (img) fz_drop_image(ctx_, img);
+		if (buf) fz_drop_buffer(ctx_, buf);
+	}
+	fz_catch(ctx_) { err = fz_caught_message(ctx_); ok = false; }
 	if (ok) dirty_ = true;
 	return ok;
 }
