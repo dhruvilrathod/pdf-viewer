@@ -2152,7 +2152,10 @@ ConvertKind classifyForConvert(const std::wstring& path)
 	for (auto* e : kImageExts) if (ext == e) return ConvertKind::Image;
 	if (ext == L"txt") return ConvertKind::Text;
 	if (ext == L"md" || ext == L"markdown") return ConvertKind::Markdown;
-	if (ext == L"docx") return ConvertKind::Docx;
+	// Everything Word itself opens and can save as PDF -- legacy .doc, macro/
+	// template variants, RTF and OpenDocument -- goes through the same path.
+	for (const wchar_t* e : { L"docx", L"doc", L"docm", L"dotx", L"dot", L"rtf", L"odt" })
+		if (ext == e) return ConvertKind::Docx;
 	if (ext == L"pdf") return ConvertKind::Pdf; // lets a plain PDF's pages be folded into the combined output too
 	return ConvertKind::Unsupported;
 }
@@ -2382,6 +2385,7 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 
 	ConvertPageBuilder pb{ ctx, pdf, fontRegular, fontBold, kPageW, kPageH, kMargin, kMargin, kMargin };
 	bool anyOk = false;
+	std::string lastWordErr; // surfaced when nothing converted, e.g. "Word is not installed"
 
 	for (const auto& path : paths) {
 		ConvertKind kind = classifyForConvert(path);
@@ -2451,8 +2455,9 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 				std::string tempUtf8 = toUtf8(tempPdf);
 				if (graftAllPagesFrom(ctx, pdf, tempUtf8.c_str())) anyOk = true;
 				else if (skipped) skipped->push_back(path);
-			} else if (skipped) {
-				skipped->push_back(path);
+			} else {
+				lastWordErr = wordErr;
+				if (skipped) skipped->push_back(path);
 			}
 			DeleteFileW(tempPdf);
 		} else {
@@ -2462,7 +2467,7 @@ bool PdfDocument::ConvertFilesToPdf(const std::vector<std::wstring>& paths, cons
 	pb.finishPage();
 
 	if (!anyOk) {
-		err = "no files could be converted";
+		err = lastWordErr.empty() ? "no files could be converted" : lastWordErr;
 		pdf_drop_document(ctx, pdf);
 		fz_drop_context(ctx);
 		return false;

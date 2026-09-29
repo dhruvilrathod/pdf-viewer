@@ -68,7 +68,7 @@ bool ConvertDocxToPdf(const wchar_t* docxPath, const wchar_t* pdfPath, std::stri
 	{
 		CLSID clsid;
 		if (FAILED(CLSIDFromProgID(L"Word.Application", &clsid))) {
-			err = "Microsoft Word is not installed (required to convert .docx files)";
+			err = "Microsoft Word is not installed (required to convert Word documents)";
 			if (comOwned) CoUninitialize();
 			return false;
 		}

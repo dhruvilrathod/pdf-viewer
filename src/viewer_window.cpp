@@ -689,11 +689,11 @@ std::vector<std::wstring> PickFilesAcrossFolders(HWND owner, const wchar_t* filt
 constexpr wchar_t kMergeFilter[] = L"PDF Documents (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
 constexpr wchar_t kMergeTitle[] = L"Select PDF Files";
 constexpr wchar_t kConvertFilter[] =
-	L"Convertible Files (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf)\0"
-	L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.docx;*.pdf\0"
+	L"Convertible Files (images, text, Word, PDF)\0"
+	L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.txt;*.md;*.doc;*.docx;*.docm;*.dot;*.dotx;*.rtf;*.odt;*.pdf\0"
 	L"Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff)\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff\0"
 	L"Text/Markdown (*.txt;*.md)\0*.txt;*.md\0"
-	L"Word Documents (*.docx)\0*.docx\0"
+	L"Word Documents (*.doc;*.docx;*.rtf;*.odt)\0*.doc;*.docx;*.docm;*.dot;*.dotx;*.rtf;*.odt\0"
 	L"PDF Documents (*.pdf)\0*.pdf\0"
 	L"All Files (*.*)\0*.*\0";
 constexpr wchar_t kConvertTitle[] = L"Select Files to Convert to PDF";
