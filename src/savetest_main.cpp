@@ -428,6 +428,25 @@ int wmain(int argc, wchar_t** argv)
 			if (!openFresh(doc)) return 1;
 			PageRectPt bound = doc.pageBound(0);
 			PageRectPt mark{ bound.x0 + 10, bound.y0 + 10, bound.x0 + 200, bound.y0 + 60 };
+			// The same box mirrored top-to-bottom: where a white box lands if
+			// its rect is read in the wrong (top-down vs PDF bottom-up) space.
+			// On this form it covers the footer text, so any white paint there
+			// shows up as lost dark pixels.
+			PageRectPt mirror{ mark.x0, bound.y1 - mark.y1, mark.x1, bound.y1 - mark.y0 };
+			auto countDark = [](PdfDocument& d, const PageRectPt& r) {
+				PageBitmap bmp = d.renderPage(0, 1.0f);
+				HDC hdc = CreateCompatibleDC(nullptr);
+				HGDIOBJ old = SelectObject(hdc, bmp.hbmp);
+				int n = 0;
+				for (int y = static_cast<int>(r.y0); y < static_cast<int>(r.y1); ++y)
+					for (int x = static_cast<int>(r.x0); x < static_cast<int>(r.x1); ++x) {
+						COLORREF c = GetPixel(hdc, x, y);
+						if (GetRValue(c) < 128 && GetGValue(c) < 128 && GetBValue(c) < 128) ++n;
+					}
+				SelectObject(hdc, old); DeleteDC(hdc);
+				return n;
+			};
+			int mirrorDarkBefore = countDark(doc, mirror);
 			std::string e;
 			if (!doc.addRedaction(0, mark, e)) {
 				std::printf("  FAIL: addRedaction: %s\n", e.c_str());
@@ -459,6 +478,13 @@ int wmain(int argc, wchar_t** argv)
 						std::printf("  box pixel = RGB(%d,%d,%d) (expect near-white)\n",
 							GetRValue(c), GetGValue(c), GetBValue(c));
 						if (GetRValue(c) < 235 || GetGValue(c) < 235 || GetBValue(c) < 235) ++failures;
+						int markDark = countDark(doc2, mark);
+						int mirrorDarkAfter = countDark(doc2, mirror);
+						std::printf("  dark pixels inside the mark after: %d (expect 0)\n", markDark);
+						std::printf("  dark pixels in the MIRRORED spot: %d -> %d (expect unchanged, and non-zero)\n",
+							mirrorDarkBefore, mirrorDarkAfter);
+						if (markDark != 0) ++failures;
+						if (mirrorDarkBefore == 0 || mirrorDarkAfter != mirrorDarkBefore) ++failures;
 					}
 				}
 			}
@@ -935,6 +961,65 @@ int wmain(int argc, wchar_t** argv)
 		Gdiplus::GdiplusShutdown(gt);
 		std::printf("\n--flattentest failures: %d\n", failures);
 		return failures == 0 ? 0 : 1;
+	}
+
+	// --redactdiag mode: marks every hit of each search phrase (argv[4..]) for
+	// redaction, applies, and prints each text line whose content changed --
+	// so text removed OUTSIDE the marks shows up immediately. Also writes
+	// <output>.before.png / <output>.after.png of the first affected page.
+	if (argc > 4 && wcscmp(argv[3], L"--redactdiag") == 0) {
+		Gdiplus::GdiplusStartupInput gdipIn;
+		ULONG_PTR gdipToken = 0;
+		if (Gdiplus::GdiplusStartup(&gdipToken, &gdipIn, nullptr) != Gdiplus::Ok) return 1;
+		struct GdipShutdown { ULONG_PTR t; ~GdipShutdown() { Gdiplus::GdiplusShutdown(t); } } gdipGuard{ gdipToken };
+		PdfDocument doc; std::string e; bool npw = false;
+		if (!doc.open(input, e, npw)) { std::printf("open FAILED: %s\n", e.c_str()); return 2; }
+		int page = -1;
+		bool white = false;
+		for (int a = 4; a < argc; ++a) {
+			if (wcscmp(argv[a], L"--white") == 0) { white = true; continue; }
+			std::string needle = ToUtf8(argv[a]);
+			for (int p = 0; p < doc.pageCount(); ++p) {
+				for (const PageRectPt& r : doc.searchPage(p, needle.c_str(), 16)) {
+					std::printf("mark p%d \"%s\" rect (%.1f, %.1f)-(%.1f, %.1f)\n", p, needle.c_str(), r.x0, r.y0, r.x1, r.y1);
+					doc.addRedaction(p, r, e);
+					if (page < 0) page = p;
+				}
+			}
+		}
+		if (page < 0) { std::printf("no phrase found\n"); return 3; }
+		auto lines = [&](int p) {
+			std::vector<std::pair<float, std::wstring>> out;
+			std::wstring cur; float y = -1;
+			for (const PageChar& c : doc.pageChars(p)) {
+				if (y < 0) y = c.quad.y0;
+				cur += static_cast<wchar_t>(c.unicode);
+				if (c.lineBreakAfter || c.paragraphBreakAfter) { out.push_back({ y, cur }); cur.clear(); y = -1; }
+			}
+			if (!cur.empty()) out.push_back({ y, cur });
+			return out;
+		};
+		auto savePng = [&](const wchar_t* suffix) {
+			PageBitmap pb = doc.renderPage(page, 1.5f);
+			Gdiplus::Bitmap bmp(pb.hbmp, nullptr);
+			CLSID pngClsid = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+			bmp.Save((std::wstring(output) + suffix).c_str(), &pngClsid, nullptr);
+		};
+		auto before = lines(page);
+		savePng(L".before.png");
+		if (!doc.applyRedactions(white, e)) { std::printf("apply FAILED: %s\n", e.c_str()); return 4; }
+		auto after = lines(page);
+		savePng(L".after.png");
+		std::printf("page %d: %zu lines before, %zu after\n", page, before.size(), after.size());
+		// Match lines by y (within 2pt) and report the ones whose text changed.
+		for (const auto& b : before) {
+			const std::wstring* match = nullptr;
+			for (const auto& a : after) if (std::fabs(a.first - b.first) < 2.0f) { match = &a.second; break; }
+			if (!match || *match != b.second)
+				std::wprintf(L"  CHANGED y=%.1f\n    before: %ls\n    after:  %ls\n", b.first, b.second.c_str(),
+					match ? match->c_str() : L"(line gone)");
+		}
+		return 0;
 	}
 
 	// --imagetest mode: Insert Image / paste-an-image, headlessly. Builds a

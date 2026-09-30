@@ -3167,9 +3167,13 @@ bool PdfDocument::applyRedactions(bool whiteBox, std::string& err)
 				if (whiteBox) {
 					// Must capture the marks' rects before pdf_redact_page runs --
 					// it deletes every Redact annotation as part of applying.
+					// The raw /Rect, in PDF's bottom-up content space (exactly
+					// what MuPDF's own black-box path reads). NOT pdf_annot_rect:
+					// that returns MuPDF's top-down page space, which drew the box
+					// mirrored top-to-bottom -- a white bar over unrelated text.
 					for (pdf_annot* a = pdf_first_annot(ctx_, pg); a; a = pdf_next_annot(ctx_, a)) {
 						if (pdf_annot_type(ctx_, a) == PDF_ANNOT_REDACT)
-							whiteRects.push_back(pdf_annot_rect(ctx_, a));
+							whiteRects.push_back(pdf_dict_get_rect(ctx_, pdf_annot_obj(ctx_, a), PDF_NAME(Rect)));
 					}
 				}
 				pdf_redact_page(ctx_, pdf, pg, &opts);
