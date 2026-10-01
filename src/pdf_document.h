@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +48,32 @@ struct PageChar {
 	int unicode = 0;
 	bool lineBreakAfter = false;  // last char of its line
 	bool paragraphBreakAfter = false; // last char of its block
+};
+
+// One character of a TextRun: where its glyph sits (baseline origin, page
+// space) and where its advance ends along the baseline. `synthetic` marks a
+// space MuPDF inferred from a gap -- there's no glyph behind it to remove.
+struct TextGlyph {
+	int unicode = 0;
+	float x = 0, y = 0;       // baseline origin
+	float endX = 0, endY = 0; // baseline point at the end of its advance
+	bool synthetic = false;
+};
+
+// A stretch of page-content text on one baseline in one font/size/colour --
+// the unit the Edit Text tool edits. text[i] corresponds to glyphs[i].
+struct TextRun {
+	PageRectPt bbox;
+	std::wstring text;
+	std::vector<TextGlyph> glyphs;
+	std::string fontName;     // as the PDF names it (subset tag stripped)
+	std::wstring family;      // best-guess Windows family, for the edit box
+	bool bold = false, italic = false;
+	float size = 0;           // points
+	unsigned long color = 0;  // COLORREF
+	PagePointF dir{ 1, 0 };   // baseline direction, page space
+	bool visible = true;      // false for invisible text (an OCR layer over a scan)
+	bool editable = true;     // false if it has characters this tool can't round-trip
 };
 
 // An existing markup annotation (free text, highlight, ink, ...) found under
@@ -225,6 +252,20 @@ public:
 	// applyRedactions().
 	bool addRedaction(int page, PageRectPt rect, std::string& err);
 
+	// --- Edit Text (the page's own text, not annotations) ----------------
+	// Every run of page-content text on `page` (form fields and annotations
+	// excluded -- they aren't part of the content stream).
+	std::vector<TextRun> textRuns(int page);
+	// Replaces `run`'s text with `newText` in place. Characters up to the
+	// first change are left untouched; from there the original glyphs are
+	// removed (matched by exact position + character, so nothing else on the
+	// page can be caught) and the new text is drawn at the same baseline, size
+	// and colour -- in the PDF's own font when its embedded copy has every
+	// typed character, else the installed Windows font of the same name (else
+	// Arial). `note` explains any such substitution; empty when it matched.
+	bool replaceTextRun(int page, const TextRun& run, const std::wstring& newText,
+		std::string& err, std::string& note);
+
 	// Forms.
 	// All widgets on `page`, for drawing field highlights (like Edge/Acrobat
 	// tint fillable fields even before the user interacts with them).
@@ -401,6 +442,12 @@ private:
 	std::vector<PageSizePt> sizes_;
 	std::vector<PageRectPt> bounds_;
 	std::wstring openedPath_; // path this document is currently reading from
+	// Edit Text's fallback fonts, embedded once per session and reused by
+	// object number (family+style -> num). Cleared whenever doc_ is reloaded,
+	// since a save renumbers objects.
+	std::unordered_map<std::string, int> editFontObjs_;
+	std::unordered_map<std::string, std::set<int>> editFontGids_; // glyphs each one must keep
+
 	// Recursive: save() holds this while it calls reopenCurrentPath(), which
 	// calls loadInfo(), which also locks -- all on the same (UI) thread.
 	mutable std::recursive_mutex mutex_;

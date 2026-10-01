@@ -330,6 +330,8 @@ bool PdfDocument::reopenCurrentPath(std::string& err, const char* authPassword)
 	if (!ctx_ || openedPath_.empty()) { err = "no path to reopen"; return false; }
 	std::string upath = toUtf8(openedPath_.c_str());
 	if (doc_) { fz_drop_document(ctx_, doc_); doc_ = nullptr; }
+	editFontObjs_.clear();
+	editFontGids_.clear();
 	// Same in-memory-buffer approach as open() -- see its comment. Keeps this
 	// reopen-after-save step from re-pinning a share-mode-limited handle to
 	// the file, which would undo the whole point of fixing open().
@@ -545,6 +547,8 @@ void PdfDocument::close()
 	sizes_.clear();
 	bounds_.clear();
 	openedPath_.clear();
+	editFontObjs_.clear();
+	editFontGids_.clear();
 }
 
 // --- Editing ---------------------------------------------------------------
@@ -3219,6 +3223,512 @@ bool PdfDocument::applyRedactions(bool whiteBox, std::string& err)
 	loadInfo();
 	dirty_ = true;
 	return true;
+}
+
+// --- Edit Text -----------------------------------------------------------------
+namespace {
+
+// Structured text of the page's own content stream only.
+// fz_new_stext_page_from_page would also run annotations and form widgets,
+// whose text isn't in the content stream and so can't be edited in place.
+fz_stext_page* contentOnlyStext(fz_context* ctx, fz_page* pg)
+{
+	fz_stext_page* st = fz_new_stext_page(ctx, fz_bound_page(ctx, pg));
+	fz_device* dev = nullptr;
+	fz_try(ctx) {
+		fz_stext_options opts = {};
+		dev = fz_new_stext_device(ctx, st, &opts);
+		fz_run_page_contents(ctx, pg, dev, fz_identity, nullptr);
+		fz_close_device(ctx, dev);
+	}
+	fz_always(ctx) { fz_drop_device(ctx, dev); }
+	fz_catch(ctx) { fz_drop_stext_page(ctx, st); fz_rethrow(ctx); }
+	return st;
+}
+
+// Where a character's advance ends, as a point on its baseline.
+fz_point baselineEnd(const fz_stext_char* ch, fz_point dir)
+{
+	float t = (ch->quad.lr.x - ch->origin.x) * dir.x + (ch->quad.lr.y - ch->origin.y) * dir.y;
+	return fz_make_point(ch->origin.x + dir.x * t, ch->origin.y + dir.y * t);
+}
+
+std::string stripSubsetTag(const char* name)
+{
+	std::string n = name ? name : "";
+	if (n.size() > 7 && n[6] == '+') n = n.substr(7);
+	return n;
+}
+
+// Splits each stext line into runs of one font/size/colour, also breaking at
+// gaps wider than 1.5em: on forms a label and its value often share a
+// baseline far apart, and re-emitting both as one run would close that gap.
+void buildTextRuns(fz_context* ctx, fz_stext_page* st, std::vector<TextRun>& out)
+{
+	for (fz_stext_block* b = st->first_block; b; b = b->next) {
+		if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+		for (fz_stext_line* ln = b->u.t.first_line; ln; ln = ln->next) {
+			TextRun cur;
+			fz_font* curFont = nullptr;
+			float curSize = 0;
+			uint32_t curArgb = 0;
+			const fz_stext_char* prevReal = nullptr;
+			bool anyVisible = false;
+			auto flush = [&] {
+				while (!cur.glyphs.empty() && cur.glyphs.back().synthetic) {
+					cur.glyphs.pop_back();
+					cur.text.pop_back();
+				}
+				if (!cur.glyphs.empty()) {
+					cur.visible = anyVisible;
+					out.push_back(std::move(cur));
+				}
+				cur = TextRun();
+				prevReal = nullptr;
+				anyVisible = false;
+			};
+			for (fz_stext_char* ch = ln->first_char; ch; ch = ch->next) {
+				bool synth = (ch->flags & FZ_STEXT_SYNTHETIC) != 0;
+				if (!synth && !cur.glyphs.empty()) {
+					bool styleBreak = ch->font != curFont || std::fabs(ch->size - curSize) > 0.05f || ch->argb != curArgb;
+					bool gapBreak = false;
+					if (prevReal) {
+						fz_point e = baselineEnd(prevReal, ln->dir);
+						float gap = (ch->origin.x - e.x) * ln->dir.x + (ch->origin.y - e.y) * ln->dir.y;
+						gapBreak = gap > 1.5f * ch->size;
+					}
+					if (styleBreak || gapBreak) flush();
+				}
+				if (cur.glyphs.empty()) {
+					if (synth) continue; // never start a run on an inferred space
+					curFont = ch->font; curSize = ch->size; curArgb = ch->argb;
+					cur.fontName = stripSubsetTag(fz_font_name(ctx, ch->font));
+					int bold = fz_font_is_bold(ctx, ch->font), italic = fz_font_is_italic(ctx, ch->font);
+					cur.family = cleanFontFamily(cur.fontName.c_str(), bold, italic);
+					cur.bold = bold != 0; cur.italic = italic != 0;
+					cur.size = ch->size;
+					cur.color = RGB((ch->argb >> 16) & 0xFF, (ch->argb >> 8) & 0xFF, ch->argb & 0xFF);
+					cur.dir = { ln->dir.x, ln->dir.y };
+					fz_rect r = fz_rect_from_quad(ch->quad);
+					cur.bbox = { r.x0, r.y0, r.x1, r.y1 };
+				}
+				TextGlyph g;
+				g.unicode = ch->c;
+				g.x = ch->origin.x; g.y = ch->origin.y;
+				fz_point e = baselineEnd(ch, ln->dir);
+				g.endX = e.x; g.endY = e.y;
+				g.synthetic = synth;
+				cur.glyphs.push_back(g);
+				if (ch->c <= 0 || ch->c > 0xFFFF) { cur.editable = false; cur.text.push_back(L'?'); }
+				else cur.text.push_back(static_cast<wchar_t>(ch->c));
+				fz_rect r = fz_rect_from_quad(ch->quad);
+				cur.bbox.x0 = std::min(cur.bbox.x0, r.x0); cur.bbox.y0 = std::min(cur.bbox.y0, r.y0);
+				cur.bbox.x1 = std::max(cur.bbox.x1, r.x1); cur.bbox.y1 = std::max(cur.bbox.y1, r.y1);
+				if (ch->flags & (FZ_STEXT_FILLED | FZ_STEXT_STROKED)) anyVisible = true;
+				if (!synth) prevReal = ch;
+			}
+			flush();
+		}
+	}
+}
+
+// Re-joins pieces of one visual line that the content stream draws apart --
+// notably an earlier edit, whose new text is appended at the END of the page
+// content, so MuPDF reads it as a separate line. Without this a second edit
+// of the same line would only see part of it and draw over the rest.
+void mergeAdjacentRuns(std::vector<TextRun>& runs)
+{
+	for (bool merged = true; merged; ) {
+		merged = false;
+		for (size_t i = 0; i < runs.size() && !merged; ++i) {
+			for (size_t j = 0; j < runs.size() && !merged; ++j) {
+				if (i == j) continue;
+				TextRun& a = runs[i];
+				const TextRun& b = runs[j];
+				if (a.fontName != b.fontName || std::fabs(a.size - b.size) > 0.05f ||
+					a.color != b.color || a.visible != b.visible) continue;
+				if (std::fabs(a.dir.x - b.dir.x) > 0.01f || std::fabs(a.dir.y - b.dir.y) > 0.01f) continue;
+				const TextGlyph& ae = a.glyphs.back();
+				const TextGlyph& bs = b.glyphs.front();
+				float dx = bs.x - ae.endX, dy = bs.y - ae.endY;
+				float along = dx * a.dir.x + dy * a.dir.y;
+				float perp = -dx * a.dir.y + dy * a.dir.x;
+				if (std::fabs(perp) > 0.1f * a.size || along < -0.3f * a.size || along > 0.6f * a.size) continue;
+				if (along > 0.15f * a.size) {
+					TextGlyph sp;
+					sp.unicode = ' ';
+					sp.x = ae.endX; sp.y = ae.endY; sp.endX = bs.x; sp.endY = bs.y;
+					sp.synthetic = true;
+					a.glyphs.push_back(sp);
+					a.text.push_back(L' ');
+				}
+				a.glyphs.insert(a.glyphs.end(), b.glyphs.begin(), b.glyphs.end());
+				a.text += b.text;
+				a.bbox.x0 = std::min(a.bbox.x0, b.bbox.x0); a.bbox.y0 = std::min(a.bbox.y0, b.bbox.y0);
+				a.bbox.x1 = std::max(a.bbox.x1, b.bbox.x1); a.bbox.y1 = std::max(a.bbox.y1, b.bbox.y1);
+				a.editable = a.editable && b.editable;
+				runs.erase(runs.begin() + static_cast<std::ptrdiff_t>(j));
+				merged = true;
+			}
+		}
+	}
+}
+
+// Glyphs to drop from the content stream, by exact origin (PDF space) and
+// character. Matching the origin rather than a box is what keeps an edit from
+// ever catching text on a neighbouring line or word.
+struct RemovalTarget { float x, y, tol; int unicode; };
+struct RemovalState { std::vector<RemovalTarget> targets; int removed = 0; };
+
+int removeMatchingGlyph(fz_context*, void* opaque, int* ucsbuf, int ucslen, fz_matrix trm, fz_matrix ctm,
+	fz_rect, int, float, float)
+{
+	auto* st = static_cast<RemovalState*>(opaque);
+	fz_matrix m = fz_concat(trm, ctm); // m.e/m.f = this glyph's origin
+	for (const RemovalTarget& t : st->targets) {
+		if (std::fabs(m.e - t.x) > t.tol || std::fabs(m.f - t.y) > t.tol) continue;
+		for (int i = 0; i < ucslen; ++i)
+			if (ucsbuf[i] == t.unicode) { ++st->removed; return 1; }
+	}
+	return 0;
+}
+
+// Finds the page resource whose loaded font IS `want` (the fz_font the text
+// was drawn with), searching form XObjects too.
+void findFontResource(fz_context* ctx, pdf_document* pdf, pdf_obj* res, pdf_resource_stack* parent,
+	fz_font* want, pdf_obj*& hitObj, pdf_font_desc*& hitDesc, int depth, std::vector<int>& seen)
+{
+	if (!res || hitDesc || depth > 4) return;
+	pdf_resource_stack stack{ parent, res };
+	pdf_obj* fonts = pdf_dict_get(ctx, res, PDF_NAME(Font));
+	for (int i = 0, n = pdf_dict_len(ctx, fonts); i < n && !hitDesc; ++i) {
+		pdf_obj* f = pdf_dict_get_val(ctx, fonts, i);
+		pdf_font_desc* d = nullptr;
+		fz_try(ctx) { d = pdf_load_font(ctx, pdf, &stack, f); }
+		fz_catch(ctx) { d = nullptr; }
+		if (d && d->font == want) { hitObj = f; hitDesc = d; }
+		else if (d) pdf_drop_font(ctx, d);
+	}
+	pdf_obj* xobjs = pdf_dict_get(ctx, res, PDF_NAME(XObject));
+	for (int i = 0, n = pdf_dict_len(ctx, xobjs); i < n && !hitDesc; ++i) {
+		pdf_obj* x = pdf_dict_get_val(ctx, xobjs, i);
+		if (!pdf_name_eq(ctx, pdf_dict_get(ctx, x, PDF_NAME(Subtype)), PDF_NAME(Form))) continue;
+		int num = pdf_to_num(ctx, x);
+		if (num && std::find(seen.begin(), seen.end(), num) != seen.end()) continue;
+		seen.push_back(num);
+		findFontResource(ctx, pdf, pdf_dict_get(ctx, x, PDF_NAME(Resources)), &stack, want, hitObj, hitDesc, depth + 1, seen);
+	}
+}
+
+int cmapCodeBytes(pdf_cmap* cm)
+{
+	for (; cm; cm = cm->usecmap) {
+		if (cm->codespace_len <= 0) continue;
+		int n = cm->codespace[0].n;
+		for (int i = 1; i < cm->codespace_len; ++i)
+			if (cm->codespace[i].n != n) return 0;
+		return n;
+	}
+	return 0;
+}
+
+// unicode -> character code for every glyph this font can actually draw. An
+// embedded font is usually a SUBSET, so a code with a Unicode mapping can
+// still have an empty outline -- those are left out (space excepted).
+std::unordered_map<int, unsigned> reverseFontEncoding(fz_context* ctx, pdf_font_desc* d, int& bytes)
+{
+	std::unordered_map<int, unsigned> out;
+	bytes = d->wmode == 0 ? cmapCodeBytes(d->encoding) : 0;
+	if (bytes != 1 && bytes != 2) return out;
+	unsigned maxCode = bytes == 1 ? 0xFFu : 0xFFFFu;
+	for (unsigned code = 0; code <= maxCode; ++code) {
+		int cid = pdf_lookup_cmap(d->encoding, code);
+		if (cid < 0) continue;
+		int ucs[PDF_MRANGE_CAP];
+		int len = d->to_unicode ? pdf_lookup_cmap_full(d->to_unicode, cid, ucs) : 0;
+		if (len == 0 && static_cast<size_t>(cid) < d->cid_to_ucs_len) { ucs[0] = d->cid_to_ucs[cid]; len = 1; }
+		if (len != 1 || ucs[0] <= 0 || ucs[0] == 0xFFFD || out.count(ucs[0])) continue;
+		int gid = pdf_font_cid_to_gid(ctx, d, cid);
+		if (gid <= 0) continue;
+		if (ucs[0] != ' ' && fz_is_empty_rect(fz_bound_glyph(ctx, d->font, gid, fz_identity))) continue;
+		out[ucs[0]] = code;
+	}
+	return out;
+}
+
+} // namespace
+
+std::vector<TextRun> PdfDocument::textRuns(int page)
+{
+	std::vector<TextRun> out;
+	if (!ctx_ || !doc_ || !authed_ || page < 0 || page >= pageCount_) return out;
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_page* pg = nullptr;
+	fz_stext_page* st = nullptr;
+	fz_try(ctx_) {
+		pg = fz_load_page(ctx_, doc_, page);
+		st = contentOnlyStext(ctx_, pg);
+		buildTextRuns(ctx_, st, out);
+		mergeAdjacentRuns(out);
+	}
+	fz_always(ctx_) {
+		if (st) fz_drop_stext_page(ctx_, st);
+		if (pg) fz_drop_page(ctx_, pg);
+	}
+	fz_catch(ctx_) { out.clear(); }
+	return out;
+}
+
+bool PdfDocument::replaceTextRun(int page, const TextRun& run, const std::wstring& newTextIn,
+	std::string& err, std::string& note)
+{
+	note.clear();
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf) { err = "not a PDF"; return false; }
+	if (run.glyphs.empty() || run.glyphs.size() != run.text.size()) { err = "nothing to edit"; return false; }
+	if (!run.editable) { err = "this text contains characters that can't be edited"; return false; }
+
+	std::wstring newText;
+	for (wchar_t c : newTextIn) if (c != L'\r' && c != L'\n') newText.push_back(c);
+
+	// Everything before the first change stays exactly as the PDF had it.
+	size_t k = 0;
+	while (k < run.text.size() && k < newText.size() && run.text[k] == newText[k]) ++k;
+	std::wstring emit = newText.substr(k);
+	std::vector<TextGlyph> removeGlyphs;
+	for (size_t i = k; i < run.glyphs.size(); ++i)
+		if (!run.glyphs[i].synthetic) removeGlyphs.push_back(run.glyphs[i]);
+	if (emit.empty() && removeGlyphs.empty()) return true; // unchanged
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	pdf_page* pg = nullptr;
+	fz_stext_page* st = nullptr;
+	pdf_font_desc* desc = nullptr;
+	fz_font* sysFont = nullptr;
+	pdf_obj* fontObj = nullptr; // the font the new text is drawn in; held while ownFontObj
+	bool ownFontObj = false;
+	fz_buffer* cs = nullptr;
+	bool ok = false;
+	fz_try(ctx_) {
+		pg = pdf_load_page(ctx_, pdf, page);
+		fz_matrix pageCtm;
+		fz_rect mediabox;
+		pdf_page_transform(ctx_, pg, &mediabox, &pageCtm);
+		fz_matrix toPdf = fz_invert_matrix(pageCtm);
+
+		// The run's live font: what the content stream actually draws it with,
+		// read off the first real glyph being replaced (or the last one kept).
+		fz_font* liveFont = nullptr;
+		size_t pi = std::min(k, run.glyphs.size() - 1);
+		while (pi < run.glyphs.size() && run.glyphs[pi].synthetic) ++pi;
+		if (pi >= run.glyphs.size()) {
+			pi = std::min(k, run.glyphs.size() - 1);
+			while (pi > 0 && run.glyphs[pi].synthetic) --pi;
+		}
+		const TextGlyph& probe = run.glyphs[pi];
+		st = contentOnlyStext(ctx_, reinterpret_cast<fz_page*>(pg));
+		for (fz_stext_block* b = st->first_block; b && !liveFont; b = b->next) {
+			if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+			for (fz_stext_line* ln = b->u.t.first_line; ln && !liveFont; ln = ln->next)
+				for (fz_stext_char* ch = ln->first_char; ch; ch = ch->next)
+					if (!(ch->flags & FZ_STEXT_SYNTHETIC) &&
+						std::fabs(ch->origin.x - probe.x) < 0.5f && std::fabs(ch->origin.y - probe.y) < 0.5f) {
+						liveFont = ch->font;
+						break;
+					}
+		}
+
+		// Encode the new text: the PDF's own font if its glyphs cover it all.
+		std::vector<unsigned> codes(emit.size(), 0);
+		std::vector<bool> asGap(emit.size(), false); // spaces the font can't draw become a TJ gap
+		int codeBytes = 0;
+		bool reuse = false;
+		if (liveFont && !emit.empty()) {
+			std::vector<int> seen;
+			pdf_obj* pageRes = pdf_dict_get_inheritable(ctx_, pg->obj, PDF_NAME(Resources));
+			findFontResource(ctx_, pdf, pageRes, nullptr, liveFont, fontObj, desc, 0, seen);
+			// Held, not borrowed: filtering below can replace the resource
+			// dictionary this came from.
+			if (fontObj) { pdf_keep_obj(ctx_, fontObj); ownFontObj = true; }
+			if (desc) {
+				auto rev = reverseFontEncoding(ctx_, desc, codeBytes);
+				reuse = codeBytes > 0;
+				for (size_t i = 0; i < emit.size() && reuse; ++i) {
+					auto it = rev.find(emit[i]);
+					if (it != rev.end()) codes[i] = it->second;
+					else if (emit[i] == L' ') asGap[i] = true;
+					else reuse = false;
+				}
+			}
+		}
+		if (!emit.empty() && !reuse) {
+			if (ownFontObj && fontObj) pdf_drop_obj(ctx_, fontObj);
+			fontObj = nullptr;
+			ownFontObj = false;
+			// Fall back to the installed Windows font of the same name.
+			int bold = run.bold, italic = run.italic;
+			std::string family = toUtf8(cleanFontFamily(run.fontName.c_str(), bold, italic).c_str());
+			sysFont = loadWindowsFont(ctx_, run.fontName.c_str(), bold, italic, 0);
+			if (sysFont) {
+				note = "Some typed characters aren't in this PDF's copy of the font, so the installed \"" +
+					family + "\" was used.";
+			} else {
+				sysFont = loadWindowsFont(ctx_, "Arial", bold, italic, 0);
+				if (!sysFont) fz_throw(ctx_, FZ_ERROR_GENERIC, "no usable font installed");
+				family = "Arial";
+				note = "The font \"" + run.fontName + "\" isn't installed on this PC, so Arial was used.";
+			}
+			for (size_t i = 0; i < emit.size(); ++i) {
+				int gid = fz_encode_character(ctx_, sysFont, emit[i]);
+				if (gid > 0) codes[i] = static_cast<unsigned>(gid);
+				else if (emit[i] == L' ') asGap[i] = true;
+				else fz_throw(ctx_, FZ_ERROR_GENERIC, "the font has no glyph for one of the typed characters");
+			}
+			codeBytes = 2; // pdf_add_cid_font: Identity-H, CID == GID
+			std::string key = family + (bold ? "|B" : "") + (italic ? "|I" : "");
+			std::set<int>& used = editFontGids_[key];
+			used.insert(0);
+			for (size_t i = 0; i < emit.size(); ++i) if (!asGap[i]) used.insert(static_cast<int>(codes[i]));
+			auto it = editFontObjs_.find(key);
+			if (it != editFontObjs_.end()) {
+				fontObj = pdf_new_indirect(ctx_, pdf, it->second, 0);
+			} else {
+				fontObj = pdf_add_cid_font(ctx_, pdf, sysFont);
+				editFontObjs_[key] = pdf_to_num(ctx_, fontObj);
+			}
+			ownFontObj = true;
+			// pdf_add_cid_font embeds the WHOLE installed font (Calibri alone is
+			// ~800KB). Swap in a subset of just the glyphs edits have used. CID
+			// mode keeps every glyph's number, so text drawn by earlier edits in
+			// this font still points at the right glyphs after a re-subset.
+			fz_try(ctx_) {
+				pdf_obj* cid = pdf_array_get(ctx_, pdf_dict_get(ctx_, fontObj, PDF_NAME(DescendantFonts)), 0);
+				pdf_obj* ff2 = pdf_dict_get(ctx_, pdf_dict_get(ctx_, cid, PDF_NAME(FontDescriptor)), PDF_NAME(FontFile2));
+				if (ff2 && sysFont->buffer) {
+					std::vector<int> gids(used.begin(), used.end());
+					fz_buffer* sub = fz_subset_ttf_for_gids(ctx_, sysFont->buffer, gids.data(),
+						static_cast<int>(gids.size()), 0, 1);
+					fz_try(ctx_) {
+						pdf_update_stream(ctx_, pdf, ff2, sub, 0);
+						pdf_dict_put_int(ctx_, ff2, PDF_NAME(Length1), static_cast<int64_t>(fz_buffer_storage(ctx_, sub, nullptr)));
+					}
+					fz_always(ctx_) { fz_drop_buffer(ctx_, sub); }
+					fz_catch(ctx_) { fz_rethrow(ctx_); }
+				}
+			}
+			fz_catch(ctx_) { /* keep the full font: bigger file, still correct */ }
+		}
+
+		// Remove the original glyphs from the first change onwards.
+		if (!removeGlyphs.empty()) {
+			RemovalState rs;
+			float tol = std::max(0.5f, run.size * 0.08f);
+			for (const TextGlyph& g : removeGlyphs) {
+				fz_point p = fz_transform_point(fz_make_point(g.x, g.y), toPdf);
+				rs.targets.push_back({ p.x, p.y, tol, g.unicode });
+			}
+			pdf_sanitize_filter_options sopts = {};
+			sopts.opaque = &rs;
+			sopts.text_filter = removeMatchingGlyph;
+			pdf_filter_factory list[2] = {};
+			list[0].filter = pdf_new_sanitize_filter;
+			list[0].options = &sopts;
+			pdf_filter_options fopts = {};
+			fopts.recurse = 0;
+			fopts.instance_forms = 1; // text inside a form XObject is edited in a private copy
+			fopts.ascii = 1;
+			fopts.filters = list;
+			pdf_filter_page_contents(ctx_, pdf, pg, &fopts);
+			if (rs.removed == 0)
+				fz_throw(ctx_, FZ_ERROR_GENERIC, "couldn't find that text in the page content");
+		}
+
+		if (!emit.empty()) {
+			// Reference the font from the page's own resources (reusing its
+			// name if it's already listed), then append the new text as its
+			// own content stream. The filter above always leaves the existing
+			// content's graphics state balanced, so this starts from the
+			// default state rather than inheriting a stray transform.
+			pdf_obj* page_ref = pg->obj;
+			pdf_obj* res = pdf_dict_get(ctx_, page_ref, PDF_NAME(Resources));
+			if (!res) {
+				pdf_obj* inh = pdf_dict_get_inheritable(ctx_, page_ref, PDF_NAME(Resources));
+				res = inh ? pdf_copy_dict(ctx_, inh) : pdf_new_dict(ctx_, pdf, 2);
+				pdf_dict_put_drop(ctx_, page_ref, PDF_NAME(Resources), res);
+			}
+			pdf_obj* fonts = pdf_dict_get(ctx_, res, PDF_NAME(Font));
+			if (!fonts) fonts = pdf_dict_put_dict(ctx_, res, PDF_NAME(Font), 2);
+			std::string resName;
+			for (int i = 0, n = pdf_dict_len(ctx_, fonts); i < n && resName.empty(); ++i) {
+				pdf_obj* v = pdf_dict_get_val(ctx_, fonts, i);
+				if (v == fontObj || (pdf_is_indirect(ctx_, v) && pdf_is_indirect(ctx_, fontObj) &&
+						pdf_to_num(ctx_, v) == pdf_to_num(ctx_, fontObj)))
+					resName = pdf_to_name(ctx_, pdf_dict_get_key(ctx_, fonts, i));
+			}
+			if (resName.empty()) {
+				char name[32];
+				int i = 0;
+				do { snprintf(name, sizeof(name), "PDFastT%d", i++); } while (pdf_dict_gets(ctx_, fonts, name));
+				pdf_dict_puts(ctx_, fonts, name, fontObj);
+				resName = name;
+			}
+
+			fz_point o = run.glyphs.empty() ? fz_make_point(0, 0)
+				: (k < run.glyphs.size() ? fz_make_point(run.glyphs[k].x, run.glyphs[k].y)
+					: fz_make_point(run.glyphs.back().endX, run.glyphs.back().endY));
+			o = fz_transform_point(o, toPdf);
+			fz_point d = fz_transform_vector(fz_make_point(run.dir.x, run.dir.y), toPdf);
+			float dl = std::sqrt(d.x * d.x + d.y * d.y);
+			if (dl < 1e-6f) { d = fz_make_point(1, 0); dl = 1; }
+			d.x /= dl; d.y /= dl;
+			float r = GetRValue(run.color) / 255.0f, gr = GetGValue(run.color) / 255.0f, bl = GetBValue(run.color) / 255.0f;
+
+			cs = fz_new_buffer(ctx_, 128);
+			fz_append_printf(ctx_, cs, "q BT /%s %g Tf %g %g %g rg %g %g %g %g %g %g Tm [",
+				resName.c_str(), run.size, r, gr, bl, d.x, d.y, -d.y, d.x, o.x, o.y);
+			bool inStr = false;
+			for (size_t i = 0; i < emit.size(); ++i) {
+				if (asGap[i]) {
+					if (inStr) { fz_append_string(ctx_, cs, ">"); inStr = false; }
+					fz_append_string(ctx_, cs, " -250 "); // a quarter-em, a typical space width
+					continue;
+				}
+				if (!inStr) { fz_append_string(ctx_, cs, "<"); inStr = true; }
+				fz_append_printf(ctx_, cs, codeBytes == 1 ? "%02x" : "%04x", codes[i]);
+			}
+			if (inStr) fz_append_string(ctx_, cs, ">");
+			fz_append_string(ctx_, cs, "] TJ ET Q\n");
+
+			pdf_obj* contentsRef = pdf_add_stream(ctx_, pdf, cs, nullptr, 0);
+			pdf_obj* oldContents = pdf_dict_get(ctx_, page_ref, PDF_NAME(Contents));
+			pdf_obj* newContents;
+			if (pdf_is_array(ctx_, oldContents)) {
+				newContents = pdf_copy_array(ctx_, oldContents);
+				pdf_array_push(ctx_, newContents, contentsRef);
+			} else {
+				newContents = pdf_new_array(ctx_, pdf, 2);
+				if (oldContents) pdf_array_push(ctx_, newContents, oldContents);
+				pdf_array_push(ctx_, newContents, contentsRef);
+			}
+			pdf_drop_obj(ctx_, contentsRef);
+			pdf_dict_put_drop(ctx_, page_ref, PDF_NAME(Contents), newContents);
+		}
+		ok = true;
+	}
+	fz_always(ctx_) {
+		if (cs) fz_drop_buffer(ctx_, cs);
+		if (ownFontObj && fontObj) pdf_drop_obj(ctx_, fontObj);
+		if (desc) pdf_drop_font(ctx_, desc);
+		if (sysFont) fz_drop_font(ctx_, sysFont);
+		if (st) fz_drop_stext_page(ctx_, st);
+		if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg));
+	}
+	fz_catch(ctx_) {
+		err = fz_caught_message(ctx_);
+		ok = false;
+	}
+	if (ok) dirty_ = true;
+	return ok;
 }
 
 bool PdfDocument::clearPendingRedactions(std::string& err)

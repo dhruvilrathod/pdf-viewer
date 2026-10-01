@@ -963,6 +963,95 @@ int wmain(int argc, wchar_t** argv)
 		return failures == 0 ? 0 : 1;
 	}
 
+	// --edittexttest mode: Edit Text, headlessly. argv[4..] are find/replace
+	// pairs; each finds the first page-content run containing `find` and
+	// rewrites it with `find` -> `replace`. Asserts the new text reads back,
+	// that every OTHER run on the page is untouched, and that it survives a
+	// save + reopen. Writes <output>, <output>.before.png, <output>.after.png.
+	if (argc > 5 && wcscmp(argv[3], L"--edittexttest") == 0) {
+		Gdiplus::GdiplusStartupInput gdipIn;
+		ULONG_PTR gdipToken = 0;
+		if (Gdiplus::GdiplusStartup(&gdipToken, &gdipIn, nullptr) != Gdiplus::Ok) return 1;
+		struct GdipShutdown { ULONG_PTR t; ~GdipShutdown() { Gdiplus::GdiplusShutdown(t); } } gdipGuard{ gdipToken };
+		PdfDocument doc; std::string e; bool npw = false;
+		if (!doc.open(input, e, npw)) { std::printf("open FAILED: %s\n", e.c_str()); return 2; }
+		auto savePng = [&](PdfDocument& d, int page, const wchar_t* suffix) {
+			PageBitmap pb = d.renderPage(page, 1.5f);
+			Gdiplus::Bitmap bmp(pb.hbmp, nullptr);
+			CLSID pngClsid = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+			bmp.Save((std::wstring(output) + suffix).c_str(), &pngClsid, nullptr);
+		};
+		auto runKey = [](const TextRun& r) { return std::to_string(static_cast<int>(r.glyphs[0].x)) + "," + std::to_string(static_cast<int>(r.glyphs[0].y)); };
+		int failures = 0, page = -1;
+		std::vector<std::wstring> expected;
+		std::vector<std::string> editedKeys;
+		std::vector<TextRun> before;
+		for (int a = 4; a + 1 < argc; a += 2) {
+			std::wstring find = argv[a], repl = argv[a + 1];
+			if (repl == L"<del>") repl.clear(); // shells drop empty arguments
+			bool done = false;
+			for (int p = 0; p < doc.pageCount() && !done; ++p) {
+				auto runs = doc.textRuns(p);
+				for (const TextRun& r : runs) {
+					size_t at = r.text.find(find);
+					if (at == std::wstring::npos) continue;
+					if (page < 0) { page = p; before = runs; savePng(doc, p, L".before.png"); }
+					std::wstring nt = r.text.substr(0, at) + repl + r.text.substr(at + find.size());
+					std::string note;
+					bool ok = doc.replaceTextRun(p, r, nt, e, note);
+					std::wprintf(L"p%d run \"%ls\" (font %hs %.1fpt%ls%ls)\n   -> \"%ls\": %hs%hs%hs\n", p, r.text.c_str(),
+						r.fontName.c_str(), r.size, r.bold ? L" bold" : L"", r.visible ? L"" : L" INVISIBLE",
+						nt.c_str(), ok ? "ok" : "FAILED ", ok ? "" : e.c_str(), note.empty() ? "" : ("\n   note: " + note).c_str());
+					if (!ok) ++failures;
+					std::wstring trimmed = nt, old = r.text;
+					while (!trimmed.empty() && trimmed.back() == L' ') trimmed.pop_back();
+					while (!old.empty() && old.back() == L' ') old.pop_back();
+					// Re-editing a line supersedes what an earlier edit expected of it.
+					expected.erase(std::remove(expected.begin(), expected.end(), old), expected.end());
+					expected.push_back(trimmed);
+					editedKeys.push_back(runKey(r));
+					done = true;
+					break;
+				}
+			}
+			if (!done) { std::wprintf(L"not found: \"%ls\"\n", find.c_str()); ++failures; }
+		}
+		if (page < 0) return 3;
+		savePng(doc, page, L".after.png");
+
+		auto check = [&](PdfDocument& d, const char* stage) {
+			auto after = d.textRuns(page);
+			std::wstring all;
+			for (const TextRun& r : after) all += r.text + L"\n";
+			for (const auto& x : expected) {
+				bool found = all.find(x) != std::wstring::npos;
+				// A re-emitted run may split at the old/new boundary; also accept
+				// the text with that boundary's run break removed.
+				if (!found) { std::wstring flat; for (const TextRun& r : after) flat += r.text; found = flat.find(x) != std::wstring::npos; }
+				std::wprintf(L"  [%hs] \"%ls\" %ls\n", stage, x.c_str(), found ? L"present" : L"MISSING");
+				if (!found) ++failures;
+			}
+			// Every run we didn't edit must still be there, same text, same place.
+			int untouched = 0, lost = 0;
+			for (const TextRun& b : before) {
+				if (std::find(editedKeys.begin(), editedKeys.end(), runKey(b)) != editedKeys.end()) continue;
+				bool same = false;
+				for (const TextRun& a2 : after) if (runKey(a2) == runKey(b) && a2.text == b.text) { same = true; break; }
+				if (same) ++untouched;
+				else { ++lost; std::wprintf(L"  [%hs] CHANGED OTHER RUN: \"%ls\"\n", stage, b.text.c_str()); }
+			}
+			std::printf("  [%s] other runs unchanged: %d, changed: %d\n", stage, untouched, lost);
+			if (lost) ++failures;
+		};
+		check(doc, "in memory");
+		if (!doc.save(output, false, e)) { std::printf("save FAILED: %s\n", e.c_str()); return 4; }
+		PdfDocument doc2;
+		if (!doc2.open(output, e, npw)) { std::printf("reopen FAILED: %s\n", e.c_str()); return 5; }
+		check(doc2, "saved+reopened");
+		std::printf("\n--edittexttest failures: %d\n", failures);
+		return failures == 0 ? 0 : 1;
+	}
+
 	// --redactdiag mode: marks every hit of each search phrase (argv[4..]) for
 	// redaction, applies, and prints each text line whose content changed --
 	// so text removed OUTSIDE the marks shows up immediately. Also writes

@@ -748,7 +748,7 @@ public:
 	// Also drops any signature selection: a save reopens the document, and a
 	// flatten/lock removes annotations outright, so the held index is no
 	// longer guaranteed to mean the same thing.
-	void refreshAfterSave() { clearStampSelection(); widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); invalidateCache(); relayout(); invalidate(); }
+	void refreshAfterSave() { clearStampSelection(); widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); runsCache_.clear(); editHoverIdx_ = -1; invalidateCache(); relayout(); invalidate(); }
 
 	void zoomIn() { setZoom(zoom_ * kZoomStep); fit_ = Fit::None; }
 	void zoomOut() { setZoom(zoom_ / kZoomStep); fit_ = Fit::None; }
@@ -768,10 +768,11 @@ public:
 	int viewRotation() const { return viewRotation_; }
 
 	// Annotation tools
-	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact, Sign };
+	enum class Tool { Select, Highlight, Draw, Erase, Text, Redact, Sign, EditText };
 	void setTool(Tool t) {
 		if (inlineEdit_) commitInlineEdit(true);
 		bool wasSign = tool_ == Tool::Sign;
+		bool wasEditText = tool_ == Tool::EditText;
 		// Changing tools drops any signature selection -- its handles belong
 		// to an editing gesture, not to the page. (Placing a signature leaves
 		// you on the Sign tool, so the auto-selection after a drop survives
@@ -783,10 +784,11 @@ public:
 		// Leaving the Sign tool must clear the follow-the-cursor ghost, or it
 		// stays painted at wherever the mouse last was.
 		if (wasSign && t != Tool::Sign && sigGhostVisible_) { sigGhostVisible_ = false; invalidate(); }
-		// The Sign tool takes the status bar over as its instruction line
-		// (see updateStatus), so both entering and leaving it have to
-		// rewrite that text -- otherwise the hint lingers under another tool.
-		if (wasSign || t == Tool::Sign) updateStatus();
+		if (wasEditText && t != Tool::EditText) { editHoverIdx_ = -1; editTextNote_.clear(); invalidate(); }
+		// The Sign and Edit Text tools take the status bar over as their
+		// instruction line (see updateStatus), so both entering and leaving
+		// them have to rewrite that text -- otherwise the hint lingers.
+		if (wasSign || t == Tool::Sign || wasEditText || t == Tool::EditText) updateStatus();
 	}
 	Tool tool() const { return tool_; }
 	// True when the canvas should behave exactly like the Select tool: normal
@@ -945,7 +947,7 @@ private:
 	void onLButtonUp(int mx, int my);
 	void eraseAt(int mx, int my);
 	void doFormFill(int page, float px, float py);
-	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); }
+	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); runsCache_.erase(page); if (editHoverPage_ == page) editHoverIdx_ = -1; }
 	void drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY);
 	// Tools-grid empty state (shown instead of the plain "drag a file here"
 	// hint when no document is open). Defined after the icons:: namespace so
@@ -965,6 +967,12 @@ private:
 		int existingAnnotIndex = -1;   // >=0 => editing an existing FreeText annot
 		int widgetIndex = -1;          // >=0 => editing this form-field widget (for Tab navigation)
 		float fontSize = 12.0f;
+		// Editing the PDF's own text (Edit Text tool): the box takes on that
+		// text's face/style/colour so what's typed previews like the result.
+		bool pdfText = false;
+		std::wstring face;
+		bool bold = false, italic = false;
+		COLORREF color = 0;
 	};
 	void beginInlineEdit(int page, PageRectPt rectPt, const std::string& utf8,
 		const InlineEditOptions& opts, std::function<void(const std::string&, bool committed)> onDone);
@@ -1012,6 +1020,11 @@ private:
 	void selectWordAt(int page, float px, float py);
 	void selectLineAt(int page, float px, float py);
 	const std::vector<PageChar>& charsForPage(int page);
+	// --- Edit Text tool --------------------------------------------------
+	const std::vector<TextRun>& runsForPage(int page);
+	int textRunAt(int page, float px, float py);   // index into runsForPage, or -1
+	void updateEditTextHover(int mx, int my);
+	void beginPdfTextEdit(int page, int runIndex, float clickX); // caret lands where clicked
 	const std::vector<AnnotInfo>& annotsForPage(int page);
 	const std::vector<LinkInfo>& linksForPage(int page);
 	// Detect plain-text URLs/emails in a page's text and turn them into links
@@ -1068,6 +1081,10 @@ private:
 	std::function<void(const std::string&, bool)> inlineEditDone_;
 	bool inlineIsWidget_ = false;
 	bool inlineShowPopup_ = false;
+	bool inlinePdfText_ = false; // see InlineEditOptions::pdfText
+	std::wstring inlinePdfFace_;
+	bool inlinePdfBold_ = false, inlinePdfItalic_ = false;
+	COLORREF inlinePdfColor_ = 0;
 	bool inlineAutoExitSelect_ = false;
 	int inlineExistingAnnotIndex_ = -1;
 	int inlineWidgetIndex_ = -1; // >=0 while inlineIsWidget_ -- which widget, for Tab navigation
@@ -1149,6 +1166,9 @@ private:
 	POINT lastClickPos_ = {};
 	int clickCount_ = 0;
 	std::unordered_map<int, std::vector<PageChar>> charsCache_;
+	std::unordered_map<int, std::vector<TextRun>> runsCache_;
+	int editHoverPage_ = -1, editHoverIdx_ = -1; // run under the cursor (Edit Text tool)
+	std::wstring editTextNote_; // last font-substitution note, shown in the status bar
 	std::unordered_map<int, std::vector<AnnotInfo>> annotCache_;
 	std::unordered_map<int, std::vector<LinkInfo>> linksCache_;
 	std::string hoveredLinkText_; // non-empty while the cursor sits over a link
@@ -1482,6 +1502,7 @@ private:
 	void updateTitle();
 	void updateStatusPath();          // right-hand status bar part: current tab's full file path
 	void layoutStatusParts();         // recomputes the two status bar part boundaries for the current width
+	int statusLeftW_ = -1;            // part 0's current width, so unchanged layouts skip SB_SETPARTS
 	bool promptSaveIfDirty(); // returns false if user cancelled
 	void updateZoomLabel();
 
@@ -2121,6 +2142,8 @@ void CanvasView::setDocument(PdfDocument* doc)
 	charsCache_.clear();
 	annotCache_.clear();
 	linksCache_.clear();
+	runsCache_.clear();
+	editHoverIdx_ = -1;
 	hoveredLinkText_.clear();
 	invalidateCache();
 	applyFit();
@@ -2361,6 +2384,11 @@ void CanvasView::onLButtonDown(int mx, int my)
 		eraseAt(mx, my);
 		return;
 	}
+	if (tool_ == Tool::EditText) {
+		int idx = doc_->isPdf() ? textRunAt(page, px, py) : -1;
+		if (idx >= 0) beginPdfTextEdit(page, idx, px);
+		return;
+	}
 	// (An unarmed Sign tool never reaches here -- actsLikeSelect() sent it
 	// down the Select branch above.)
 	// Begin a drag for Highlight / Draw / Text / Sign.
@@ -2394,6 +2422,7 @@ void CanvasView::onMouseMove(int mx, int my)
 	}
 	if (!dragging_) {
 		if (actsLikeSelect()) updateLinkHover(mx, my);
+		if (tool_ == Tool::EditText) updateEditTextHover(mx, my);
 		if (tool_ == Tool::Sign && hasPendingSignature()) {
 			// Follow-the-cursor ghost. Invalidate only the union of the old
 			// and new ghost rects -- a full-canvas invalidate on every mouse
@@ -2871,6 +2900,116 @@ const std::vector<PageChar>& CanvasView::charsForPage(int page)
 	return charsCache_.emplace(page, std::move(c)).first->second;
 }
 
+const std::vector<TextRun>& CanvasView::runsForPage(int page)
+{
+	auto it = runsCache_.find(page);
+	if (it != runsCache_.end()) return it->second;
+	std::vector<TextRun> r;
+	if (doc_ && doc_->isPdf()) r = doc_->textRuns(page);
+	return runsCache_.emplace(page, std::move(r)).first->second;
+}
+
+int CanvasView::textRunAt(int page, float px, float py)
+{
+	// Tight line spacing can make neighbouring runs' boxes overlap by a hair;
+	// the smallest box containing the point is the one actually pointed at.
+	constexpr float kPad = 1.5f;
+	const auto& runs = runsForPage(page);
+	int best = -1;
+	float bestArea = 0;
+	for (size_t i = 0; i < runs.size(); ++i) {
+		const PageRectPt& b = runs[i].bbox;
+		if (px < b.x0 - kPad || px > b.x1 + kPad || py < b.y0 - kPad || py > b.y1 + kPad) continue;
+		float area = (b.x1 - b.x0) * (b.y1 - b.y0);
+		if (best < 0 || area < bestArea) { best = static_cast<int>(i); bestArea = area; }
+	}
+	return best;
+}
+
+void CanvasView::updateEditTextHover(int mx, int my)
+{
+	int page = -1, idx = -1;
+	float px, py;
+	if (!inlineEdit_ && mx >= 0 && hitTestPage(mx, my, page, px, py)) idx = textRunAt(page, px, py);
+	if (idx < 0) page = -1;
+	if (page == editHoverPage_ && idx == editHoverIdx_) return;
+	auto dirty = [this](int pg, int i) {
+		if (pg < 0 || i < 0) return;
+		const auto& runs = runsForPage(pg);
+		int sx, sy;
+		if (i >= static_cast<int>(runs.size()) || !pageScreenOrigin(pg, sx, sy)) return;
+		RECT r = pageRectToView(pg, runs[i].bbox);
+		OffsetRect(&r, sx, sy);
+		InflateRect(&r, 4, 4);
+		InvalidateRect(hwnd_, &r, FALSE);
+	};
+	dirty(editHoverPage_, editHoverIdx_);
+	editHoverPage_ = page;
+	editHoverIdx_ = idx;
+	dirty(editHoverPage_, editHoverIdx_);
+	if (mx >= 0) SetCursor(LoadCursor(nullptr, idx >= 0 ? IDC_IBEAM : IDC_ARROW));
+}
+
+void CanvasView::beginPdfTextEdit(int page, int runIndex, float clickX)
+{
+	const auto& runs = runsForPage(page);
+	if (runIndex < 0 || runIndex >= static_cast<int>(runs.size())) return;
+	TextRun run = runs[runIndex]; // a copy: committing invalidates the cache
+	if (!run.visible) {
+		editTextNote_ = L"That text is an invisible layer over a scanned image, so it can't be edited as text.";
+		updateStatus();
+		return;
+	}
+	if (!run.editable) {
+		editTextNote_ = L"That text uses characters this tool can't edit.";
+		updateStatus();
+		return;
+	}
+	editTextNote_.clear();
+	updateEditTextHover(-1, -1);
+
+	// The box covers the line, with room to the right for it to grow.
+	PageRectPt bound = doc_->pageBound(page);
+	PageRectPt r = run.bbox;
+	r.x1 = std::min(bound.x1, r.x1 + std::max(3.0f * run.size, (r.x1 - r.x0) * 0.3f));
+	r.y0 -= 1.0f;
+	r.y1 += 1.0f;
+
+	InlineEditOptions opts;
+	opts.pdfText = true;
+	opts.fontSize = run.size;
+	opts.face = run.family;
+	opts.bold = run.bold;
+	opts.italic = run.italic;
+	opts.color = run.color;
+	beginInlineEdit(page, r, WideToUtf8(run.text), opts,
+		[this, page, run](const std::string& text, bool committed) {
+			if (!committed) return;
+			std::wstring nt = Utf8ToWide(text);
+			if (nt == run.text) return;
+			std::string err, note;
+			if (!doc_->replaceTextRun(page, run, nt, err, note)) {
+				std::wstring w = L"Couldn't change that text.";
+				if (!err.empty()) w += L"\n\n" + Utf8ToWide(err);
+				MessageBoxW(GetAncestor(hwnd_, GA_ROOT), w.c_str(), L"Edit Text", MB_OK | MB_ICONWARNING);
+				return;
+			}
+			editTextNote_ = Utf8ToWide(note);
+			invalidatePage(page);
+			invalidate();
+			if (onChanged_) onChanged_();
+			updateStatus();
+		});
+	if (!inlineEdit_) return; // refused (e.g. the view is rotated)
+	// Caret where the click landed, not select-all: the usual edit is a word
+	// or two inside a longer line, and select-all would make the first
+	// keystroke wipe the whole line.
+	size_t caret = run.glyphs.size();
+	for (size_t i = 0; i < run.glyphs.size(); ++i)
+		if (clickX < (run.glyphs[i].x + run.glyphs[i].endX) / 2) { caret = i; break; }
+	SendMessageW(inlineEdit_, EM_SETSEL, caret, caret);
+}
+
 const std::vector<AnnotInfo>& CanvasView::annotsForPage(int page)
 {
 	auto it = annotCache_.find(page);
@@ -3247,6 +3386,7 @@ void CanvasView::refreshCursor()
 	if (!GetCursorPos(&pt)) return;
 	if (WindowFromPoint(pt) != hwnd_) return;
 	ScreenToClient(hwnd_, &pt);
+	if (tool_ == Tool::EditText) { updateEditTextHover(pt.x, pt.y); return; }
 	if (!actsLikeSelect()) { SetCursor(LoadCursor(nullptr, IDC_CROSS)); return; }
 	// Mirror the WM_SETCURSOR path so the pointer is right for whatever is
 	// under it (I-beam over text, hand over a link), not just a plain arrow.
@@ -3591,6 +3731,12 @@ void CanvasView::updateInlineEditFont()
 	// annotation is actually written in, so what's being typed occupies the
 	// same width on screen as it will once committed.
 	wcscpy_s(lf.lfFaceName, L"Arial");
+	if (inlinePdfText_) {
+		// Page text: its own family/style, so the edit previews in place.
+		if (!inlinePdfFace_.empty()) wcsncpy_s(lf.lfFaceName, inlinePdfFace_.c_str(), _TRUNCATE);
+		lf.lfWeight = inlinePdfBold_ ? FW_BOLD : FW_NORMAL;
+		lf.lfItalic = inlinePdfItalic_ ? TRUE : FALSE;
+	}
 	HFONT f = CreateFontIndirectW(&lf);
 	SendMessageW(inlineEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(f), TRUE);
 	if (inlineEditFont_) DeleteObject(inlineEditFont_);
@@ -3633,9 +3779,15 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 	inlineExistingAnnotIndex_ = opts.existingAnnotIndex;
 	inlineWidgetIndex_ = opts.widgetIndex;
 	inlineFontSize_ = opts.fontSize;
+	inlinePdfText_ = opts.pdfText;
+	inlinePdfFace_ = opts.face;
+	inlinePdfBold_ = opts.bold;
+	inlinePdfItalic_ = opts.italic;
+	inlinePdfColor_ = opts.color;
 
-	if (inlineShowPopup_) {
-		updateInlineEditFont(); // reflect the actual annotation point size
+	if (inlineShowPopup_ || inlinePdfText_) {
+		updateInlineEditFont(); // reflect the actual point size (and, for page text, its face)
+		if (inlinePdfText_) SendMessageW(inlineEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(1, 1));
 	} else {
 		NONCLIENTMETRICSW ncm = { sizeof(ncm) };
 		UINT dpi = GetDpiForWindow(hwnd_);
@@ -3659,9 +3811,9 @@ void CanvasView::beginInlineEdit(int page, PageRectPt rectPt, const std::string&
 			WS_POPUP | WS_VISIBLE, 0, 0, 10, 10, ownerRoot, nullptr, hInst, this);
 	}
 
-	// Form fields keep their fixed widget-defined size; only free-text boxes
+	// Form fields and page text keep their fixed size; only free-text boxes
 	// (new or existing) get drag handles.
-	if (!opts.isWidget) {
+	if (!opts.isWidget && !opts.pdfText) {
 		resizeTarget_ = ResizeTarget::InlineEdit;
 		createResizeHandles();
 	}
@@ -3695,6 +3847,7 @@ void CanvasView::commitInlineEdit(bool commit)
 	inlineEditPage_ = -1;
 	inlineExistingAnnotIndex_ = -1;
 	inlineWidgetIndex_ = -1;
+	inlinePdfText_ = false;
 	auto done = std::move(inlineEditDone_);
 	inlineEditDone_ = nullptr;
 	if (done) done(WideToUtf8(buf), commit);
@@ -4341,6 +4494,24 @@ void CanvasView::onPaint()
 		}
 	}
 
+	// Edit Text: outline the run under the cursor, so it's clear what a click
+	// will edit (one line in one style, not the whole paragraph).
+	if (tool_ == Tool::EditText && editHoverIdx_ >= 0 && !inlineEdit_) {
+		const auto& runs = runsForPage(editHoverPage_);
+		int sx, sy;
+		if (editHoverIdx_ < static_cast<int>(runs.size()) && pageScreenOrigin(editHoverPage_, sx, sy)) {
+			RECT r = pageRectToView(editHoverPage_, runs[editHoverIdx_].bbox);
+			OffsetRect(&r, sx, sy);
+			InflateRect(&r, 2, 2);
+			HPEN pen = CreatePen(PS_DOT, 1, RGB(0, 120, 215));
+			HGDIOBJ oldPen = SelectObject(mem, pen);
+			HGDIOBJ oldBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
+			Rectangle(mem, r.left, r.top, r.right, r.bottom);
+			SelectObject(mem, oldPen); SelectObject(mem, oldBr);
+			DeleteObject(pen);
+		}
+	}
+
 	// Live overlay for the in-progress annotation drag.
 	if (dragging_) {
 		if (tool_ == Tool::Highlight || tool_ == Tool::Text || tool_ == Tool::Redact) {
@@ -4569,6 +4740,13 @@ void CanvasView::updateStatus()
 		if (onViewChanged_) onViewChanged_();
 		return;
 	}
+	if (tool_ == Tool::EditText && doc_ && doc_->isOpen()) {
+		statusText_ = !editTextNote_.empty() ? editTextNote_
+			: L"Edit Text: click any text on the page to change it. Enter applies, Esc cancels.";
+		SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
+		if (onViewChanged_) onViewChanged_();
+		return;
+	}
 	wchar_t buf[128];
 	if (doc_ && doc_->isOpen()) {
 		int cur = (mode_ == Mode::Continuous) ? dominantVisiblePage() : currentPage_;
@@ -4615,6 +4793,7 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			InflateRect(&dirty, 2, 2);
 			InvalidateRect(hwnd, &dirty, FALSE);
 		}
+		if (self->editHoverIdx_ >= 0) self->updateEditTextHover(-1, -1); // clears the outline
 		return 0;
 	case WM_TIMER:
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
@@ -4636,6 +4815,10 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_LBUTTONUP: self->onLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
 	case WM_SETCURSOR:
 		if (LOWORD(lp) == HTCLIENT) {
+			if (self->tool_ == Tool::EditText && self->doc_ && self->doc_->isOpen()) {
+				SetCursor(LoadCursor(nullptr, self->editHoverIdx_ >= 0 ? IDC_IBEAM : IDC_ARROW));
+				return TRUE;
+			}
 			// Crosshair only for tools that actually mark the page -- which
 			// includes Sign ONLY once a signature is armed. With the panel
 			// merely open, the pointer stays exactly as it is anywhere else.
@@ -4698,6 +4881,15 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		break;
 	case WM_CTLCOLOREDIT:
+		if (self->inlineEdit_ && reinterpret_cast<HWND>(lp) == self->inlineEdit_ && self->inlinePdfText_) {
+			// Opaque white over the original text, in that text's colour: the
+			// box shows only what the line will read once applied.
+			HDC dc = reinterpret_cast<HDC>(wp);
+			SetTextColor(dc, self->inlinePdfColor_);
+			SetBkColor(dc, RGB(255, 255, 255));
+			static HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
+			return reinterpret_cast<LRESULT>(white);
+		}
 		if (self->inlineEdit_ && reinterpret_cast<HWND>(lp) == self->inlineEdit_ && self->inlineShowPopup_) {
 			// Live preview: the free-text box's typed color follows the swatch
 			// picker immediately, same as the rendered annotation will use.
@@ -5964,6 +6156,24 @@ void DrawSignTool(Gdiplus::Graphics& g, float s)
 	p.line(0.14f, 0.78f, 0.86f, 0.78f);
 }
 
+// A "T" with a text cursor beside it: edit the text that's already there,
+// as opposed to Add Text's plain "A" (a new box).
+void DrawEditTextTool(Gdiplus::Graphics& g, float s)
+{
+	Gdiplus::FontFamily fam(L"Segoe UI");
+	Gdiplus::Font font(&fam, s * 0.56f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+	Gdiplus::SolidBrush br{ Gdiplus::Color(kInk) };
+	Gdiplus::StringFormat fmt;
+	fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
+	fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+	Gdiplus::RectF rc(-s * 0.10f, 0, s * 0.80f, s);
+	g.DrawString(L"T", 1, &font, rc, &fmt, &br);
+	IconPen p(g, s, 0.07f);
+	p.line(0.80f, 0.20f, 0.80f, 0.80f);
+	p.line(0.70f, 0.20f, 0.90f, 0.20f);
+	p.line(0.70f, 0.80f, 0.90f, 0.80f);
+}
+
 void DrawTextTool(Gdiplus::Graphics& g, float s)
 {
 	Gdiplus::FontFamily fam(L"Segoe UI");
@@ -6396,6 +6606,7 @@ const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
 		icons::DrawToolsMenu, icons::DrawThemeToggle, icons::DrawEraseTool,
 		icons::DrawRotateView,
 		icons::DrawSignTool,
+		icons::DrawEditTextTool,
 	};
 	return fns;
 }
@@ -6464,7 +6675,7 @@ void FrameWindow::createChildren()
 	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
 		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
 		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18,
-		iErase = 19, iRotate = 20, iSign = 21;
+		iErase = 19, iRotate = 20, iSign = 21, iEditText = 22;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -6519,6 +6730,7 @@ void FrameWindow::createChildren()
 	radioBtn(IDM_TOOL_DRAW, iDraw, L"Draw");
 	radioBtn(IDM_TOOL_ERASE, iErase, L"Erase");
 	radioBtn(IDM_TOOL_TEXT, iText, L"Add Text");
+	radioBtn(IDM_TOOL_EDITTEXT, iEditText, L"Edit Text — click the PDF's own text to change it");
 	radioBtn(IDM_TOOL_SIGN, iSign, L"Sign — type or draw a signature, then click the page to place it");
 	radioBtn(IDM_TOOL_REDACT, iRedact, L"Redact");
 	btn(IDM_TOOL_COLOR, iColor, L"Color");
@@ -8986,6 +9198,7 @@ int FrameWindow::newTab()
 	tab->canvas->setOnViewChanged([this] {
 		updateZoomLabel();
 		updatePageEditBox();
+		layoutStatusParts();
 		// Wheel-driven print-preview paging (see CanvasView::onWheel) moves
 		// the preview cursor directly on the canvas; keep the panel's "Page
 		// N of M" readout and prev/next enabled-state in sync with it.
@@ -9062,10 +9275,13 @@ void FrameWindow::switchToTab(int idx)
 	case CanvasView::Tool::Draw: toolId = IDM_TOOL_DRAW; break;
 	case CanvasView::Tool::Erase: toolId = IDM_TOOL_ERASE; break;
 	case CanvasView::Tool::Text: toolId = IDM_TOOL_TEXT; break;
+	case CanvasView::Tool::EditText: toolId = IDM_TOOL_EDITTEXT; break;
+	case CanvasView::Tool::Sign: toolId = IDM_TOOL_SIGN; break;
 	case CanvasView::Tool::Redact: toolId = IDM_TOOL_REDACT; break;
 	default: break;
 	}
-	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE, IDM_TOOL_TEXT, IDM_TOOL_REDACT })
+	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE, IDM_TOOL_TEXT,
+		IDM_TOOL_EDITTEXT, IDM_TOOL_SIGN, IDM_TOOL_REDACT })
 		SendMessageW(toolbar_, TB_CHECKBUTTON, b, MAKELPARAM(b == toolId, 0));
 	updateRedactBar();
 
@@ -10055,6 +10271,7 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOL_DRAW:
 	case IDM_TOOL_ERASE:
 	case IDM_TOOL_TEXT:
+	case IDM_TOOL_EDITTEXT:
 	case IDM_TOOL_SIGN:
 	case IDM_TOOL_REDACT: selectTool(id); break;
 	case IDM_TOOL_COLOR: chooseColor(); break;
@@ -10098,13 +10315,14 @@ void FrameWindow::selectTool(int id)
 	case IDM_TOOL_DRAW: t = CanvasView::Tool::Draw; break;
 	case IDM_TOOL_ERASE: t = CanvasView::Tool::Erase; break;
 	case IDM_TOOL_TEXT: t = CanvasView::Tool::Text; break;
+	case IDM_TOOL_EDITTEXT: t = CanvasView::Tool::EditText; break;
 	case IDM_TOOL_SIGN: t = CanvasView::Tool::Sign; break;
 	case IDM_TOOL_REDACT: t = CanvasView::Tool::Redact; break;
 	default: t = CanvasView::Tool::Select; break;
 	}
 	if (canvas_) canvas_->setTool(t);
 	for (int b : { IDM_TOOL_SELECT, IDM_TOOL_HIGHLIGHT, IDM_TOOL_DRAW, IDM_TOOL_ERASE,
-		IDM_TOOL_TEXT, IDM_TOOL_SIGN, IDM_TOOL_REDACT })
+		IDM_TOOL_TEXT, IDM_TOOL_EDITTEXT, IDM_TOOL_SIGN, IDM_TOOL_REDACT })
 		SendMessageW(toolbar_, TB_CHECKBUTTON, b, MAKELPARAM(b == id, 0));
 	updateRedactBar();
 	// The signature panel IS the Sign tool's UI, so it follows the tool
@@ -10287,6 +10505,25 @@ void FrameWindow::layoutStatusParts()
 	// Wide enough for the longest form of part 0's text, which now includes
 	// the view-rotation readout ("Page 9 / 99   Zoom 1200%   Rotated 270°").
 	int leftW = Scale(300, dpi);
+	// Tool instruction lines and notes (Sign, Edit Text's font-substitution
+	// warning) run longer than that: let part 0 grow to fit its current text,
+	// up to three quarters of the bar, rather than cutting them off mid-word.
+	if (canvas_) {
+		const std::wstring& t = canvas_->currentStatusText();
+		HDC dc = GetDC(status_);
+		HFONT f = reinterpret_cast<HFONT>(SendMessageW(status_, WM_GETFONT, 0, 0));
+		HGDIOBJ old = f ? SelectObject(dc, f) : nullptr;
+		SIZE sz{};
+		GetTextExtentPoint32W(dc, t.c_str(), static_cast<int>(t.size()), &sz);
+		if (old) SelectObject(dc, old);
+		ReleaseDC(status_, dc);
+		RECT rc;
+		GetClientRect(status_, &rc);
+		int maxW = std::max(leftW, static_cast<int>(rc.right) * 3 / 4);
+		leftW = std::clamp(static_cast<int>(sz.cx) + Scale(24, dpi), leftW, maxW);
+	}
+	if (leftW == statusLeftW_) return; // unchanged -- skip the repaint
+	statusLeftW_ = leftW;
 	int parts[2] = { leftW, -1 };
 	SendMessageW(status_, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
 }
