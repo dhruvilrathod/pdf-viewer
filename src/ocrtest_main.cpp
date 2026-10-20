@@ -8,6 +8,10 @@
 //   pdfviewer_ocrtest make  <file>... <out.pdf>      wrap images / PDFs into one PDF
 #include "pdf_document.h"
 
+extern "C" {
+#include <mupdf/pdf.h>
+}
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -101,6 +105,74 @@ int wmain(int argc, wchar_t** argv)
 			double ms = Ms(t0);
 			auto chars = doc.pageChars(p);
 			std::printf("-- page %d: %zu chars in %.0f ms\n%s\n", p + 1, chars.size(), ms, Narrow(PageText(chars)).c_str());
+		}
+		return 0;
+	}
+
+	if (cmd == L"dump") {
+		// Structure of page N (default 1): resources and the start of the content stream.
+		int pn = argc >= 4 ? _wtoi(argv[3]) - 1 : 0;
+		fz_context* ctx = doc.ctx();
+		pdf_document* pdf = pdf_document_from_fz_document(ctx, doc.doc());
+		fz_try(ctx) {
+			pdf_obj* page = pdf_lookup_page_obj(ctx, pdf, pn);
+			pdf_obj* res = pdf_dict_get_inheritable(ctx, page, PDF_NAME(Resources));
+			std::printf("page %d resources:\n", pn + 1);
+			for (int i = 0; i < pdf_dict_len(ctx, res); ++i) {
+				pdf_obj* v = pdf_dict_get_val(ctx, res, i);
+				std::printf("  /%s (%d entries)\n", pdf_to_name(ctx, pdf_dict_get_key(ctx, res, i)), pdf_is_dict(ctx, v) ? pdf_dict_len(ctx, v) : 0);
+				if (pdf_dict_get_key(ctx, res, i) == PDF_NAME(Font) || pdf_dict_get_key(ctx, res, i) == PDF_NAME(XObject)) {
+					for (int k = 0; k < pdf_dict_len(ctx, v) && k < 12; ++k) {
+						pdf_obj* o = pdf_dict_get_val(ctx, v, k);
+						pdf_obj* st = pdf_dict_get(ctx, o, PDF_NAME(Subtype));
+						pdf_obj* bf = pdf_dict_get(ctx, o, PDF_NAME(BaseFont));
+						pdf_obj* w = pdf_dict_get(ctx, o, PDF_NAME(Width));
+						std::printf("      %s: %s %s %s\n", pdf_to_name(ctx, pdf_dict_get_key(ctx, v, k)), pdf_to_name(ctx, st),
+							bf ? pdf_to_name(ctx, bf) : "", w ? "(sized)" : "");
+					}
+				}
+			}
+			fz_buffer* buf = pdf_load_raw_stream(ctx, pdf_dict_get(ctx, page, PDF_NAME(Contents)));
+			(void)buf;
+		}
+		fz_catch(ctx) { std::printf("dump error: %s\n", fz_caught_message(ctx)); }
+		fz_buffer* all = nullptr;
+		fz_try(ctx) {
+			pdf_obj* page = pdf_lookup_page_obj(ctx, pdf, pn);
+			pdf_obj* c = pdf_dict_get(ctx, page, PDF_NAME(Contents));
+			all = fz_new_buffer(ctx, 4096);
+			if (pdf_is_array(ctx, c)) {
+				for (int i = 0; i < pdf_array_len(ctx, c); ++i) {
+					fz_buffer* b = pdf_load_stream(ctx, pdf_array_get(ctx, c, i));
+					fz_append_buffer(ctx, all, b); fz_append_string(ctx, all, "\n"); fz_drop_buffer(ctx, b);
+				}
+			} else if (c) {
+				fz_buffer* b = pdf_load_stream(ctx, c);
+				fz_append_buffer(ctx, all, b); fz_drop_buffer(ctx, b);
+			}
+			unsigned char* data = nullptr;
+			size_t n = fz_buffer_storage(ctx, all, &data);
+			std::printf("content stream: %zu bytes. First 700:\n%.*s\n", n, (int)std::min<size_t>(n, 700), (const char*)data);
+		}
+		fz_always(ctx) { fz_drop_buffer(ctx, all); }
+		fz_catch(ctx) { std::printf("contents error: %s\n", fz_caught_message(ctx)); }
+		return 0;
+	}
+
+	if (cmd == L"chars") {
+		// What the viewer's selection sees: per page, the char count and a sample.
+		for (int p = 0; p < doc.pageCount(); ++p) {
+			auto chars = doc.pageChars(p);
+			auto runs = doc.textRuns(p);
+			int vis = 0;
+			for (const auto& r : runs) if (r.visible) ++vis;
+			std::printf("-- page %d: %zu chars, %zu runs (%d visible), size %.0fx%.0f\n", p + 1, chars.size(), runs.size(), vis,
+				doc.pageSize(p).w, doc.pageSize(p).h);
+			std::wstring t = PageText(chars);
+			std::printf("%s\n", Narrow(t.substr(0, 400)).c_str());
+			for (size_t i = 0; i < runs.size() && i < 3; ++i)
+				std::printf("   run %zu: font='%s' size=%.1f visible=%d bbox=(%.0f,%.0f,%.0f,%.0f)\n", i, runs[i].fontName.c_str(),
+					runs[i].size, (int)runs[i].visible, runs[i].bbox.x0, runs[i].bbox.y0, runs[i].bbox.x1, runs[i].bbox.y1);
 		}
 		return 0;
 	}

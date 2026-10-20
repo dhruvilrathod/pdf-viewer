@@ -3916,6 +3916,21 @@ void appendOverlayStream(fz_context* ctx, pdf_document* pdf, pdf_obj* pageObj, f
 	fz_catch(ctx) { fz_rethrow(ctx); }
 }
 
+// Counts small filled shapes: the glyph-sized outlines of text that a "print
+// to PDF" step turned into curves, which leaves nothing to select.
+struct GlyphShapeProbe {
+	fz_device super;
+	int shapes = 0;
+};
+
+void glyphProbeFillPath(fz_context* ctx, fz_device* dev, const fz_path* path, int, fz_matrix ctm,
+	fz_colorspace*, const float*, float, fz_color_params)
+{
+	fz_rect r = fz_bound_path(ctx, path, nullptr, ctm);
+	float w = r.x1 - r.x0, h = r.y1 - r.y0;
+	if (w > 0.5f && h > 0.5f && w < 40.0f && h < 40.0f) ++reinterpret_cast<GlyphShapeProbe*>(dev)->shapes;
+}
+
 } // namespace
 
 bool PdfDocument::ocrAvailable() { return OcrIsAvailable(); }
@@ -3994,6 +4009,23 @@ bool PdfDocument::pageNeedsOcr(int page)
 				// over it. A page carrying a real amount of text (including an
 				// OCR layer from an earlier save) is left alone.
 				need = (coverage >= 0.5 && chars < 8) || (coverage >= 0.8 && textFrac < 0.03 && chars < 60);
+			}
+			if (!need && chars < 8) {
+				// No text and no big picture: is it text drawn as outlines? Only
+				// pages that already have nothing to select get this extra pass.
+				fz_device* probe = nullptr;
+				fz_var(probe);
+				fz_try(ctx_) {
+					probe = fz_new_device_of_size(ctx_, sizeof(GlyphShapeProbe));
+					probe->fill_path = glyphProbeFillPath;
+					fz_run_page_contents(ctx_, pg, probe, fz_identity, nullptr);
+					fz_close_device(ctx_, probe);
+					// A page of text is hundreds of glyph shapes; a plan or a
+					// logo has far fewer small ones.
+					need = reinterpret_cast<GlyphShapeProbe*>(probe)->shapes >= 150;
+				}
+				fz_always(ctx_) { if (probe) fz_drop_device(ctx_, probe); }
+				fz_catch(ctx_) {}
 			}
 		}
 		fz_always(ctx_) {
