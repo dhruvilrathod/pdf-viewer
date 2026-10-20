@@ -3,6 +3,7 @@
 #pragma once
 
 #include <windows.h>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
@@ -75,6 +76,10 @@ struct TextRun {
 	bool visible = true;      // false for invisible text (an OCR layer over a scan)
 	bool editable = true;     // false if it has characters this tool can't round-trip
 };
+
+// One word / line of OCR'd text on a page, in page space (points).
+struct OcrWordPt { std::wstring text; PageRectPt rect; };
+struct OcrLinePt { std::vector<OcrWordPt> words; PageRectPt rect; };
 
 // An existing markup annotation (free text, highlight, ink, ...) found under
 // a point, for click-to-edit / delete support.
@@ -251,6 +256,33 @@ public:
 	// see applyRedactions()). Nothing is actually removed from the page until
 	// applyRedactions().
 	bool addRedaction(int page, PageRectPt rect, std::string& err);
+
+	// --- OCR for scanned pages (Windows.Media.Ocr) -----------------------
+	// A page "needs OCR" when it is essentially one big picture with no real
+	// text on it. The answer is cached per page, and checking costs only a
+	// text-extraction pass (images are not decoded), so a normal digital PDF
+	// is never rasterized or recognized.
+	static bool ocrAvailable();
+	bool pageNeedsOcr(int page);
+	// Samples a few pages: true if most of them are scans. Decides whether
+	// the OCR toggle starts out on for a freshly opened document.
+	bool probeNeedsOcr();
+	// The next page still waiting for OCR, nearest to `focusPage` first; -1
+	// when nothing is left. Pages are tested lazily here, so a digital PDF
+	// with OCR forced on just walks its pages and finds nothing to do.
+	int nextOcrPage(int focusPage);
+	// Renders `page`, recognizes it and stores the result. Heavy: meant for a
+	// worker thread; holds the document lock only while rendering.
+	bool ocrScanPage(int page, std::string& err);
+	// The OCR layer is shown (selection / search / copy) and written on save
+	// only while enabled. Recognized pages are kept when it is turned off.
+	void setOcrLayerEnabled(bool on) { ocrEnabled_ = on; }
+	bool ocrLayerEnabled() const { return ocrEnabled_; }
+	bool pageHasOcr(int page) const;
+	int ocrPagesDone() const;
+	bool hasOcrToSave() const;
+	// Drops every recognized page without writing it.
+	void discardOcr();
 
 	// --- Edit Text (the page's own text, not annotations) ----------------
 	// Every run of page-content text on `page` (form fields and annotations
@@ -438,6 +470,17 @@ private:
 	// Each text widget's font size the first time this session touches it
 	// (key: page<<32 | widgetIndex) -- see autoFitTextWidgetFontSize().
 	std::unordered_map<long long, float> widgetBaseFontSize_;
+	// OCR state. ocrState_: -1 unknown, 0 no OCR needed, 1 needed + pending,
+	// 2 recognized, 3 attempted and failed/empty (never retried).
+	mutable std::mutex ocrMutex_;
+	std::vector<signed char> ocrState_;
+	std::unordered_map<int, std::vector<OcrLinePt>> ocrPages_;
+	std::atomic<bool> ocrEnabled_{ false };
+	std::atomic<int> docGen_{ 0 }; // bumped whenever page indices may have changed
+	std::vector<PageChar> ocrChars(int page, std::vector<int>* lineIndex = nullptr) const;
+	// Writes every recognized page into the PDF as invisible text, then
+	// forgets the side table. Caller holds mutex_. No-op if nothing to write.
+	void bakeOcrLayer();
 	int pageCount_ = 0;
 	std::vector<PageSizePt> sizes_;
 	std::vector<PageRectPt> bounds_;

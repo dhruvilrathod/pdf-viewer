@@ -22,6 +22,7 @@
 #include <richedit.h> // MSFTEDIT_CLASS / CHARFORMAT2W -- the rich-text-editor tool's edit control
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cwctype>
@@ -30,6 +31,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -217,6 +219,13 @@ constexpr wchar_t kResizeHandleClass[] = L"PdfResizeHandle";
 // a heap-allocated updater::UpdateInfo (frame takes ownership), WPARAM is the
 // `manual` flag. See startUpdateCheck()/onUpdateResult().
 constexpr UINT WM_APP_UPDATE_RESULT = WM_APP + 1;
+
+// Posted by a canvas's OCR worker thread to that canvas: WM_APP_OCR_PAGE once
+// when a page starts (LPARAM = -1) and once when it finishes (LPARAM = 1 on
+// success, 0 on failure); WM_APP_OCR_DONE when the worker has run out of pages
+// (or stopped on an error).
+constexpr UINT WM_APP_OCR_PAGE = WM_APP + 2;
+constexpr UINT WM_APP_OCR_DONE = WM_APP + 3;
 
 // Resize-handle direction indices, matching the 8-entry layout used by
 // positionResizeHandles()/updateResize(): NW,N,NE,W,E,SW,S,SE. kResizeMove is
@@ -712,7 +721,17 @@ public:
 
 	static void Register(HINSTANCE hInst);
 	CanvasView(HWND parent, HINSTANCE hInst);
+	~CanvasView() { stopOcrWorker(); }
 	HWND hwnd() const { return hwnd_; }
+
+	// --- OCR for scanned pages ---------------------------------------------
+	// On by default for a document that opens as a scan (see setDocument);
+	// otherwise nothing is ever recognized. While on, pages that are just a
+	// picture get read in the background, nearest the current page first, and
+	// their text becomes selectable / searchable. Save writes it into the PDF.
+	bool ocrEnabled() const { return ocrEnabled_; }
+	void toggleOcr();
+	void kickOcr(); // starts the worker if OCR is on and pages remain; cheap otherwise
 
 	void setDocument(PdfDocument* doc);
 	void setThumbPanel(ThumbPanel* tp) { thumbs_ = tp; }
@@ -748,7 +767,7 @@ public:
 	// Also drops any signature selection: a save reopens the document, and a
 	// flatten/lock removes annotations outright, so the held index is no
 	// longer guaranteed to mean the same thing.
-	void refreshAfterSave() { clearStampSelection(); widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); runsCache_.clear(); editHoverIdx_ = -1; invalidateCache(); relayout(); invalidate(); }
+	void refreshAfterSave() { clearStampSelection(); widgetCache_.clear(); charsCache_.clear(); annotCache_.clear(); linksCache_.clear(); runsCache_.clear(); editHoverIdx_ = -1; invalidateCache(); relayout(); invalidate(); kickOcr(); }
 
 	void zoomIn() { setZoom(zoom_ * kZoomStep); fit_ = Fit::None; }
 	void zoomOut() { setZoom(zoom_ / kZoomStep); fit_ = Fit::None; }
@@ -1167,6 +1186,24 @@ private:
 	int clickCount_ = 0;
 	std::unordered_map<int, std::vector<PageChar>> charsCache_;
 	std::unordered_map<int, std::vector<TextRun>> runsCache_;
+
+	// OCR worker (see toggleOcr / kickOcr). The thread only touches `doc_`'s
+	// own locked API plus these atomics; results come back as window messages.
+	bool ocrEnabled_ = false;
+	bool ocrSeen_ = false;              // at least one page was recognized this session
+	std::thread ocrThread_;
+	std::atomic<bool> ocrStop_{ false };
+	std::atomic<bool> ocrRunning_{ false };
+	std::atomic<int> ocrFocus_{ 0 };    // page the worker should work outward from
+	std::atomic<int> ocrBusyPage_{ -1 };
+	std::mutex ocrErrMutex_;
+	std::string ocrErr_;                // last engine error, "" if none
+	std::wstring ocrNote_;              // one-line message shown in place of the OCR status
+	void stopOcrWorker();
+	void setOcrEnabled(bool on);
+	void onOcrPage(int page, bool ok);
+	void onOcrDone();
+	std::wstring ocrStatusSuffix() const;
 	int editHoverPage_ = -1, editHoverIdx_ = -1; // run under the cursor (Edit Text tool)
 	std::wstring editTextNote_; // last font-substitution note, shown in the status bar
 	std::unordered_map<int, std::vector<AnnotInfo>> annotCache_;
@@ -1499,6 +1536,7 @@ private:
 	void chooseWidth();
 	void chooseOpacity();
 	void saveDocument(bool saveAs);
+	void syncOcrButton(); // mirrors the active tab's OCR on/off state onto the toolbar toggle
 	void updateTitle();
 	void updateStatusPath();          // right-hand status bar part: current tab's full file path
 	void layoutStatusParts();         // recomputes the two status bar part boundaries for the current width
@@ -2127,8 +2165,131 @@ CanvasView::CanvasView(HWND parent, HINSTANCE hInst)
 	dpi_ = GetDpiForWindow(hwnd_);
 }
 
+void CanvasView::stopOcrWorker()
+{
+	ocrStop_ = true;
+	if (ocrThread_.joinable()) ocrThread_.join();
+	ocrStop_ = false;
+	ocrRunning_ = false;
+	ocrBusyPage_ = -1;
+}
+
+void CanvasView::setOcrEnabled(bool on)
+{
+	if (on == ocrEnabled_) return;
+	ocrEnabled_ = on;
+	ocrNote_.clear();
+	if (doc_) doc_->setOcrLayerEnabled(on);
+	if (!on) {
+		stopOcrWorker();
+		// What was selected may have been recognized text that no longer exists.
+		clearTextSelection();
+	}
+	charsCache_.clear();
+	if (on) kickOcr();
+	invalidate();
+	updateStatus();
+}
+
+void CanvasView::toggleOcr()
+{
+	if (!doc_ || !doc_->isOpen()) return;
+	if (ocrEnabled_) { setOcrEnabled(false); return; }
+	if (!doc_->isPdf()) {
+		ocrNote_ = L"OCR works on PDF files only.";
+		updateStatus();
+		return;
+	}
+	if (!PdfDocument::ocrAvailable()) {
+		ocrNote_ = L"OCR isn't available: Windows has no OCR language installed (Settings > Time & language > Language & region).";
+		updateStatus();
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> l(ocrErrMutex_);
+		ocrErr_.clear();
+	}
+	setOcrEnabled(true);
+}
+
+void CanvasView::kickOcr()
+{
+	if (!ocrEnabled_ || !doc_ || !doc_->isOpen()) return;
+	if (ocrRunning_) return;
+	if (ocrThread_.joinable()) ocrThread_.join(); // a finished worker; reap it
+	ocrStop_ = false;
+	ocrRunning_ = true;
+	PdfDocument* doc = doc_;
+	HWND hwnd = hwnd_;
+	ocrThread_ = std::thread([this, doc, hwnd] {
+		while (!ocrStop_) {
+			int p = doc->nextOcrPage(ocrFocus_.load());
+			if (p < 0) break;
+			ocrBusyPage_ = p;
+			PostMessageW(hwnd, WM_APP_OCR_PAGE, static_cast<WPARAM>(p), -1); // starting p: refresh the status text
+			std::string err;
+			bool ok = doc->ocrScanPage(p, err);
+			if (ocrStop_) break;
+			if (!ok && err != "document changed") {
+				std::lock_guard<std::mutex> l(ocrErrMutex_);
+				ocrErr_ = err;
+				if (err.find("OCR language") != std::string::npos) break; // nothing will work
+			}
+			PostMessageW(hwnd, WM_APP_OCR_PAGE, static_cast<WPARAM>(p), ok ? 1 : 0);
+		}
+		ocrBusyPage_ = -1;
+		ocrRunning_ = false;
+		PostMessageW(hwnd, WM_APP_OCR_DONE, 0, 0);
+	});
+}
+
+void CanvasView::onOcrPage(int page, bool ok)
+{
+	if (ok) {
+		ocrSeen_ = true;
+		charsCache_.erase(page);
+	}
+	if (IsWindowVisible(hwnd_)) updateStatus();
+}
+
+void CanvasView::onOcrDone()
+{
+	if (ocrThread_.joinable() && !ocrRunning_) ocrThread_.join();
+	std::string err;
+	{
+		std::lock_guard<std::mutex> l(ocrErrMutex_);
+		err = ocrErr_;
+	}
+	if (!err.empty() && !ocrSeen_) ocrNote_ = Utf8ToWide(err);
+	if (IsWindowVisible(hwnd_)) updateStatus();
+}
+
+std::wstring CanvasView::ocrStatusSuffix() const
+{
+	if (!ocrNote_.empty()) return L"      " + ocrNote_;
+	if (!ocrEnabled_ || !doc_) return L"";
+	if (ocrRunning_) {
+		int p = ocrBusyPage_;
+		return p >= 0 ? L"      OCR: reading page " + std::to_wstring(p + 1) + L"…" : L"      OCR: looking for scanned pages…";
+	}
+	if (doc_->hasOcrToSave()) {
+		int n = doc_->ocrPagesDone();
+		return L"      OCR text ready on " + std::to_wstring(n) + (n == 1 ? L" page" : L" pages") + L" — Save to keep it";
+	}
+	if (ocrSeen_) return L"      OCR text is part of this file";
+	return L"      OCR on — no scanned pages found";
+}
+
 void CanvasView::setDocument(PdfDocument* doc)
 {
+	stopOcrWorker();                         // it works on the old document
+	ocrEnabled_ = false;
+	ocrSeen_ = false;
+	ocrNote_.clear();
+	{
+		std::lock_guard<std::mutex> l(ocrErrMutex_);
+		ocrErr_.clear();
+	}
 	if (inlineEdit_) commitInlineEdit(false); // old doc's widget indices won't apply
 	clearStampSelection();                   // ... nor its annotation indices
 	doc_ = doc;
@@ -2149,6 +2310,10 @@ void CanvasView::setDocument(PdfDocument* doc)
 	applyFit();
 	relayout();
 	invalidate();
+	// A scan opens with OCR already on; a normal digital PDF is left alone
+	// (detection only extracts text from a few pages, it never recognizes).
+	if (doc_ && doc_->isOpen() && doc_->isPdf() && doc_->probeNeedsOcr() && PdfDocument::ocrAvailable())
+		setOcrEnabled(true);
 	updateStatus();
 }
 
@@ -4757,10 +4922,12 @@ void CanvasView::updateStatus()
 		if (viewRotation_ != 0) swprintf(rot, 32, L"      Rotated %d°", viewRotation_);
 		swprintf(buf, 128, L"Page %d / %d      Zoom %d%%%s",
 			cur + 1, doc_->pageCount(), static_cast<int>(std::lround(zoom_ * 100)), rot);
+		ocrFocus_ = cur; // the OCR worker reads outward from the page being looked at
 	} else {
 		swprintf(buf, 128, L"No document");
 	}
 	statusText_ = buf;
+	if (doc_ && doc_->isOpen()) statusText_ += ocrStatusSuffix();
 	SendMessageW(status_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusText_.c_str()));
 	if (onViewChanged_) onViewChanged_();
 }
@@ -4798,6 +4965,12 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_TIMER:
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
 		break;
+	case WM_APP_OCR_PAGE:
+		self->onOcrPage(static_cast<int>(wp), lp == 1);
+		return 0;
+	case WM_APP_OCR_DONE:
+		self->onOcrDone();
+		return 0;
 	case WM_MOUSEWHEEL:
 		// WM_(H)MOUSEWHEEL's lParam is in SCREEN coordinates (unlike almost
 		// every other mouse message), needed so Ctrl+wheel zoom can anchor on
@@ -6174,6 +6347,20 @@ void DrawEditTextTool(Gdiplus::Graphics& g, float s)
 	p.line(0.70f, 0.80f, 0.90f, 0.80f);
 }
 
+// Scanner-style corner brackets around a few lines of text: "read the text
+// out of this picture".
+void DrawOcrTool(Gdiplus::Graphics& g, float s)
+{
+	IconPen p(g, s);
+	p.polyline({ {0.14f,0.32f}, {0.14f,0.14f}, {0.32f,0.14f} });
+	p.polyline({ {0.68f,0.14f}, {0.86f,0.14f}, {0.86f,0.32f} });
+	p.polyline({ {0.14f,0.68f}, {0.14f,0.86f}, {0.32f,0.86f} });
+	p.polyline({ {0.68f,0.86f}, {0.86f,0.86f}, {0.86f,0.68f} });
+	p.line(0.30f, 0.38f, 0.70f, 0.38f);
+	p.line(0.30f, 0.50f, 0.70f, 0.50f);
+	p.line(0.30f, 0.62f, 0.54f, 0.62f);
+}
+
 void DrawTextTool(Gdiplus::Graphics& g, float s)
 {
 	Gdiplus::FontFamily fam(L"Segoe UI");
@@ -6607,6 +6794,7 @@ const std::vector<icons::DrawFn>& ToolbarIconDrawFns()
 		icons::DrawRotateView,
 		icons::DrawSignTool,
 		icons::DrawEditTextTool,
+		icons::DrawOcrTool,
 	};
 	return fns;
 }
@@ -6675,7 +6863,7 @@ void FrameWindow::createChildren()
 	int iOpen = 0, iSave = 1, iSaveAs = 2, iPrint = 3, iFind = 4, iSelect = 5, iHighlight = 6,
 		iDraw = 7, iText = 8, iRedact = 9, iColor = 10, iWidth = 11, iOpacity = 12,
 		iZoomOut = 13, iZoomIn = 14, iFitWidth = 15, iFitPage = 16, iTools = 17, iThemeToggle = 18,
-		iErase = 19, iRotate = 20, iSign = 21, iEditText = 22;
+		iErase = 19, iRotate = 20, iSign = 21, iEditText = 22, iOcr = 23;
 
 	auto addStr = [&](const wchar_t* s) -> INT_PTR {
 		wchar_t buf[64]; wcscpy_s(buf, s);
@@ -6703,6 +6891,19 @@ void FrameWindow::createChildren()
 		b.idCommand = id;
 		b.fsState = TBSTATE_ENABLED;
 		b.fsStyle = BTNS_CHECKGROUP | BTNS_AUTOSIZE;
+		b.iBitmap = image;
+		b.iString = -1;
+		toolbarTips_[id] = tip;
+		SendMessageW(toolbar_, TB_ADDBUTTONS, 1, reinterpret_cast<LPARAM>(&b));
+	};
+	// On/off switch that keeps its pressed look while on (unlike btn()). Its
+	// state is owned by the active tab's canvas, not the toolbar -- see
+	// syncOcrButton().
+	auto toggleBtn = [&](int id, int image, const wchar_t* tip) {
+		TBBUTTON b = {};
+		b.idCommand = id;
+		b.fsState = TBSTATE_ENABLED;
+		b.fsStyle = BTNS_CHECK | BTNS_AUTOSIZE;
 		b.iBitmap = image;
 		b.iString = -1;
 		toolbarTips_[id] = tip;
@@ -6759,6 +6960,7 @@ void FrameWindow::createChildren()
 	textBtn(IDM_VIEW_PAGELABEL, L"9999 of 9999");
 	sep();
 	btn(IDM_EDIT_FIND, iFind, L"Find");
+	toggleBtn(IDM_TOOL_OCR, iOcr, L"OCR — read the text in scanned pages so it can be selected, searched and saved into the PDF. On automatically for scanned PDFs.");
 	btn(IDM_FILE_PRINT, iPrint, L"Print");
 	btn(IDM_FILE_SAVE, iSave, L"Save");
 	btn(IDM_FILE_SAVEAS, iSaveAs, L"Save As");
@@ -9196,6 +9398,7 @@ int FrameWindow::newTab()
 	tab->canvas->setOnChanged([this] { updateTitle(); updateRedactBar(); });
 	tab->canvas->setOnExitTextTool([this] { selectTool(IDM_TOOL_SELECT); });
 	tab->canvas->setOnViewChanged([this] {
+		syncOcrButton();
 		updateZoomLabel();
 		updatePageEditBox();
 		layoutStatusParts();
@@ -9264,6 +9467,7 @@ void FrameWindow::switchToTab(int idx)
 	layout();
 	updateTitle();
 	updateZoomLabel();
+	syncOcrButton();
 	updatePageEditBox();
 	updateProtectionBar();
 	syncMenuChecks();
@@ -10277,6 +10481,10 @@ void FrameWindow::onCommand(int id)
 	case IDM_TOOL_COLOR: chooseColor(); break;
 	case IDM_TOOL_WIDTH: chooseWidth(); break;
 	case IDM_TOOL_OPACITY: chooseOpacity(); break;
+	case IDM_TOOL_OCR:
+		if (canvas_) canvas_->toggleOcr();
+		syncOcrButton(); // the toolbar flipped its own check on click; the canvas decides what is true
+		break;
 	case IDM_FILE_SAVE: saveDocument(false); break;
 	case IDM_FILE_SAVEAS: saveDocument(true); break;
 	case IDM_VIEW_ZOOMIN: canvas_->zoomIn(); break;
@@ -10553,6 +10761,14 @@ void FrameWindow::updateTitle()
 	SetWindowTextW(hwnd_, t.c_str());
 	if (activeTab_ >= 0) updateTabLabel(activeTab_);
 	updateStatusPath();
+}
+
+void FrameWindow::syncOcrButton()
+{
+	if (!toolbar_) return;
+	bool on = canvas_ && canvas_->ocrEnabled();
+	bool now = SendMessageW(toolbar_, TB_ISBUTTONCHECKED, IDM_TOOL_OCR, 0) != 0;
+	if (on != now) SendMessageW(toolbar_, TB_CHECKBUTTON, IDM_TOOL_OCR, MAKELPARAM(on, 0));
 }
 
 void FrameWindow::saveDocument(bool saveAs)

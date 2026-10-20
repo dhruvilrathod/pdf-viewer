@@ -100,6 +100,7 @@
 #define IDC_REDACT_COLOR   1234  // toggles the box color used at Apply time between black/white
 #define IDM_TOOLS_INSERT_IMAGE 1235  // Tools menu: place an image file on the page as a movable stamp
 #define IDM_TOOL_EDITTEXT      1236  // toolbar radio tool: edit the PDF's own (content-stream) text in place
+#define IDM_TOOL_OCR           1237  // toolbar toggle: OCR scanned pages so their text can be selected/searched/saved
 
 // Organize side-panel action strip (bottom of the thumbnail column)
 #define IDC_ORGANIZE_INSERT  1127

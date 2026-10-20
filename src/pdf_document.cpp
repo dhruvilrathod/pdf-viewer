@@ -1,4 +1,5 @@
 #include "pdf_document.h"
+#include "ocr.h"
 #include "word_convert.h"
 
 #include <windows.h>
@@ -399,6 +400,13 @@ void PdfDocument::loadInfo()
 	pageCount_ = 0;
 	sizes_.clear();
 	bounds_.clear();
+	// Page indices may mean something else now: forget what OCR has done.
+	++docGen_;
+	{
+		std::lock_guard<std::mutex> ol(ocrMutex_);
+		ocrState_.clear();
+		ocrPages_.clear();
+	}
 	isPdf_ = (pdf_document_from_fz_document(ctx_, doc_) != nullptr);
 	fz_try(ctx_) {
 		pageCount_ = fz_count_pages(ctx_, doc_);
@@ -414,6 +422,10 @@ void PdfDocument::loadInfo()
 	}
 	fz_catch(ctx_) {
 		// leave whatever we managed to read
+	}
+	{
+		std::lock_guard<std::mutex> ol(ocrMutex_);
+		ocrState_.assign(static_cast<size_t>(pageCount_), static_cast<signed char>(-1));
 	}
 }
 
@@ -437,6 +449,45 @@ std::vector<PageRectPt> PdfDocument::searchPage(int index, const char* needle, i
 	if (maxHits <= 0) return out;
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	if (ocrEnabled_ && pageHasOcr(index)) {
+		// A page with an OCR layer has no real text to search, so match
+		// against the recognized words instead (case-insensitive).
+		std::vector<int> lineIdx;
+		std::vector<PageChar> oc = ocrChars(index, &lineIdx);
+		std::wstring hay, needleW;
+		{
+			int n = MultiByteToWideChar(CP_UTF8, 0, needle, -1, nullptr, 0);
+			if (n > 1) {
+				needleW.resize(static_cast<size_t>(n - 1));
+				MultiByteToWideChar(CP_UTF8, 0, needle, -1, needleW.data(), n);
+			}
+		}
+		for (auto& c : needleW) c = static_cast<wchar_t>(towlower(c));
+		for (const auto& c : oc) {
+			wchar_t w = c.unicode ? static_cast<wchar_t>(c.unicode) : L' ';
+			hay.push_back(static_cast<wchar_t>(towlower(w)));
+		}
+		if (!needleW.empty()) {
+			for (size_t pos = hay.find(needleW); pos != std::wstring::npos && static_cast<int>(out.size()) < maxHits;
+				pos = hay.find(needleW, pos + needleW.size())) {
+				// One rectangle per line a match touches.
+				size_t i = pos, end = pos + needleW.size();
+				while (i < end) {
+					size_t j = i;
+					PageRectPt r = oc[i].quad;
+					while (j + 1 < end && lineIdx[j + 1] == lineIdx[i]) {
+						++j;
+						const PageRectPt& q = oc[j].quad;
+						r.x0 = std::min(r.x0, q.x0); r.y0 = std::min(r.y0, q.y0);
+						r.x1 = std::max(r.x1, q.x1); r.y1 = std::max(r.y1, q.y1);
+					}
+					out.push_back(r);
+					i = j + 1;
+				}
+			}
+		}
+		return out;
+	}
 	std::vector<fz_quad> quads(static_cast<size_t>(maxHits));
 	int n = 0;
 	fz_try(ctx_) {
@@ -649,6 +700,14 @@ std::vector<PageRectPt> PdfDocument::textQuadsInRect(int page, PageRectPt rect)
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	fz_rect sel = normRect(rect);
+	if (ocrEnabled_ && pageHasOcr(page)) {
+		for (const PageChar& c : ocrChars(page)) {
+			if (!c.unicode || c.unicode == L' ') continue;
+			float cx = (c.quad.x0 + c.quad.x1) * 0.5f, cy = (c.quad.y0 + c.quad.y1) * 0.5f;
+			if (cx >= sel.x0 && cx <= sel.x1 && cy >= sel.y0 && cy <= sel.y1) out.push_back(c.quad);
+		}
+		return out;
+	}
 	fz_page* pg = nullptr;
 	fz_stext_page* stext = nullptr;
 	fz_try(ctx_) {
@@ -684,6 +743,7 @@ std::vector<PageChar> PdfDocument::pageChars(int page)
 	if (page < 0 || page >= pageCount_) return out;
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	if (ocrEnabled_ && pageHasOcr(page)) return ocrChars(page);
 	fz_page* pg = nullptr;
 	fz_stext_page* stext = nullptr;
 	fz_try(ctx_) {
@@ -1782,6 +1842,7 @@ bool PdfDocument::rebuildFromPages(const std::vector<PagePlanEntry>& entries, st
 {
 	if (!ctx_) { err = "no context"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	bakeOcrLayer(); // pages are about to be reordered: the text must travel with them
 
 	// selfPdf may legitimately be null here: Merge into a blank tab never
 	// opens a base document, so doc_ is null and every plan entry references
@@ -1971,6 +2032,7 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 	if (!pdf) { err = "not a PDF"; return false; }
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	bakeOcrLayer(); // scanned pages get their recognized text as an invisible layer
 
 	// Never write directly over the target: write to a sibling temp file,
 	// verify the result actually opens and renders, and only then replace
@@ -2091,6 +2153,7 @@ bool PdfDocument::exportPages(const std::vector<int>& pageIndices, const wchar_t
 	if (pageIndices.empty()) { err = "no pages selected"; return false; }
 
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	bakeOcrLayer();
 	std::vector<PagePlanEntry> entries;
 	entries.reserve(pageIndices.size());
 	for (int p : pageIndices) entries.push_back({ -1, p, 0 });
@@ -2667,6 +2730,7 @@ bool PdfDocument::resizeToA4(std::string& err)
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	bakeOcrLayer(); // so the text layer is scaled along with the page
 
 	constexpr float kA4W = 595.28f, kA4H = 841.89f; // ISO A4, points (1/72")
 	fz_try(ctx_) {
@@ -2747,6 +2811,7 @@ bool PdfDocument::flattenToImages(std::string& err)
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	discardOcr(); // flatten-to-image deliberately removes all text
 
 	constexpr float kDpi = 200.0f;
 	constexpr float kScale = kDpi / 72.0f;
@@ -2918,6 +2983,7 @@ bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	bakeOcrLayer();
 
 	fz_try(ctx_) {
 		int n = fz_count_pages(ctx_, doc_);
@@ -3153,6 +3219,10 @@ bool PdfDocument::applyRedactions(bool whiteBox, std::string& err)
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	// Recognized text must go into the page first, or redacting a scan would
+	// black out the picture and still leave the hidden words behind to be
+	// saved and copied out.
+	bakeOcrLayer();
 	fz_try(ctx_) {
 		pdf_redact_options opts = {};
 		// MuPDF's own black_boxes fill is hardcoded to black (pdf_redact_end_page
@@ -3768,4 +3838,519 @@ bool PdfDocument::clearPendingRedactions(std::string& err)
 	}
 	if (any) dirty_ = true;
 	return true;
+}
+
+// ===========================================================================
+// OCR for scanned pages
+// ===========================================================================
+namespace {
+
+constexpr float kOcrDpi = 300.0f;        // render resolution handed to the engine
+constexpr float kOcrMaxSide = 4800.0f;   // ... capped for very large sheets
+constexpr float kOcrSpaceGap = 0.12f;    // word gap (x line height) that counts as a space
+
+// Is there a space between two neighbouring recognized words? The engine's
+// word boxes are tight to the ink, so a gap alone can't tell "fox jumps" from
+// "1" + ",284": closing punctuation never takes a space before it.
+bool ocrSpaceBetween(const OcrWordPt& a, const OcrWordPt& b, float lineHeight)
+{
+	if (b.rect.x0 - a.rect.x1 <= kOcrSpaceGap * lineHeight) return false;
+	if (!b.text.empty() && wcschr(L",.;:!?)]}%", b.text[0])) return false;
+	if (!a.text.empty() && wcschr(L"([{", a.text.back())) return false;
+	return true;
+}
+
+// The byte WinAnsiEncoding (cp1252) uses for `c`, if it has one.
+bool ansiByte(wchar_t c, unsigned char& out)
+{
+	char b = 0;
+	BOOL usedDefault = FALSE;
+	int n = WideCharToMultiByte(1252, WC_NO_BEST_FIT_CHARS, &c, 1, &b, 1, nullptr, &usedDefault);
+	if (n != 1 || usedDefault) return false;
+	unsigned char ub = static_cast<unsigned char>(b);
+	if (ub < 0x20) return false;
+	out = ub;
+	return true;
+}
+
+// Adds `overlay` as a new content stream that starts from the page's default
+// graphics state: the existing content is bracketed by q ... Q, then the
+// overlay follows. A scan whose content leaves a transform behind can't then
+// shift or scale the text layer.
+void appendOverlayStream(fz_context* ctx, pdf_document* pdf, pdf_obj* pageObj, fz_buffer* overlay)
+{
+	fz_buffer* head = nullptr;
+	fz_buffer* tail = nullptr;
+	pdf_obj* headRef = nullptr;
+	pdf_obj* tailRef = nullptr;
+	pdf_obj* arr = nullptr;
+	fz_var(head); fz_var(tail); fz_var(headRef); fz_var(tailRef); fz_var(arr);
+	fz_try(ctx) {
+		head = fz_new_buffer(ctx, 8);
+		fz_append_string(ctx, head, "q\n");
+		tail = fz_new_buffer(ctx, 4096);
+		fz_append_string(ctx, tail, "\nQ\nq\n");
+		fz_append_buffer(ctx, tail, overlay);
+		fz_append_string(ctx, tail, "Q\n");
+		headRef = pdf_add_stream(ctx, pdf, head, nullptr, 0);
+		tailRef = pdf_add_stream(ctx, pdf, tail, nullptr, 0);
+		pdf_obj* old = pdf_dict_get(ctx, pageObj, PDF_NAME(Contents));
+		arr = pdf_new_array(ctx, pdf, 4);
+		pdf_array_push(ctx, arr, headRef);
+		if (pdf_is_array(ctx, old)) {
+			for (int i = 0, n = pdf_array_len(ctx, old); i < n; ++i)
+				pdf_array_push(ctx, arr, pdf_array_get(ctx, old, i));
+		} else if (old) {
+			pdf_array_push(ctx, arr, old);
+		}
+		pdf_array_push(ctx, arr, tailRef);
+		pdf_dict_put(ctx, pageObj, PDF_NAME(Contents), arr);
+	}
+	fz_always(ctx) {
+		if (head) fz_drop_buffer(ctx, head);
+		if (tail) fz_drop_buffer(ctx, tail);
+		pdf_drop_obj(ctx, headRef);
+		pdf_drop_obj(ctx, tailRef);
+		pdf_drop_obj(ctx, arr);
+	}
+	fz_catch(ctx) { fz_rethrow(ctx); }
+}
+
+} // namespace
+
+bool PdfDocument::ocrAvailable() { return OcrIsAvailable(); }
+
+bool PdfDocument::pageHasOcr(int page) const
+{
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	return ocrPages_.find(page) != ocrPages_.end();
+}
+
+int PdfDocument::ocrPagesDone() const
+{
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	int n = 0;
+	for (signed char s : ocrState_) if (s == 2) ++n;
+	return n;
+}
+
+bool PdfDocument::hasOcrToSave() const
+{
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	return ocrEnabled_ && !ocrPages_.empty();
+}
+
+void PdfDocument::discardOcr()
+{
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	ocrPages_.clear();
+	for (auto& s : ocrState_) if (s == 2 || s == 1) s = 3;
+}
+
+bool PdfDocument::pageNeedsOcr(int page)
+{
+	if (!ctx_ || !doc_ || !authed_ || !isPdf_) return false;
+	{
+		std::lock_guard<std::mutex> ol(ocrMutex_);
+		if (page < 0 || page >= static_cast<int>(ocrState_.size())) return false;
+		if (ocrState_[page] >= 0) return ocrState_[page] == 1;
+	}
+	const int gen = docGen_.load();
+	bool need = false;
+	{
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		fz_page* pg = nullptr;
+		fz_stext_page* st = nullptr;
+		fz_device* dev = nullptr;
+		fz_try(ctx_) {
+			pg = fz_load_page(ctx_, doc_, page);
+			fz_rect pb = fz_bound_page(ctx_, pg);
+			double pageArea = static_cast<double>(pb.x1 - pb.x0) * (pb.y1 - pb.y0);
+			st = fz_new_stext_page(ctx_, pb);
+			fz_stext_options o = {};
+			o.flags = FZ_STEXT_PRESERVE_IMAGES; // keeps the picture's box; nothing is decoded
+			dev = fz_new_stext_device(ctx_, st, &o);
+			fz_run_page_contents(ctx_, pg, dev, fz_identity, nullptr);
+			fz_close_device(ctx_, dev);
+			int chars = 0;
+			double textArea = 0, imageArea = 0;
+			for (fz_stext_block* b = st->first_block; b; b = b->next) {
+				if (b->type == FZ_STEXT_BLOCK_IMAGE) {
+					fz_rect r = fz_intersect_rect(b->bbox, pb);
+					if (!fz_is_empty_rect(r)) imageArea += static_cast<double>(r.x1 - r.x0) * (r.y1 - r.y0);
+				} else if (b->type == FZ_STEXT_BLOCK_TEXT) {
+					for (fz_stext_line* ln = b->u.t.first_line; ln; ln = ln->next) {
+						textArea += static_cast<double>(ln->bbox.x1 - ln->bbox.x0) * (ln->bbox.y1 - ln->bbox.y0);
+						for (fz_stext_char* ch = ln->first_char; ch; ch = ch->next)
+							if (ch->c > 32) ++chars;
+					}
+				}
+			}
+			if (pageArea > 0) {
+				double coverage = std::min(1.0, imageArea / pageArea);
+				double textFrac = textArea / pageArea;
+				// A picture covering the sheet with next to no real text on it,
+				// or a full-page picture with only a short stamp / Bates number
+				// over it. A page carrying a real amount of text (including an
+				// OCR layer from an earlier save) is left alone.
+				need = (coverage >= 0.5 && chars < 8) || (coverage >= 0.8 && textFrac < 0.03 && chars < 60);
+			}
+		}
+		fz_always(ctx_) {
+			if (dev) fz_drop_device(ctx_, dev);
+			if (st) fz_drop_stext_page(ctx_, st);
+			if (pg) fz_drop_page(ctx_, pg);
+		}
+		fz_catch(ctx_) { need = false; }
+	}
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	if (gen == docGen_.load() && page < static_cast<int>(ocrState_.size()) && ocrState_[page] == -1)
+		ocrState_[page] = need ? 1 : 0;
+	return need;
+}
+
+bool PdfDocument::probeNeedsOcr()
+{
+	if (!isPdf_ || pageCount_ <= 0) return false;
+	int probes[3] = { 0, pageCount_ / 2, pageCount_ - 1 };
+	int seen = 0, scans = 0, last = -1;
+	for (int p : probes) {
+		if (p == last) continue;
+		last = p;
+		++seen;
+		if (pageNeedsOcr(p)) ++scans;
+	}
+	return seen > 0 && scans * 2 >= seen;
+}
+
+int PdfDocument::nextOcrPage(int focusPage)
+{
+	int n = pageCount_;
+	if (n <= 0) return -1;
+	focusPage = std::max(0, std::min(focusPage, n - 1));
+	for (int d = 0; d < n; ++d) {
+		for (int sign = 0; sign < 2; ++sign) {
+			if (d == 0 && sign == 1) continue;
+			int p = sign == 0 ? focusPage + d : focusPage - d;
+			if (p < 0 || p >= n) continue;
+			signed char s;
+			{
+				std::lock_guard<std::mutex> ol(ocrMutex_);
+				if (p >= static_cast<int>(ocrState_.size())) return -1;
+				s = ocrState_[p];
+			}
+			if (s == 1) return p;
+			if (s == -1 && pageNeedsOcr(p)) return p;
+		}
+	}
+	return -1;
+}
+
+bool PdfDocument::ocrScanPage(int page, std::string& err)
+{
+	if (!ctx_ || !doc_ || !authed_) { err = "no document"; return false; }
+	if (page < 0 || page >= pageCount_) { err = "bad page"; return false; }
+	const int gen = docGen_.load();
+	int maxDim = OcrMaxImageDimension();
+	if (maxDim <= 0) maxDim = 10000;
+
+	std::vector<unsigned char> gray;
+	int pw = 0, ph = 0, ox = 0, oy = 0;
+	float scale = 1.0f;
+	std::vector<fz_rect> realLines; // text the page already has: OCR must not double it
+	bool rendered = false;
+	{
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		if (gen != docGen_.load()) { err = "document changed"; return false; }
+		fz_page* pg = nullptr;
+		fz_pixmap* pix = nullptr;
+		fz_device* dev = nullptr;
+		fz_stext_page* st = nullptr;
+		fz_try(ctx_) {
+			pg = fz_load_page(ctx_, doc_, page);
+			fz_rect b = fz_bound_page(ctx_, pg);
+			float longest = std::max(b.x1 - b.x0, b.y1 - b.y0);
+			if (longest <= 0) fz_throw(ctx_, FZ_ERROR_GENERIC, "empty page");
+			scale = std::min(kOcrDpi / 72.0f, std::min(kOcrMaxSide, static_cast<float>(maxDim - 8)) / longest);
+			fz_matrix ctm = fz_scale(scale, scale);
+			fz_irect box = fz_round_rect(fz_transform_rect(b, ctm));
+			pix = fz_new_pixmap_with_bbox(ctx_, fz_device_gray(ctx_), box, nullptr, 0);
+			fz_clear_pixmap_with_value(ctx_, pix, 0xFF);
+			dev = fz_new_draw_device(ctx_, ctm, pix);
+			// Page content only: highlights and sticky notes would confuse the engine.
+			fz_run_page_contents(ctx_, pg, dev, fz_identity, nullptr);
+			fz_close_device(ctx_, dev);
+			pw = fz_pixmap_width(ctx_, pix);
+			ph = fz_pixmap_height(ctx_, pix);
+			ox = pix->x; oy = pix->y;
+			int stride = fz_pixmap_stride(ctx_, pix);
+			const unsigned char* src = fz_pixmap_samples(ctx_, pix);
+			gray.resize(static_cast<size_t>(pw) * ph);
+			for (int y = 0; y < ph; ++y)
+				memcpy(&gray[static_cast<size_t>(y) * pw], src + static_cast<size_t>(y) * stride, static_cast<size_t>(pw));
+
+			fz_stext_options o = {};
+			st = fz_new_stext_page_from_page(ctx_, pg, &o);
+			for (fz_stext_block* sb = st->first_block; sb; sb = sb->next) {
+				if (sb->type != FZ_STEXT_BLOCK_TEXT) continue;
+				for (fz_stext_line* ln = sb->u.t.first_line; ln; ln = ln->next) realLines.push_back(ln->bbox);
+			}
+			rendered = true;
+		}
+		fz_always(ctx_) {
+			if (st) fz_drop_stext_page(ctx_, st);
+			if (dev) fz_drop_device(ctx_, dev);
+			if (pix) fz_drop_pixmap(ctx_, pix);
+			if (pg) fz_drop_page(ctx_, pg);
+		}
+		fz_catch(ctx_) { err = fz_caught_message(ctx_); }
+	}
+	auto markFailed = [&] {
+		std::lock_guard<std::mutex> ol(ocrMutex_);
+		if (gen == docGen_.load() && page < static_cast<int>(ocrState_.size())) ocrState_[page] = 3;
+	};
+	if (!rendered) { markFailed(); return false; }
+
+	std::vector<OcrLine> found;
+	if (!OcrRecognizeGray8(gray.data(), pw, ph, pw, found, err)) { markFailed(); return false; }
+	gray = std::vector<unsigned char>(); // free the page image before the bookkeeping
+
+	std::vector<OcrLinePt> lines;
+	for (const OcrLine& l : found) {
+		OcrLinePt out;
+		bool first = true;
+		for (const OcrWord& w : l.words) {
+			OcrWordPt wp;
+			wp.text = w.text;
+			wp.rect = { (w.x + ox) / scale, (w.y + oy) / scale, (w.x + w.w + ox) / scale, (w.y + w.h + oy) / scale };
+			if (first) { out.rect = wp.rect; first = false; }
+			else {
+				out.rect.x0 = std::min(out.rect.x0, wp.rect.x0); out.rect.y0 = std::min(out.rect.y0, wp.rect.y0);
+				out.rect.x1 = std::max(out.rect.x1, wp.rect.x1); out.rect.y1 = std::max(out.rect.y1, wp.rect.y1);
+			}
+			out.words.push_back(std::move(wp));
+		}
+		if (out.words.empty()) continue;
+		// Skip lines that sit on top of text the page already carries.
+		double area = static_cast<double>(out.rect.x1 - out.rect.x0) * (out.rect.y1 - out.rect.y0);
+		bool dup = false;
+		for (const fz_rect& r : realLines) {
+			double ix = std::min(out.rect.x1, r.x1) - std::max(out.rect.x0, r.x0);
+			double iy = std::min(out.rect.y1, r.y1) - std::max(out.rect.y0, r.y0);
+			if (ix > 0 && iy > 0 && area > 0 && ix * iy / area > 0.5) { dup = true; break; }
+		}
+		if (!dup) lines.push_back(std::move(out));
+	}
+
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	if (gen != docGen_.load() || page >= static_cast<int>(ocrState_.size())) { err = "document changed"; return false; }
+	if (lines.empty()) { ocrState_[page] = 3; return true; }
+	ocrPages_[page] = std::move(lines);
+	ocrState_[page] = 2;
+	return true;
+}
+
+std::vector<PageChar> PdfDocument::ocrChars(int page, std::vector<int>* lineIndex) const
+{
+	std::vector<PageChar> out;
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	auto it = ocrPages_.find(page);
+	if (it == ocrPages_.end()) return out;
+	const std::vector<OcrLinePt>& lines = it->second;
+	for (size_t li = 0; li < lines.size(); ++li) {
+		const OcrLinePt& ln = lines[li];
+		float lh = ln.rect.y1 - ln.rect.y0;
+		size_t before = out.size();
+		for (size_t wi = 0; wi < ln.words.size(); ++wi) {
+			const OcrWordPt& w = ln.words[wi];
+			size_t n = w.text.size();
+			if (n == 0) continue;
+			float cw = (w.rect.x1 - w.rect.x0) / static_cast<float>(n);
+			for (size_t i = 0; i < n; ++i) {
+				PageChar pc;
+				pc.quad = { w.rect.x0 + cw * i, ln.rect.y0, w.rect.x0 + cw * (i + 1), ln.rect.y1 };
+				pc.unicode = w.text[i];
+				out.push_back(pc);
+				if (lineIndex) lineIndex->push_back(static_cast<int>(li));
+			}
+			if (wi + 1 < ln.words.size()) {
+				const OcrWordPt& nx = ln.words[wi + 1];
+				if (ocrSpaceBetween(w, nx, lh)) {
+					PageChar sp;
+					sp.quad = { w.rect.x1, ln.rect.y0, nx.rect.x0, ln.rect.y1 };
+					sp.unicode = L' ';
+					out.push_back(sp);
+					if (lineIndex) lineIndex->push_back(static_cast<int>(li));
+				}
+			}
+		}
+		if (out.size() == before) continue;
+		out.back().lineBreakAfter = true;
+		bool lastLine = li + 1 == lines.size();
+		if (lastLine || lines[li + 1].rect.y0 - ln.rect.y1 > 0.8f * lh) out.back().paragraphBreakAfter = true;
+	}
+	return out;
+}
+
+void PdfDocument::bakeOcrLayer()
+{
+	// Caller holds mutex_.
+	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
+	if (!pdf || !ocrEnabled_) return;
+	std::unordered_map<int, std::vector<OcrLinePt>> snapshot;
+	{
+		std::lock_guard<std::mutex> ol(ocrMutex_);
+		if (ocrPages_.empty()) return;
+		snapshot = ocrPages_;
+	}
+	std::vector<int> done;
+	for (const auto& kv : snapshot) {
+		const int page = kv.first;
+		const std::vector<OcrLinePt>& lines = kv.second;
+		pdf_page* pg = nullptr;
+		fz_buffer* cs = nullptr;
+		fz_buffer* cmap = nullptr;
+		pdf_obj* font = nullptr;
+		pdf_obj* cmapRef = nullptr;
+		fz_var(pg); fz_var(cs); fz_var(cmap); fz_var(font); fz_var(cmapRef);
+		fz_try(ctx_) {
+			if (page < 0 || page >= pageCount_) fz_throw(ctx_, FZ_ERROR_GENERIC, "page gone");
+			// Give every character on the page a one-byte code: WinAnsi's own
+			// byte when it has one (readable even by tools that ignore the
+			// ToUnicode map), otherwise any unused byte, mapped by ToUnicode.
+			std::unordered_map<wchar_t, unsigned char> code;
+			bool taken[256] = {};
+			std::vector<wchar_t> others;
+			code[L' '] = 0x20; taken[0x20] = true;
+			for (const auto& ln : lines) for (const auto& w : ln.words) for (wchar_t c : w.text) {
+				if (code.count(c)) continue;
+				unsigned char b;
+				if (ansiByte(c, b) && !taken[b]) { code[c] = b; taken[b] = true; }
+				else if (std::find(others.begin(), others.end(), c) == others.end()) others.push_back(c);
+			}
+			for (wchar_t c : others) {
+				for (int b = 1; b < 256; ++b) {
+					if (!taken[b]) { code[c] = static_cast<unsigned char>(b); taken[b] = true; break; }
+				}
+			}
+
+			cmap = fz_new_buffer(ctx_, 1024);
+			fz_append_string(ctx_, cmap,
+				"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+				"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+				"/CMapName /Adobe-Identity-UCS def /CMapType 2 def\n"
+				"1 begincodespacerange <00> <FF> endcodespacerange\n");
+			std::vector<std::pair<unsigned char, wchar_t>> entries;
+			for (const auto& kv2 : code) entries.push_back({ kv2.second, kv2.first });
+			std::sort(entries.begin(), entries.end());
+			for (size_t i = 0; i < entries.size(); i += 100) {
+				size_t n = std::min<size_t>(100, entries.size() - i);
+				fz_append_printf(ctx_, cmap, "%d beginbfchar\n", static_cast<int>(n));
+				for (size_t k = 0; k < n; ++k)
+					fz_append_printf(ctx_, cmap, "<%02X> <%04X>\n", entries[i + k].first, static_cast<unsigned>(entries[i + k].second));
+				fz_append_string(ctx_, cmap, "endbfchar\n");
+			}
+			fz_append_string(ctx_, cmap, "endcmap CMapName currentdict /CMap defineresource pop end end\n");
+			cmapRef = pdf_add_stream(ctx_, pdf, cmap, nullptr, 0);
+
+			// A non-embedded Helvetica with uniform widths: nothing is ever
+			// drawn, so only the advance matters, and every glyph advances
+			// 0.5 em (scaled to each word's measured width with Tz below).
+			pdf_obj* fontDict = pdf_new_dict(ctx_, pdf, 8);
+			fz_try(ctx_) {
+				pdf_dict_put(ctx_, fontDict, PDF_NAME(Type), PDF_NAME(Font));
+				pdf_dict_put(ctx_, fontDict, PDF_NAME(Subtype), PDF_NAME(Type1));
+				pdf_dict_put_drop(ctx_, fontDict, PDF_NAME(BaseFont), pdf_new_name(ctx_, "Helvetica"));
+				pdf_dict_put(ctx_, fontDict, PDF_NAME(Encoding), PDF_NAME(WinAnsiEncoding));
+				pdf_dict_put_int(ctx_, fontDict, PDF_NAME(FirstChar), 0);
+				pdf_dict_put_int(ctx_, fontDict, PDF_NAME(LastChar), 255);
+				pdf_obj* widths = pdf_new_array(ctx_, pdf, 256);
+				for (int i = 0; i < 256; ++i) pdf_array_push_int(ctx_, widths, 500);
+				pdf_dict_put_drop(ctx_, fontDict, PDF_NAME(Widths), widths);
+				pdf_dict_put(ctx_, fontDict, PDF_NAME(ToUnicode), cmapRef);
+				font = pdf_add_object(ctx_, pdf, fontDict);
+			}
+			fz_always(ctx_) { pdf_drop_obj(ctx_, fontDict); }
+			fz_catch(ctx_) { fz_rethrow(ctx_); }
+
+			pg = pdf_load_page(ctx_, pdf, page);
+			fz_matrix pageCtm;
+			fz_rect mediabox;
+			pdf_page_transform(ctx_, pg, &mediabox, &pageCtm);
+			fz_matrix toPdf = fz_invert_matrix(pageCtm);
+
+			cs = fz_new_buffer(ctx_, 4096);
+			fz_append_string(ctx_, cs, "BT\n3 Tr\n");
+			for (const auto& ln : lines) {
+				float lh = ln.rect.y1 - ln.rect.y0;
+				if (lh <= 0.5f) continue;
+				float size = std::max(1.0f, lh * 0.8f);
+				float baseline = ln.rect.y1 - 0.18f * lh;
+				fz_append_printf(ctx_, cs, "/PDFastOCR %g Tf\n", size);
+				// Words with no real space between them (the engine splits
+				// "1,284.50" into three boxes) become one run: text extractors,
+				// MuPDF's included, add a space wherever two separately placed
+				// strings leave a gap.
+				struct Run { std::wstring text; float x0, x1; bool spaceAfter; };
+				std::vector<Run> runs;
+				for (size_t wi = 0; wi < ln.words.size(); ++wi) {
+					const OcrWordPt& w = ln.words[wi];
+					if (w.text.empty() || w.rect.x1 - w.rect.x0 <= 0) continue;
+					if (!runs.empty() && wi > 0 && !ocrSpaceBetween(ln.words[wi - 1], w, lh)) {
+						runs.back().text += w.text;
+						runs.back().x1 = w.rect.x1;
+					} else {
+						if (!runs.empty()) runs.back().spaceAfter = true;
+						runs.push_back({ w.text, w.rect.x0, w.rect.x1, false });
+					}
+				}
+				for (const Run& r : runs) {
+					size_t n = r.text.size();
+					fz_matrix tm = fz_concat(fz_make_matrix(1, 0, 0, -1, r.x0, baseline), toPdf);
+					float tz = (r.x1 - r.x0) / (static_cast<float>(n) * 0.5f * size) * 100.0f;
+					fz_append_printf(ctx_, cs, "%g %g %g %g %g %g Tm %g Tz <", tm.a, tm.b, tm.c, tm.d, tm.e, tm.f, tz);
+					for (wchar_t c : r.text) {
+						auto it2 = code.find(c);
+						fz_append_printf(ctx_, cs, "%02X", it2 != code.end() ? it2->second : 0x3F);
+					}
+					if (r.spaceAfter) fz_append_string(ctx_, cs, "20");
+					fz_append_string(ctx_, cs, "> Tj\n");
+				}
+			}
+			fz_append_string(ctx_, cs, "ET\n");
+
+			// Per-page resources: the page may share one with others, and each
+			// page's text layer has its own code table.
+			pdf_obj* pageObj = pg->obj;
+			pdf_obj* res0 = pdf_dict_get_inheritable(ctx_, pageObj, PDF_NAME(Resources));
+			pdf_obj* res = res0 ? pdf_copy_dict(ctx_, res0) : pdf_new_dict(ctx_, pdf, 2);
+			fz_try(ctx_) {
+				pdf_obj* fonts0 = pdf_dict_get(ctx_, res, PDF_NAME(Font));
+				pdf_obj* fonts = fonts0 ? pdf_copy_dict(ctx_, fonts0) : pdf_new_dict(ctx_, pdf, 2);
+				pdf_dict_puts(ctx_, fonts, "PDFastOCR", font);
+				pdf_dict_put_drop(ctx_, res, PDF_NAME(Font), fonts);
+				pdf_dict_put(ctx_, pageObj, PDF_NAME(Resources), res);
+			}
+			fz_always(ctx_) { pdf_drop_obj(ctx_, res); }
+			fz_catch(ctx_) { fz_rethrow(ctx_); }
+
+			appendOverlayStream(ctx_, pdf, pageObj, cs);
+			done.push_back(page);
+		}
+		fz_always(ctx_) {
+			if (pg) fz_drop_page(ctx_, reinterpret_cast<fz_page*>(pg));
+			if (cs) fz_drop_buffer(ctx_, cs);
+			if (cmap) fz_drop_buffer(ctx_, cmap);
+			pdf_drop_obj(ctx_, font);
+			pdf_drop_obj(ctx_, cmapRef);
+		}
+		fz_catch(ctx_) {
+			// This page keeps its side-table entry; the save goes ahead without it.
+		}
+	}
+	std::lock_guard<std::mutex> ol(ocrMutex_);
+	for (int p : done) {
+		ocrPages_.erase(p);
+		if (p < static_cast<int>(ocrState_.size())) ocrState_[p] = 0; // it has real text now
+	}
 }

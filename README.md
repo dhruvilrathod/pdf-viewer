@@ -43,8 +43,9 @@ to slow you down.
 
 ### Runtime requirements
 
-**None** beyond Windows 10 or 11. PDFast is a native Windows application — it does
-not run on macOS or Linux.
+**None** beyond Windows 10 or 11 (OCR also needs an OCR-capable language, which
+English-language Windows includes). PDFast is a native Windows application — it
+does not run on macOS or Linux.
 
 ## Features
 
@@ -104,6 +105,24 @@ not run on macOS or Linux.
 - This is a visible, hand-written-style signature — *not* a cryptographic /
   certificate-based one. There's no audit trail, and locking is enforced by
   flattening rather than by tamper detection.
+
+**OCR for scanned pages**
+- A scanned PDF (pages that are just a picture) opens with the **OCR** toolbar
+  toggle already on: the text is read in the background, nearest the page you're
+  on first, and becomes **selectable, copyable and searchable**.
+- Uses the OCR engine built into Windows 10/11 (`Windows.Media.Ocr`) — nothing
+  extra to install or ship, fully offline, and it needs an OCR language pack
+  (English ships with Windows; add others under *Settings → Time & language →
+  Language & region*).
+- Digital PDFs are never touched: a quick text-extraction check (no rendering)
+  decides which pages need OCR, and everything else is skipped. The toggle can be
+  switched on or off by hand for any PDF.
+- **Save** / **Save As** write the recognized text into the file as an invisible
+  text layer, so it stays selectable and searchable in any other PDF viewer.
+  Turn the toggle off before saving to leave the file without it. The text isn't
+  saved until you Save; closing doesn't prompt for it, since it can be re-read.
+- Accuracy is that of the Windows engine: clean, upright, horizontal scans work
+  best. Rotated pages and handwriting are not handled.
 
 **Security**
 - Open **password-protected** PDFs (inline password prompt).

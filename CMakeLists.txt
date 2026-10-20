@@ -29,7 +29,7 @@ target_link_libraries(pdfviewer_poc PRIVATE mupdf)
 
 # Console diagnostic tool for the edit+save code path (no GUI/window
 # involved) -- lets us isolate save-corruption bugs from Win32 input issues.
-add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp src/word_convert.cpp src/webview_convert.cpp src/signature.cpp)
+add_executable(pdfviewer_savetest src/savetest_main.cpp src/pdf_document.cpp src/ocr.cpp src/word_convert.cpp src/webview_convert.cpp src/signature.cpp)
 # gdi32/user32: pdf_document.cpp now loads installed Windows fonts (CreateFontW/
 # GetFontData) so MuPDF can substitute real fonts for non-embedded references.
 # ole32/oleaut32: word_convert.cpp's Word COM automation (Convert to PDF's
@@ -39,6 +39,20 @@ target_include_directories(pdfviewer_savetest PRIVATE ${WEBVIEW2_DIR}/include)
 target_link_libraries(pdfviewer_savetest PRIVATE mupdf gdi32 user32 gdiplus ole32 oleaut32
 	${WEBVIEW2_DIR}/lib/x64/WebView2LoaderStatic.lib)
 target_compile_definitions(pdfviewer_savetest PRIVATE NOMINMAX UNICODE _UNICODE)
+
+# Console harness for the OCR layer (scanned-page detection, Windows OCR, the
+# invisible text layer written on save). No GUI.
+add_executable(pdfviewer_ocrtest src/ocrtest_main.cpp src/pdf_document.cpp src/ocr.cpp src/word_convert.cpp src/webview_convert.cpp src/signature.cpp)
+target_include_directories(pdfviewer_ocrtest PRIVATE ${WEBVIEW2_DIR}/include)
+target_link_libraries(pdfviewer_ocrtest PRIVATE mupdf gdi32 user32 gdiplus ole32 oleaut32
+	${WEBVIEW2_DIR}/lib/x64/WebView2LoaderStatic.lib)
+target_compile_definitions(pdfviewer_ocrtest PRIVATE NOMINMAX UNICODE _UNICODE)
+
+# Windows' built-in OCR (Windows.Media.Ocr) through C++/WinRT: header-only, no
+# extra DLL or model to ship. Needs a conforming preprocessor/two-phase lookup.
+set_source_files_properties(src/ocr.cpp PROPERTIES
+	COMPILE_OPTIONS "/permissive-;/utf-8"
+	COMPILE_DEFINITIONS "NOMINMAX")
 
 # Console harness for the auto-updater's network + parse path (no GUI). Point
 # it at any public GitHub repo with releases to validate the update check.
@@ -51,6 +65,7 @@ add_executable(pdfviewer WIN32
 	src/main.cpp
 	src/viewer_window.cpp
 	src/pdf_document.cpp
+	src/ocr.cpp
 	src/print_document.cpp
 	src/updater.cpp
 	src/package_info.cpp
