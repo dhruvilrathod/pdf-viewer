@@ -109,6 +109,26 @@ int wmain(int argc, wchar_t** argv)
 		return 0;
 	}
 
+	if (cmd == L"render") {
+		// How much of each page is actually inked: a blank (all-white) page prints 0.
+		for (int p = 0; p < doc.pageCount(); ++p) {
+			PageBitmap bm = doc.renderPage(p, 0.5f);
+			if (!bm.hbmp) { std::printf("-- page %d: render FAILED\n", p + 1); continue; }
+			BITMAPINFO bi = {};
+			bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+			bi.bmiHeader.biWidth = bm.width; bi.bmiHeader.biHeight = -bm.height;
+			bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+			std::vector<unsigned char> px(static_cast<size_t>(bm.width) * bm.height * 4);
+			HDC dc = GetDC(nullptr);
+			GetDIBits(dc, bm.hbmp, 0, bm.height, px.data(), &bi, DIB_RGB_COLORS);
+			ReleaseDC(nullptr, dc);
+			size_t dark = 0;
+			for (size_t i = 0; i < px.size(); i += 4) if (px[i] < 200 || px[i + 1] < 200 || px[i + 2] < 200) ++dark;
+			std::printf("-- page %d: %zu non-white pixels of %zu\n", p + 1, dark, px.size() / 4);
+		}
+		return 0;
+	}
+
 	if (cmd == L"dump") {
 		// Structure of page N (default 1): resources and the start of the content stream.
 		int pn = argc >= 4 ? _wtoi(argv[3]) - 1 : 0;

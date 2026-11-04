@@ -4063,9 +4063,10 @@ bool PdfDocument::pageNeedsOcr(int page)
 				// OCR layer from an earlier save) is left alone.
 				need = (coverage >= 0.5 && chars < 8) || (coverage >= 0.8 && textFrac < 0.03 && chars < 60);
 			}
-			if (!need && chars < 8) {
-				// No text and no big picture: is it text drawn as outlines? Only
-				// pages that already have nothing to select get this extra pass.
+			if (!need && chars < 300) {
+				// No (or little) text and no big picture: is the rest of it text
+				// drawn as outlines? Only pages that are mostly unselectable get
+				// this extra pass, so a normal digital page never pays for it.
 				fz_device* probe = nullptr;
 				fz_var(probe);
 				fz_try(ctx_) {
@@ -4075,7 +4076,12 @@ bool PdfDocument::pageNeedsOcr(int page)
 					fz_close_device(ctx_, probe);
 					// A page of text is hundreds of glyph shapes; a plan or a
 					// logo has far fewer small ones.
-					need = reinterpret_cast<GlyphShapeProbe*>(probe)->shapes >= 150;
+					int shapes = reinterpret_cast<GlyphShapeProbe*>(probe)->shapes;
+
+					// Real text with outlined text beside it (a form printout whose
+					// header is live text but whose body is curves): the outlines
+					// must clearly outnumber the characters we can already select.
+					need = shapes >= 150 && shapes >= 4 * chars;
 				}
 				fz_always(ctx_) { if (probe) fz_drop_device(ctx_, probe); }
 				fz_catch(ctx_) {}
