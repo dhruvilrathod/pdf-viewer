@@ -1988,6 +1988,25 @@ bool fullRewriteChokesOnMissingObject(const std::wstring& wpath)
 	return chokes;
 }
 
+// Marks every object number the xref never mentions (the "hole" some PDF
+// generators leave) as a free entry. MuPDF loads a free entry as null, but
+// throws "cannot find object in xref" for an unset one -- which is what a
+// full, garbage-collecting rewrite trips over. Purely in-memory and harmless:
+// a free object is exactly what a hole already behaves like everywhere else.
+void markXrefHolesFree(fz_context* ctx, pdf_document* pdf)
+{
+	int len = pdf_xref_len(ctx, pdf);
+	pdf_ensure_solid_xref(ctx, pdf, len);
+	for (int i = 1; i < len; ++i) {
+		pdf_xref_entry* x = pdf_get_xref_entry_no_change(ctx, pdf, i);
+		if (x && x->type == 0) {
+			x->type = 'f';
+			x->ofs = 0;
+			x->gen = 0;
+		}
+	}
+}
+
 } // namespace
 
 bool PdfDocument::probeFullRewriteRisky()
@@ -2070,6 +2089,34 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 		useIncremental = true;
 	}
 
+	// Changing the encryption rewrites the trailer's /Encrypt entry IN THE LIVE
+	// DOCUMENT before anything is written (removed for "no protection", replaced
+	// for a new password). If the write then fails, doc_ is left claiming a
+	// protection state that doesn't match its still-encrypted objects, and any
+	// later Save writes encrypted data under a trailer with no /Encrypt -- every
+	// page reads back as garbage (a blank page with the field boxes showing).
+	// So remember the entry and put it back on any failure.
+	const bool changesEncryption = stripEncryption || newPassword;
+	pdf_obj* savedEncrypt = nullptr;
+	if (changesEncryption) {
+		pdf_obj* e = pdf_dict_get(ctx_, pdf_trailer(ctx_, pdf), PDF_NAME(Encrypt));
+		if (e) savedEncrypt = pdf_keep_obj(ctx_, e);
+		// A full rewrite can't go through a hole in the xref; patch it first.
+		if (probeFullRewriteRisky()) {
+			fz_try(ctx_) { markXrefHolesFree(ctx_, pdf); }
+			fz_catch(ctx_) {}
+		}
+	}
+	auto restoreEncryption = [&] {
+		if (!changesEncryption || !doc_) return;
+		fz_try(ctx_) {
+			pdf_obj* trailer = pdf_trailer(ctx_, pdf);
+			if (savedEncrypt) pdf_dict_put(ctx_, trailer, PDF_NAME(Encrypt), savedEncrypt);
+			else pdf_dict_del(ctx_, trailer, PDF_NAME(Encrypt));
+		}
+		fz_catch(ctx_) {}
+	};
+
 	bool wrote = false;
 	if (useIncremental && !incremental) {
 		// Forced into incremental by the probe above (the caller asked for a
@@ -2113,11 +2160,15 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 		wrote = false;
 	}
 	if (!wrote) {
+		restoreEncryption();
+		if (savedEncrypt) pdf_drop_obj(ctx_, savedEncrypt);
 		DeleteFileW(wtemp.c_str());
 		return false;
 	}
 
 	if (!verifyPdfFile(utemp, pageCount_, newPassword)) {
+		restoreEncryption();
+		if (savedEncrypt) pdf_drop_obj(ctx_, savedEncrypt);
 		err = "save produced an invalid file; the original was left untouched";
 		DeleteFileW(wtemp.c_str());
 		return false;
@@ -2125,6 +2176,8 @@ bool PdfDocument::writeAndReplace(const wchar_t* path, bool incremental, bool st
 
 	// Release our own read handle before replacing -- Windows won't let us
 	// replace a file this same process still has open for reading.
+	// (The saved /Encrypt entry belongs to this document: let go of it first.)
+	if (savedEncrypt) { pdf_drop_obj(ctx_, savedEncrypt); savedEncrypt = nullptr; }
 	if (doc_) { fz_drop_document(ctx_, doc_); doc_ = nullptr; }
 
 	if (!MoveFileExW(wtemp.c_str(), wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
