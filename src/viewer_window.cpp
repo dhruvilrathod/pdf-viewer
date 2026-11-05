@@ -1539,6 +1539,9 @@ private:
 	void syncOcrButton(); // mirrors the active tab's OCR on/off state onto the toolbar toggle
 	void updateTitle();
 	void updateStatusPath();          // right-hand status bar part: current tab's full file path
+	void copyFolderPathToClipboard(); // click on that part: copy the file's FOLDER (not the file) to the clipboard
+	bool statusPathCopied_ = false;   // true briefly after a copy: the part shows a confirmation instead of the path
+	static constexpr UINT_PTR kStatusPathCopiedTimer = 2;
 	void layoutStatusParts();         // recomputes the two status bar part boundaries for the current width
 	int statusLeftW_ = -1;            // part 0's current width, so unchanged layouts skip SB_SETPARTS
 	bool promptSaveIfDirty(); // returns false if user cancelled
@@ -10185,6 +10188,7 @@ void FrameWindow::drawStatusBarItem(const DRAWITEMSTRUCT* dis)
 			? tabs_[activeTab_]->path : std::wstring();
 		tr.left += Scale(6, dpi);
 		tr.right -= Scale(6, dpi);
+		if (statusPathCopied_ && !path.empty()) path = L"Folder path copied to clipboard";
 		DrawTextW(dis->hDC, path.c_str(), -1, &tr,
 			DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS | DT_NOPREFIX);
 		return;
@@ -10749,6 +10753,35 @@ void FrameWindow::updateStatusPath()
 	SendMessageW(status_, SB_SETTEXTW, 1 | SBT_OWNERDRAW, reinterpret_cast<LPARAM>(path.c_str()));
 }
 
+// Clicking the path in the status bar copies the file's folder (everything
+// before the last backslash), ready to paste into Explorer's address bar or
+// an email. A short "copied" note replaces the path for a moment so the click
+// visibly did something.
+void FrameWindow::copyFolderPathToClipboard()
+{
+	if (activeTab_ < 0 || activeTab_ >= static_cast<int>(tabs_.size())) return;
+	std::wstring path = tabs_[activeTab_]->path;
+	size_t cut = path.find_last_of(L"\\/");
+	if (cut == std::wstring::npos || cut == 0) return; // untitled tab: no folder to copy
+	std::wstring folder = path.substr(0, cut);
+	if (folder.size() == 2 && folder[1] == L':') folder += L'\\'; // "C:" -> "C:\" (a drive root keeps its slash)
+
+	if (!OpenClipboard(hwnd_)) return;
+	EmptyClipboard();
+	HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (folder.size() + 1) * sizeof(wchar_t));
+	if (mem) {
+		void* p = GlobalLock(mem);
+		memcpy(p, folder.c_str(), (folder.size() + 1) * sizeof(wchar_t));
+		GlobalUnlock(mem);
+		SetClipboardData(CF_UNICODETEXT, mem);
+	}
+	CloseClipboard();
+
+	statusPathCopied_ = true;
+	SetTimer(hwnd_, kStatusPathCopiedTimer, 1500, nullptr);
+	InvalidateRect(status_, nullptr, TRUE);
+}
+
 void FrameWindow::updateTitle()
 {
 	DocTab* at = (activeTab_ >= 0 && activeTab_ < static_cast<int>(tabs_.size())) ? tabs_[activeTab_].get() : nullptr;
@@ -10911,9 +10944,34 @@ LRESULT CALLBACK FrameWindow::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		return 0;
 	case WM_TIMER:
 		if (wp == 1) { KillTimer(hwnd, 1); self->liveSearch(); }
+		if (wp == kStatusPathCopiedTimer) {
+			KillTimer(hwnd, kStatusPathCopiedTimer);
+			self->statusPathCopied_ = false;
+			if (self->status_) InvalidateRect(self->status_, nullptr, TRUE);
+		}
 		return 0;
+	case WM_SETCURSOR:
+		// The path in the status bar is clickable: show a hand over it. A
+		// child's default handling forwards WM_SETCURSOR up to this window.
+		if (self->status_ && reinterpret_cast<HWND>(wp) == self->status_ && LOWORD(lp) == HTCLIENT) {
+			POINT pt; GetCursorPos(&pt);
+			ScreenToClient(self->status_, &pt);
+			RECT pr;
+			if (self->activeTab_ >= 0 && self->activeTab_ < static_cast<int>(self->tabs_.size()) &&
+				!self->tabs_[self->activeTab_]->path.empty() &&
+				SendMessageW(self->status_, SB_GETRECT, 1, reinterpret_cast<LPARAM>(&pr)) && PtInRect(&pr, pt)) {
+				SetCursor(LoadCursor(nullptr, IDC_HAND));
+				return TRUE;
+			}
+		}
+		break;
 	case WM_NOTIFY: {
 		auto* nm = reinterpret_cast<NMHDR*>(lp);
+		if (nm->hwndFrom == self->status_ && nm->code == NM_CLICK) {
+			// Part 1 is the file path; part 0 (page / zoom) stays inert.
+			if (reinterpret_cast<NMMOUSE*>(lp)->dwItemSpec == 1) self->copyFolderPathToClipboard();
+			return 0;
+		}
 		if (nm->hwndFrom == self->tabStrip_ && nm->code == TCN_SELCHANGE) {
 			self->switchToTab(static_cast<int>(SendMessageW(self->tabStrip_, TCM_GETCURSEL, 0, 0)));
 			return 0;
