@@ -582,6 +582,70 @@ PageBitmap PdfDocument::renderPage(int index, float scale, int rotate)
 	return result;
 }
 
+PageBitmap PdfDocument::renderRegion(int index, float scale, int rotate, int rx0, int ry0, int rx1, int ry1)
+{
+	PageBitmap result;
+	if (!ctx_ || !doc_ || !authed_) return result;
+	if (index < 0 || index >= pageCount_) return result;
+	if (scale <= 0.0f) return result;
+
+	rotate = ((rotate % 360) + 360) % 360;
+	if (rotate % 90 != 0) rotate = 0;
+
+	std::lock_guard<std::recursive_mutex> lock(mutex_);
+	fz_page* page = nullptr;
+	fz_pixmap* pix = nullptr;
+	fz_device* dev = nullptr;
+	fz_try(ctx_) {
+		page = fz_load_page(ctx_, doc_, index);
+
+		// Same target box renderPage() computes, so a region here is exactly
+		// the same pixels of the same render -- tiles cut from it butt together
+		// with no seam (every pixel is computed independently of its neighbours).
+		fz_matrix baseCtm = fz_pre_rotate(fz_scale(scale, scale), static_cast<float>(rotate));
+		fz_irect targetBox = fz_round_rect(fz_transform_rect(fz_bound_page(ctx_, page), baseCtm));
+		int targetW = std::max(1, targetBox.x1 - targetBox.x0);
+		int targetH = std::max(1, targetBox.y1 - targetBox.y0);
+		rx0 = std::max(0, std::min(rx0, targetW)); rx1 = std::max(rx0, std::min(rx1, targetW));
+		ry0 = std::max(0, std::min(ry0, targetH)); ry1 = std::max(ry0, std::min(ry1, targetH));
+		int rw = rx1 - rx0, rh = ry1 - ry0;
+		if (rw > 0 && rh > 0) {
+			fz_irect want = { targetBox.x0 + rx0, targetBox.y0 + ry0, targetBox.x0 + rx1, targetBox.y0 + ry1 };
+			int w = 0, h = 0;
+			HBITMAP hbmp = nullptr;
+			if (scale < 1.5f) {
+				// Supersample 2x and box-filter back down, as renderPage() does
+				// (see its comment); the region is an exact 2x block of pixels.
+				fz_irect ssBox = { want.x0 * 2, want.y0 * 2, want.x1 * 2, want.y1 * 2 };
+				fz_matrix ctm = fz_pre_rotate(fz_scale(scale * 2.0f, scale * 2.0f), static_cast<float>(rotate));
+				pix = fz_new_pixmap_with_bbox(ctx_, fz_device_rgb(ctx_), ssBox, nullptr, 0);
+				fz_clear_pixmap_with_value(ctx_, pix, 0xFF);
+				dev = fz_new_draw_device(ctx_, ctm, pix);
+				fz_run_page(ctx_, page, dev, fz_identity, nullptr);
+				fz_close_device(ctx_, dev);
+				hbmp = pixmapToDIB(ctx_, pix, w, h, rw, rh);
+			} else {
+				pix = fz_new_pixmap_with_bbox(ctx_, fz_device_rgb(ctx_), want, nullptr, 0);
+				fz_clear_pixmap_with_value(ctx_, pix, 0xFF);
+				dev = fz_new_draw_device(ctx_, baseCtm, pix);
+				fz_run_page(ctx_, page, dev, fz_identity, nullptr);
+				fz_close_device(ctx_, dev);
+				hbmp = pixmapToDIB(ctx_, pix, w, h);
+			}
+			if (hbmp) { result.hbmp = hbmp; result.width = w; result.height = h; }
+		}
+	}
+	fz_always(ctx_) {
+		if (dev) fz_drop_device(ctx_, dev);
+		if (pix) fz_drop_pixmap(ctx_, pix);
+		if (page) fz_drop_page(ctx_, page);
+	}
+	fz_catch(ctx_) {
+		// return empty on failure
+	}
+	return result;
+}
+
 void PdfDocument::close()
 {
 	std::lock_guard<std::recursive_mutex> lock(mutex_);

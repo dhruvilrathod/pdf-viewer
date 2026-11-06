@@ -447,6 +447,11 @@ public:
 	// mix rendered pixels with those coordinates must rotate them themselves
 	// (see CanvasView::pageRectToView).
 	PageBitmap renderPage(int index, float scale, int rotate = 0);
+	// Just a rectangle of what renderPage() would produce, in that render's own
+	// pixel coordinates (0,0 = its top-left; clamped to its size). Cost follows
+	// the rectangle, not the page, so a screenful of a huge page (or of any
+	// page at a high zoom) stays cheap. Same rotation / supersampling rules.
+	PageBitmap renderRegion(int index, float scale, int rotate, int rx0, int ry0, int rx1, int ry1);
 	// Same, but with annotation `annotIndex` temporarily hidden for this one
 	// render (flag is restored immediately after) -- used to build the
 	// "transparent" background behind an in-progress edit of that annotation

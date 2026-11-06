@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <cwctype>
@@ -226,6 +227,11 @@ constexpr UINT WM_APP_UPDATE_RESULT = WM_APP + 1;
 // (or stopped on an error).
 constexpr UINT WM_APP_OCR_PAGE = WM_APP + 2;
 constexpr UINT WM_APP_OCR_DONE = WM_APP + 3;
+
+// Posted by a canvas's page-render worker when it has finished one or more
+// tiles / previews and they are waiting to be collected (see
+// CanvasView::onRenderReady).
+constexpr UINT WM_APP_RENDER_READY = WM_APP + 4;
 
 // Resize-handle direction indices, matching the 8-entry layout used by
 // positionResizeHandles()/updateResize(): NW,N,NE,W,E,SW,S,SE. kResizeMove is
@@ -721,7 +727,7 @@ public:
 
 	static void Register(HINSTANCE hInst);
 	CanvasView(HWND parent, HINSTANCE hInst);
-	~CanvasView() { stopOcrWorker(); }
+	~CanvasView() { stopOcrWorker(); stopRenderWorker(); }
 	HWND hwnd() const { return hwnd_; }
 
 	// --- OCR for scanned pages ---------------------------------------------
@@ -937,8 +943,66 @@ private:
 	void beginSmoothScrollX(int targetX);
 	void stepScrollAnim();
 	void invalidate() { if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE); }
-	void invalidateCache() { cache_.clear(); cacheKey_ = 0; }
-	HBITMAP ensureRendered(int i, int& w, int& h);
+	// Everything cached about what the pages look like is thrown away: tiles,
+	// previews, and any render still in flight (its result is dropped on arrival).
+	void invalidateCache() { tiles_.clear(); previews_.clear(); pageGen_.clear(); ++renderGen_; cacheKey_ = 0; }
+
+	// --- Tiled, asynchronous page rendering --------------------------------
+	// A page is never rendered as one bitmap: a big scan, or any page at a high
+	// zoom, would be a huge allocation and a long stall on the UI thread. The
+	// page is cut into kTileSize squares, only those on screen (plus a ring
+	// just outside, for scrolling) are rendered, on a worker thread, and what is
+	// not ready yet is drawn from a small whole-page preview stretched to fit --
+	// so a zoom or scroll always repaints at once and sharpens a moment later.
+	static constexpr int kTileSize = 512;
+	static constexpr size_t kMaxTiles = 160;     // ~1 MB each
+	static constexpr size_t kMaxPreviews = 40;
+	static constexpr int kPreviewSide = 640;     // longest side of a preview, pixels
+	struct RenderJob {
+		int page = 0, tx = 0, ty = 0;
+		bool preview = false;
+		long long scaleKey = 0;
+		float scale = 1.0f;
+		int rot = 0;
+		long long gen = 0;
+		bool operator==(const RenderJob& o) const {
+			return page == o.page && tx == o.tx && ty == o.ty && preview == o.preview &&
+				scaleKey == o.scaleKey && rot == o.rot && gen == o.gen;
+		}
+	};
+	struct TileEntry { PageBitmap bmp; long long gen = 0; unsigned long long used = 0; };
+	struct PreviewEntry { PageBitmap bmp; long long gen = 0; unsigned long long used = 0; };
+	struct WantedJob { float dist; RenderJob job; };
+	static unsigned long long TileKey(int page, int tx, int ty) {
+		return (static_cast<unsigned long long>(page) << 40) | (static_cast<unsigned long long>(tx) << 20) | static_cast<unsigned long long>(ty);
+	}
+	long long genFor(int page) const {
+		auto it = pageGen_.find(page);
+		return (static_cast<long long>(renderGen_) << 32) | static_cast<unsigned>(it == pageGen_.end() ? 0 : it->second);
+	}
+	void drawPageTiles(HDC mem, HDC src, int idx, int px, int py, int pw, int ph, int cw, int ch);
+	void submitRenderJobs();
+	void stopRenderWorker();
+	void renderWorkerMain(PdfDocument* doc, HWND hwnd);
+	void onRenderReady();
+	void evictRenderCaches();
+	std::unordered_map<unsigned long long, TileEntry> tiles_;   // valid for the current cacheKey_
+	std::unordered_map<int, PreviewEntry> previews_;            // independent of zoom; valid for previewRot_
+	std::unordered_map<int, int> pageGen_;                      // bumped when one page's content changes
+	int renderGen_ = 1;                                         // bumped when everything changes
+	int previewRot_ = 0;
+	unsigned long long paintSerial_ = 0;
+	bool previewsWanted_ = true;                                // few enough pages in view to bother
+	std::vector<WantedJob> wantVisible_, wantNear_;             // gathered while painting
+	std::thread renderThread_;
+	std::mutex renderMutex_;
+	std::condition_variable renderCv_;
+	std::vector<RenderJob> renderJobs_;                         // queued, most urgent first
+	bool renderStop_ = false;
+	bool renderInFlightValid_ = false;
+	RenderJob renderInFlight_;
+	bool renderPostPending_ = false;
+	std::vector<std::pair<RenderJob, PageBitmap>> renderDone_;
 	void onPaint();
 	void onSize();
 	void onVScroll(WPARAM);
@@ -966,7 +1030,7 @@ private:
 	void onLButtonUp(int mx, int my);
 	void eraseAt(int mx, int my);
 	void doFormFill(int page, float px, float py);
-	void invalidatePage(int page) { cache_.erase(page); widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); runsCache_.erase(page); if (editHoverPage_ == page) editHoverIdx_ = -1; }
+	void invalidatePage(int page) { ++pageGen_[page]; widgetCache_.erase(page); charsCache_.erase(page); annotCache_.erase(page); linksCache_.erase(page); runsCache_.erase(page); if (editHoverPage_ == page) editHoverIdx_ = -1; }
 	void drawFieldHighlights(HDC dc, int pageIndex, int pageX, int pageY);
 	// Tools-grid empty state (shown instead of the plain "drag a file here"
 	// hint when no document is open). Defined after the icons:: namespace so
@@ -1085,8 +1149,7 @@ private:
 	std::vector<PageLayout> layout_; // continuous: one per page
 	int canvasW_ = 0, canvasH_ = 0;
 
-	long long cacheKey_ = 0; // effScale rounded; invalidates cache on change
-	std::unordered_map<int, PageBitmap> cache_;
+	long long cacheKey_ = 0; // effScale rounded; invalidates the tile cache on change
 	std::unordered_map<int, std::vector<WidgetInfo>> widgetCache_;
 
 	// Inline edit state (form text fields, new free-text annotations, and
@@ -2286,6 +2349,7 @@ std::wstring CanvasView::ocrStatusSuffix() const
 void CanvasView::setDocument(PdfDocument* doc)
 {
 	stopOcrWorker();                         // it works on the old document
+	stopRenderWorker();                      // ... and so does the page renderer
 	ocrEnabled_ = false;
 	ocrSeen_ = false;
 	ocrNote_.clear();
@@ -3732,19 +3796,31 @@ void CanvasView::makeInlineBgBrush()
 
 	HBITMAP pageHb = nullptr;
 	int pw = 0, ph = 0;
+	int bx0, by0, bx1, by1;
 	PageBitmap freshBmp; // keeps the fresh render's HBITMAP alive for this scope
 	if (inlineExistingAnnotIndex_ >= 0) {
 		freshBmp = doc_->renderPageWithoutAnnot(inlineEditPage_, sc, inlineExistingAnnotIndex_);
 		pageHb = freshBmp.hbmp;
 		pw = freshBmp.width; ph = freshBmp.height;
+		bx0 = std::clamp(static_cast<int>(inlineEditRectPt_.x0 * sc), 0, pw);
+		by0 = std::clamp(static_cast<int>(inlineEditRectPt_.y0 * sc), 0, ph);
+		bx1 = std::clamp(static_cast<int>(inlineEditRectPt_.x1 * sc), 0, pw);
+		by1 = std::clamp(static_cast<int>(inlineEditRectPt_.y1 * sc), 0, ph);
 	} else {
-		pageHb = ensureRendered(inlineEditPage_, pw, ph);
+		// Only the pixels behind the box are needed, not the whole page.
+		int fw, fh;
+		pagePixelSize(inlineEditPage_, fw, fh);
+		bx0 = std::clamp(static_cast<int>(inlineEditRectPt_.x0 * sc), 0, fw);
+		by0 = std::clamp(static_cast<int>(inlineEditRectPt_.y0 * sc), 0, fh);
+		bx1 = std::clamp(static_cast<int>(inlineEditRectPt_.x1 * sc), 0, fw);
+		by1 = std::clamp(static_cast<int>(inlineEditRectPt_.y1 * sc), 0, fh);
+		freshBmp = doc_->renderRegion(inlineEditPage_, sc, viewRotation_, bx0, by0, std::max(bx1, bx0 + 1), std::max(by1, by0 + 1));
+		pageHb = freshBmp.hbmp;
+		pw = freshBmp.width; ph = freshBmp.height;
+		bx1 -= bx0; by1 -= by0; bx0 = 0; by0 = 0; // the region bitmap starts at the box's corner
+		bx1 = std::min(bx1, pw); by1 = std::min(by1, ph);
 	}
 	if (!pageHb) return;
-	int bx0 = std::clamp(static_cast<int>(inlineEditRectPt_.x0 * sc), 0, pw);
-	int by0 = std::clamp(static_cast<int>(inlineEditRectPt_.y0 * sc), 0, ph);
-	int bx1 = std::clamp(static_cast<int>(inlineEditRectPt_.x1 * sc), 0, pw);
-	int by1 = std::clamp(static_cast<int>(inlineEditRectPt_.y1 * sc), 0, ph);
 	int bw = std::max(1, bx1 - bx0), bh = std::max(1, by1 - by0);
 
 	HDC screenDC = GetDC(nullptr);
@@ -4280,8 +4356,11 @@ void CanvasView::relayout()
 
 	int gap = Scale(kBasePageGap, dpi_);
 	// Rotation is part of the key: the cached bitmaps are rendered turned.
+	// A zoom only drops the tiles: the previews are zoom-independent, and are
+	// exactly what keeps a zoom step instant while the new tiles render.
 	long long newKey = std::llround(effScale() * 1000.0f) * 4 + viewRotation_ / 90;
-	if (newKey != cacheKey_) { invalidateCache(); cacheKey_ = newKey; }
+	if (newKey != cacheKey_) { tiles_.clear(); cacheKey_ = newKey; }
+	if (viewRotation_ != previewRot_) { previews_.clear(); previewRot_ = viewRotation_; ++renderGen_; }
 
 	if (mode_ == Mode::Continuous) {
 		int n = doc_->pageCount();
@@ -4494,21 +4573,230 @@ void CanvasView::updateScrollbars()
 	SetScrollInfo(hwnd_, SB_HORZ, &si, TRUE);
 }
 
-HBITMAP CanvasView::ensureRendered(int i, int& w, int& h)
+void CanvasView::stopRenderWorker()
 {
-	auto it = cache_.find(i);
-	if (it != cache_.end() && it->second.hbmp) {
-		w = it->second.width; h = it->second.height;
-		return it->second.hbmp;
+	{
+		std::lock_guard<std::mutex> l(renderMutex_);
+		renderStop_ = true;
 	}
-	if (!doc_) return nullptr;
-	PageBitmap bmp = doc_->renderPage(i, effScale(), viewRotation_);
-	HBITMAP hb = bmp.hbmp;
-	w = bmp.width; h = bmp.height;
-	// Bound cache growth: clear if it gets large (visible pages re-render fast).
-	if (cache_.size() > 24) cache_.clear();
-	cache_[i] = std::move(bmp);
-	return hb;
+	renderCv_.notify_all();
+	if (renderThread_.joinable()) renderThread_.join();
+	std::lock_guard<std::mutex> l(renderMutex_);
+	renderStop_ = false;
+	renderJobs_.clear();
+	renderDone_.clear();
+	renderInFlightValid_ = false;
+	renderPostPending_ = false;
+}
+
+void CanvasView::renderWorkerMain(PdfDocument* doc, HWND hwnd)
+{
+	for (;;) {
+		RenderJob job;
+		{
+			std::unique_lock<std::mutex> lk(renderMutex_);
+			renderCv_.wait(lk, [&] { return renderStop_ || !renderJobs_.empty(); });
+			if (renderStop_) return;
+			job = renderJobs_.front();
+			renderJobs_.erase(renderJobs_.begin());
+			renderInFlight_ = job;
+			renderInFlightValid_ = true;
+		}
+		PageBitmap bmp;
+		if (job.preview) {
+			bmp = doc->renderPage(job.page, job.scale, job.rot);
+		} else {
+			bmp = doc->renderRegion(job.page, job.scale, job.rot, job.tx * kTileSize, job.ty * kTileSize,
+				(job.tx + 1) * kTileSize, (job.ty + 1) * kTileSize);
+		}
+		bool post = false;
+		{
+			std::lock_guard<std::mutex> l(renderMutex_);
+			renderInFlightValid_ = false;
+			renderDone_.emplace_back(job, std::move(bmp));
+			post = !renderPostPending_;
+			renderPostPending_ = true;
+		}
+		if (post) PostMessageW(hwnd, WM_APP_RENDER_READY, 0, 0);
+	}
+}
+
+// Hands the worker what this paint found missing: most urgent first (previews,
+// then on-screen tiles nearest the middle of the view, then the ring around).
+void CanvasView::submitRenderJobs()
+{
+	auto byDist = [](const WantedJob& a, const WantedJob& b) { return a.dist < b.dist; };
+	std::sort(wantVisible_.begin(), wantVisible_.end(), byDist);
+	std::sort(wantNear_.begin(), wantNear_.end(), byDist);
+	std::vector<RenderJob> all;
+	all.reserve(wantVisible_.size() + wantNear_.size());
+	for (const auto& w : wantVisible_) all.push_back(w.job);
+	for (const auto& w : wantNear_) all.push_back(w.job);
+	wantVisible_.clear();
+	wantNear_.clear();
+
+	{
+		std::lock_guard<std::mutex> l(renderMutex_);
+		if (renderInFlightValid_) {
+			all.erase(std::remove(all.begin(), all.end(), renderInFlight_), all.end()); // already being drawn
+		}
+		if (all == renderJobs_) return;
+		renderJobs_ = std::move(all);
+	}
+	if (!doc_ || !doc_->isOpen()) return;
+	if (!renderThread_.joinable())
+		renderThread_ = std::thread([this, doc = doc_, hwnd = hwnd_] { renderWorkerMain(doc, hwnd); });
+	renderCv_.notify_one();
+}
+
+void CanvasView::evictRenderCaches()
+{
+	if (tiles_.size() > kMaxTiles) {
+		// Drop the least recently drawn tiles, never one drawn by the latest paint.
+		std::vector<std::pair<unsigned long long, unsigned long long>> order; // (used, key)
+		for (const auto& kv : tiles_)
+			if (kv.second.used < paintSerial_) order.push_back({ kv.second.used, kv.first });
+		std::sort(order.begin(), order.end());
+		for (const auto& o : order) {
+			if (tiles_.size() <= kMaxTiles) break;
+			tiles_.erase(o.second);
+		}
+	}
+	if (previews_.size() > kMaxPreviews) {
+		std::vector<std::pair<unsigned long long, int>> order;
+		for (const auto& kv : previews_)
+			if (kv.second.used < paintSerial_) order.push_back({ kv.second.used, kv.first });
+		std::sort(order.begin(), order.end());
+		for (const auto& o : order) {
+			if (previews_.size() <= kMaxPreviews) break;
+			previews_.erase(o.second);
+		}
+	}
+}
+
+void CanvasView::onRenderReady()
+{
+	std::vector<std::pair<RenderJob, PageBitmap>> done;
+	{
+		std::lock_guard<std::mutex> l(renderMutex_);
+		done.swap(renderDone_);
+		renderPostPending_ = false;
+	}
+	for (auto& d : done) {
+		const RenderJob& j = d.first;
+		if (j.gen != genFor(j.page)) continue; // the page changed meanwhile; the next paint asks again
+		if (j.preview) {
+			if (j.rot != viewRotation_) continue;
+			PreviewEntry& e = previews_[j.page];
+			e.bmp = std::move(d.second);
+			e.gen = j.gen;
+			e.used = paintSerial_;
+			invalidate();
+		} else {
+			if (j.scaleKey != cacheKey_) continue; // zoomed again while it rendered
+			TileEntry& e = tiles_[TileKey(j.page, j.tx, j.ty)];
+			e.bmp = std::move(d.second);
+			e.gen = j.gen;
+			e.used = paintSerial_;
+			int sx, sy;
+			if (pageScreenOrigin(j.page, sx, sy)) {
+				RECT r = { sx + j.tx * kTileSize, sy + j.ty * kTileSize, sx + (j.tx + 1) * kTileSize, sy + (j.ty + 1) * kTileSize };
+				InvalidateRect(hwnd_, &r, FALSE);
+			}
+		}
+	}
+	evictRenderCaches();
+}
+
+// Paints page `idx` (whose top-left is at px,py on screen, pw x ph pixels)
+// from whatever tiles exist, stretching the page preview over the rest, and
+// records what is still missing for submitRenderJobs().
+void CanvasView::drawPageTiles(HDC mem, HDC src, int idx, int px, int py, int pw, int ph, int cw, int ch)
+{
+	RECT page = { px, py, px + pw, py + ph }, clip = { 0, 0, cw, ch }, vis;
+	if (!IntersectRect(&vis, &page, &clip)) return;
+	FillRect(mem, &vis, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH))); // paper, under anything not drawn yet
+
+	const long long gen = genFor(idx);
+	const float cx = cw * 0.5f, cy = ch * 0.5f;
+	auto distTo = [&](int x, int y, int w, int h) {
+		float dx = px + x + w * 0.5f - cx, dy = py + y + h * 0.5f - cy;
+		return dx * dx + dy * dy;
+	};
+
+	PreviewEntry* pv = nullptr;
+	{
+		auto it = previews_.find(idx);
+		if (it != previews_.end()) { pv = &it->second; pv->used = paintSerial_; }
+	}
+	if (previewsWanted_ && (!pv || pv->gen != gen)) {
+		PageSizePt s = doc_->pageSize(idx);
+		float longest = std::max(s.w, s.h);
+		if (longest > 0) {
+			RenderJob j;
+			j.page = idx; j.preview = true; j.rot = viewRotation_; j.gen = gen;
+			j.scale = std::min(kPreviewSide / longest, 2.0f);
+			wantVisible_.push_back({ -1.0f, j });
+		}
+	}
+
+	const int vx0 = vis.left - px, vy0 = vis.top - py, vx1 = vis.right - px, vy1 = vis.bottom - py;
+	const int tx0 = vx0 / kTileSize, tx1 = (vx1 - 1) / kTileSize;
+	const int ty0 = vy0 / kTileSize, ty1 = (vy1 - 1) / kTileSize;
+	const int tilesX = (pw + kTileSize - 1) / kTileSize, tilesY = (ph + kTileSize - 1) / kTileSize;
+
+	auto makeJob = [&](int tx, int ty) {
+		RenderJob j;
+		j.page = idx; j.tx = tx; j.ty = ty;
+		j.scaleKey = cacheKey_; j.scale = effScale(); j.rot = viewRotation_; j.gen = gen;
+		return j;
+	};
+
+	for (int ty = ty0; ty <= ty1; ++ty) {
+		for (int tx = tx0; tx <= tx1; ++tx) {
+			const int x = tx * kTileSize, y = ty * kTileSize;
+			const int w = std::min(kTileSize, pw - x), h = std::min(kTileSize, ph - y);
+			auto it = tiles_.find(TileKey(idx, tx, ty));
+			if (it != tiles_.end()) {
+				it->second.used = paintSerial_;
+				if (it->second.bmp.hbmp) {
+					HGDIOBJ old = SelectObject(src, it->second.bmp.hbmp);
+					BitBlt(mem, px + x, py + y, it->second.bmp.width, it->second.bmp.height, src, 0, 0, SRCCOPY);
+					SelectObject(src, old);
+				}
+				if (it->second.gen != gen) wantVisible_.push_back({ distTo(x, y, w, h), makeJob(tx, ty) });
+				continue;
+			}
+			if (pv && pv->bmp.hbmp && pv->bmp.width > 0 && pw > 0 && ph > 0) {
+				const int pvW = pv->bmp.width, pvH = pv->bmp.height;
+				int sx0 = static_cast<int>(static_cast<long long>(x) * pvW / pw);
+				int sy0 = static_cast<int>(static_cast<long long>(y) * pvH / ph);
+				int sx1 = std::min(pvW, static_cast<int>((static_cast<long long>(x + w) * pvW + pw - 1) / pw));
+				int sy1 = std::min(pvH, static_cast<int>((static_cast<long long>(y + h) * pvH + ph - 1) / ph));
+				if (sx1 > sx0 && sy1 > sy0) {
+					HGDIOBJ old = SelectObject(src, pv->bmp.hbmp);
+					SetStretchBltMode(mem, HALFTONE);
+					SetBrushOrgEx(mem, 0, 0, nullptr);
+					StretchBlt(mem, px + x, py + y, w, h, src, sx0, sy0, sx1 - sx0, sy1 - sy0, SRCCOPY);
+					SelectObject(src, old);
+				}
+			}
+			wantVisible_.push_back({ distTo(x, y, w, h), makeJob(tx, ty) });
+		}
+	}
+
+	// The ring just outside the screen, so a scroll finds its tiles ready.
+	for (int ty = std::max(0, ty0 - 1); ty <= std::min(tilesY - 1, ty1 + 1); ++ty) {
+		for (int tx = std::max(0, tx0 - 1); tx <= std::min(tilesX - 1, tx1 + 1); ++tx) {
+			if (tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1) continue;
+			auto it = tiles_.find(TileKey(idx, tx, ty));
+			if (it != tiles_.end()) it->second.used = paintSerial_; // keep it; it is about to matter
+			if (it == tiles_.end() || it->second.gen != gen) {
+				const int x = tx * kTileSize, y = ty * kTileSize;
+				wantNear_.push_back({ distTo(x, y, std::min(kTileSize, pw - x), std::min(kTileSize, ph - y)), makeJob(tx, ty) });
+			}
+		}
+	}
 }
 
 // The page a reader would call "the page I'm on": the one covering the most of
@@ -4573,28 +4861,36 @@ void CanvasView::onPaint()
 			}
 		};
 		auto blitPage = [&](int idx, int px, int py, int pw, int ph) {
-			int w = 0, h = 0;
-			HBITMAP hb = ensureRendered(idx, w, h);
-			if (!hb) return;
 			drawPageShadow(px, py, pw, ph);
-			HBITMAP oldSrc = static_cast<HBITMAP>(SelectObject(src, hb));
-			BitBlt(mem, px, py, w, h, src, 0, 0, SRCCOPY);
-			SelectObject(src, oldSrc);
+			drawPageTiles(mem, src, idx, px, py, pw, ph, cw, ch);
 			drawFieldHighlights(mem, idx, px, py);
 			drawHighlights(mem, idx, px, py);
 			drawTextSelection(mem, idx, px, py);
 		};
 
+		++paintSerial_;
 		if (mode_ == Mode::Continuous) {
+			// Zoomed far out, dozens of pages are in view at once and each is
+			// only a tile or two: skip the previews then (a tile is as quick).
+			int inView = 0;
+			for (size_t i = 0; i < layout_.size(); ++i) {
+				int py = layout_[i].y + offY;
+				if (py + layout_[i].h < 0) continue;
+				if (py > ch) break;
+				++inView;
+			}
+			previewsWanted_ = inView <= 8;
 			for (size_t i = 0; i < layout_.size(); ++i) {
 				int py = layout_[i].y + offY;
 				if (py + layout_[i].h < 0 || py > ch) continue; // offscreen
 				blitPage(static_cast<int>(i), layout_[i].x + offX, py, layout_[i].w, layout_[i].h);
 			}
 		} else {
+			previewsWanted_ = true;
 			blitPage(currentPage_, offX, offY, canvasW_, canvasH_);
 		}
 		DeleteDC(src);
+		submitRenderJobs();
 	} else {
 		drawEmptyState(mem, rc);
 	}
@@ -4968,6 +5264,9 @@ LRESULT CALLBACK CanvasView::Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_TIMER:
 		if (wp == CanvasView::kScrollAnimTimerId) { self->stepScrollAnim(); return 0; }
 		break;
+	case WM_APP_RENDER_READY:
+		self->onRenderReady();
+		return 0;
 	case WM_APP_OCR_PAGE:
 		self->onOcrPage(static_cast<int>(wp), lp == 1);
 		return 0;

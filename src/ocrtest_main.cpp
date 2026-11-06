@@ -109,6 +109,56 @@ int wmain(int argc, wchar_t** argv)
 		return 0;
 	}
 
+	if (cmd == L"bench") {
+		// bench <in.pdf> <page>: full-page render vs one screenful, across zoom levels,
+		// plus a check that a region is pixel-identical to the same area of a full render.
+		int pn = argc >= 4 ? _wtoi(argv[3]) - 1 : 0;
+		auto ms = [](std::chrono::steady_clock::time_point a) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count(); };
+		auto pixels = [](const PageBitmap& bm, std::vector<unsigned char>& px) {
+			BITMAPINFO bi = {};
+			bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+			bi.bmiHeader.biWidth = bm.width; bi.bmiHeader.biHeight = -bm.height;
+			bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+			px.resize(static_cast<size_t>(bm.width) * bm.height * 4);
+			HDC dc = GetDC(nullptr);
+			GetDIBits(dc, bm.hbmp, 0, bm.height, px.data(), &bi, DIB_RGB_COLORS);
+			ReleaseDC(nullptr, dc);
+		};
+		PageSizePt sz = doc.pageSize(pn);
+		std::printf("page %d is %.0f x %.0f pt\n", pn + 1, sz.w, sz.h);
+		for (float sc : { 0.5f, 1.0f, 1.5f, 3.0f, 6.0f, 12.0f }) {
+			double fullPx = double(sz.w) * sc * double(sz.h) * sc;
+			double tFull = -1;
+			if (fullPx < 120e6) {
+				auto t0 = std::chrono::steady_clock::now();
+				PageBitmap full = doc.renderPage(pn, sc);
+				tFull = ms(t0);
+			}
+			int w = int(sz.w * sc), h = int(sz.h * sc);
+			int rx0 = std::max(0, w / 2 - 960), ry0 = std::max(0, h / 2 - 540);
+			auto t1 = std::chrono::steady_clock::now();
+			PageBitmap reg = doc.renderRegion(pn, sc, 0, rx0, ry0, rx0 + 1920, ry0 + 1080);
+			double tReg = ms(t1);
+			std::printf("scale %5.1f  full page %6.0f Mpx: %8.0f ms   |  1920x1080 region: %6.0f ms\n", sc, fullPx / 1e6, tFull, tReg);
+		}
+		for (float sc : { 0.7f, 2.0f }) {
+			PageBitmap full = doc.renderPage(pn, sc);
+			int rx0 = full.width / 3 + 1, ry0 = full.height / 4 + 3, rw = std::min(400, full.width - rx0), rh = std::min(300, full.height - ry0);
+			PageBitmap reg = doc.renderRegion(pn, sc, 0, rx0, ry0, rx0 + rw, ry0 + rh);
+			std::vector<unsigned char> a, b;
+			pixels(full, a); pixels(reg, b);
+			size_t diff = 0; int maxd = 0; size_t big = 0;
+			for (int y = 0; y < reg.height; ++y)
+				for (int x = 0; x < reg.width; ++x)
+					for (int c = 0; c < 3; ++c) {
+						int d = std::abs(int(a[(static_cast<size_t>(ry0 + y) * full.width + rx0 + x) * 4 + c]) - int(b[(static_cast<size_t>(y) * reg.width + x) * 4 + c]));
+						if (d) { ++diff; maxd = std::max(maxd, d); if (d > 8) ++big; }
+					}
+			std::printf("seam check at scale %.1f: region %dx%d vs full render -> %zu differing values, max difference %d/255, %zu above 8 %s\n", sc, reg.width, reg.height, diff, maxd, big, diff == 0 ? "(identical)" : "");
+		}
+		return 0;
+	}
+
 	if (cmd == L"render") {
 		// How much of each page is actually inked: a blank (all-white) page prints 0.
 		for (int p = 0; p < doc.pageCount(); ++p) {
