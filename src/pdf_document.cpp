@@ -3238,11 +3238,178 @@ bool PdfDocument::flattenAnnotationsToContent(std::string& err)
 	return true;
 }
 
+namespace {
+
+// Records, for each image we are tracking, the lowest resolution (pixels per
+// inch) it is ever drawn at -- measured from the full transform the page
+// interpreter hands a device, so an image placed inside a form XObject that is
+// itself scaled on the page (very common for phone scans and "image + text
+// layer" PDFs) is measured at what the reader actually sees, not at the size
+// it has inside the form.
+struct ImageDpiProbe {
+	fz_device super;
+	const std::unordered_map<fz_image*, int>* tracked;
+	std::unordered_map<fz_image*, float>* dpi;
+};
+
+void imageDpiFill(fz_context*, fz_device* dev, fz_image* img, fz_matrix ctm, float, fz_color_params)
+{
+	auto* p = reinterpret_cast<ImageDpiProbe*>(dev);
+	if (!p->tracked->count(img)) return;
+	float ex = std::sqrt(ctm.a * ctm.a + ctm.b * ctm.b), ey = std::sqrt(ctm.c * ctm.c + ctm.d * ctm.d);
+	if (ex <= 0.0f || ey <= 0.0f) return;
+	float d = std::min(img->w * 72.0f / ex, img->h * 72.0f / ey);
+	auto it = p->dpi->find(img);
+	if (it == p->dpi->end()) p->dpi->emplace(img, d);
+	else if (d < it->second) it->second = d; // keep enough resolution for its largest use
+}
+
+// Downsamples image object `num` so its largest use lands at `targetDpi`, and
+// re-encodes it as JPEG -- but only when that really is smaller. Photos and
+// scans only: anything with a mask, a Decode array, an index palette or a
+// colour key is left exactly as it is. Returns true if the object changed.
+bool shrinkImageObject(fz_context* ctx, pdf_document* pdf, int num, fz_image* img, float dpi, int targetDpi, int quality)
+{
+	bool changed = false;
+	fz_pixmap* pix = nullptr;
+	fz_pixmap* tmp = nullptr;
+	fz_buffer* jpg = nullptr;
+	pdf_obj* ref = nullptr;
+	fz_var(pix); fz_var(tmp); fz_var(jpg); fz_var(ref); fz_var(changed);
+	fz_try(ctx) {
+		int nw = std::max(1, static_cast<int>(std::lround(img->w * static_cast<double>(targetDpi) / dpi)));
+		int nh = std::max(1, static_cast<int>(std::lround(img->h * static_cast<double>(targetDpi) / dpi)));
+		// A JPEG at the target size costs very roughly 0.12 bytes per pixel or more.
+		// An image already stored smaller than that (a lossless scan of a mostly
+		// white text page, say) can't be beaten, so don't spend seconds decoding and
+		// encoding it just to throw the result away.
+		int64_t storedLen = pdf_to_int64(ctx, pdf_dict_get(ctx, pdf_load_object(ctx, pdf, num), PDF_NAME(Length)));
+		bool worthTrying = storedLen <= 0 || static_cast<double>(storedLen) > 0.12 * nw * nh;
+		if (worthTrying && nw < img->w && nh < img->h) {
+			int w = nw, h = nh;
+			// Decodes at a power-of-two reduction where the format allows it (JPEG
+			// scales while decoding), so a 24-megapixel photo is cheap to read.
+			pix = fz_get_pixmap_from_image(ctx, img, nullptr, nullptr, &w, &h);
+			bool usable = pix && !pix->alpha && pix->w > 0 && pix->h > 0;
+			bool toRgb = false;
+			if (usable) {
+				fz_colorspace* cs = pix->colorspace;
+				if (!(cs && (fz_colorspace_is_gray(ctx, cs) || fz_colorspace_is_rgb(ctx, cs)))) {
+					tmp = fz_convert_pixmap(ctx, pix, fz_device_rgb(ctx), nullptr, nullptr, fz_default_color_params, 0);
+					fz_drop_pixmap(ctx, pix); pix = tmp; tmp = nullptr;
+					toRgb = true;
+				}
+				if (pix->w != nw || pix->h != nh) {
+					tmp = fz_scale_pixmap(ctx, pix, 0, 0, static_cast<float>(nw), static_cast<float>(nh), nullptr);
+					fz_drop_pixmap(ctx, pix); pix = tmp; tmp = nullptr;
+				}
+				jpg = fz_new_buffer_from_pixmap_as_jpeg(ctx, pix, fz_default_color_params, quality, 0);
+				pdf_obj* o = pdf_load_object(ctx, pdf, num);
+				int64_t oldLen = pdf_to_int64(ctx, pdf_dict_get(ctx, o, PDF_NAME(Length)));
+				if (oldLen <= 0 || static_cast<int64_t>(fz_buffer_storage(ctx, jpg, nullptr)) < oldLen) {
+					ref = pdf_new_indirect(ctx, pdf, num, 0);
+					pdf_dict_put_int(ctx, o, PDF_NAME(Width), nw);
+					pdf_dict_put_int(ctx, o, PDF_NAME(Height), nh);
+					pdf_dict_put_int(ctx, o, PDF_NAME(BitsPerComponent), 8);
+					pdf_dict_put(ctx, o, PDF_NAME(Filter), PDF_NAME(DCTDecode));
+					pdf_dict_del(ctx, o, PDF_NAME(DecodeParms));
+					if (toRgb) pdf_dict_put(ctx, o, PDF_NAME(ColorSpace), PDF_NAME(DeviceRGB));
+					pdf_update_stream(ctx, pdf, ref, jpg, 1); // already DCT-encoded
+					changed = true;
+				}
+			}
+		}
+	}
+	fz_always(ctx) {
+		if (pix) fz_drop_pixmap(ctx, pix);
+		if (tmp) fz_drop_pixmap(ctx, tmp);
+		if (jpg) fz_drop_buffer(ctx, jpg);
+		if (ref) pdf_drop_obj(ctx, ref);
+	}
+	fz_catch(ctx) { changed = false; }
+	return changed;
+}
+
+// The pass MuPDF's own image rewriter cannot do: it measures each image's
+// resolution inside a form XObject on its own, without the transform the page
+// puts on that form, so a camera photo drawn through a form looks like a
+// 72-dpi picture and is never touched. Here every photo is measured at its
+// real on-page size first. Returns the number of images shrunk.
+int shrinkOversizedImages(fz_context* ctx, pdf_document* pdf, int pageCount)
+{
+	constexpr int kTarget = 150, kTrigger = 165, kQuality = 75;
+	std::unordered_map<fz_image*, int> tracked; // pinned image -> its object number
+	std::unordered_map<fz_image*, float> dpi;
+	int shrunk = 0;
+	fz_device* dev = nullptr;
+	fz_var(dev); fz_var(shrunk);
+	fz_try(ctx) {
+		int len = pdf_xref_len(ctx, pdf);
+		for (int i = 1; i < len; ++i) {
+			fz_try(ctx) {
+				pdf_obj* o = pdf_load_object(ctx, pdf, i);
+				if (pdf_is_dict(ctx, o) && pdf_dict_get(ctx, o, PDF_NAME(Subtype)) == PDF_NAME(Image) &&
+					pdf_dict_get(ctx, o, PDF_NAME(Mask)) == nullptr && pdf_dict_get(ctx, o, PDF_NAME(Decode)) == nullptr &&
+					!pdf_to_bool(ctx, pdf_dict_get(ctx, o, PDF_NAME(ImageMask))) &&
+					pdf_dict_get(ctx, o, PDF_NAME(SMaskInData)) == nullptr) {
+					pdf_obj* ref = pdf_new_indirect(ctx, pdf, i, 0);
+					fz_image* im = nullptr;
+					fz_try(ctx) { im = pdf_load_image(ctx, pdf, ref); }
+					fz_always(ctx) { pdf_drop_obj(ctx, ref); }
+					fz_catch(ctx) { im = nullptr; }
+					if (im) {
+						bool keep = !im->imagemask && !im->use_colorkey && !im->scalable &&
+							!(im->colorspace && (fz_colorspace_is_indexed(ctx, im->colorspace) || fz_colorspace_is_device_n(ctx, im->colorspace) ||
+								fz_colorspace_is_lab(ctx, im->colorspace)));
+						if (keep) tracked[im] = i;
+						else fz_drop_image(ctx, im);
+					}
+				}
+			}
+			fz_catch(ctx) { /* one unreadable object doesn't stop the rest */ }
+		}
+		if (!tracked.empty()) {
+			dev = fz_new_device_of_size(ctx, sizeof(ImageDpiProbe));
+			auto* probe = reinterpret_cast<ImageDpiProbe*>(dev);
+			probe->tracked = &tracked;
+			probe->dpi = &dpi;
+			dev->fill_image = imageDpiFill;
+			for (int p = 0; p < pageCount; ++p) {
+				fz_page* pg = nullptr;
+				fz_try(ctx) {
+					pg = fz_load_page(ctx, reinterpret_cast<fz_document*>(pdf), p);
+					fz_run_page_contents(ctx, pg, dev, fz_identity, nullptr);
+				}
+				fz_always(ctx) { if (pg) fz_drop_page(ctx, pg); }
+				fz_catch(ctx) { /* an unreadable page is just not measured */ }
+			}
+			fz_close_device(ctx, dev);
+			for (const auto& kv : dpi) {
+				if (kv.second > kTrigger && shrinkImageObject(ctx, pdf, tracked[kv.first], kv.first, kv.second, kTarget, kQuality))
+					++shrunk;
+			}
+		}
+	}
+	fz_always(ctx) {
+		if (dev) fz_drop_device(ctx, dev);
+		for (const auto& kv : tracked) fz_drop_image(ctx, kv.first);
+	}
+	fz_catch(ctx) {}
+	return shrunk;
+}
+
+} // namespace
+
 bool PdfDocument::compress(std::string& err)
 {
 	pdf_document* pdf = ctx_ && doc_ ? pdf_document_from_fz_document(ctx_, doc_) : nullptr;
 	if (!pdf) { err = "not a PDF"; return false; }
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+	// First the photos MuPDF's rewriter can't size correctly (see
+	// shrinkOversizedImages); once they are small, its pass below runs fast over
+	// them instead of decoding every full-size photo just to leave it alone.
+	shrinkOversizedImages(ctx_, pdf, pageCount_);
 
 	// Use MuPDF's own image rewriter (the exact engine behind `mutool clean
 	// --image-subsample-dpi ... --image-recompress-method jpeg`) rather than

@@ -11,6 +11,7 @@
 extern "C" {
 #include <mupdf/pdf.h>
 }
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <chrono>
@@ -106,6 +107,123 @@ int wmain(int argc, wchar_t** argv)
 			auto chars = doc.pageChars(p);
 			std::printf("-- page %d: %zu chars in %.0f ms\n%s\n", p + 1, chars.size(), ms, Narrow(PageText(chars)).c_str());
 		}
+		return 0;
+	}
+
+	if (cmd == L"png") {
+		// png <in.pdf> <page> <scale> <out.png>
+		if (argc < 6) return 2;
+		int pn = _wtoi(argv[3]) - 1;
+		float sc = static_cast<float>(_wtof(argv[4]));
+		PageBitmap bm = doc.renderPage(pn, sc);
+		if (!bm.hbmp) { std::printf("render failed\n"); return 1; }
+		Gdiplus::GdiplusStartupInput gi; ULONG_PTR tok = 0;
+		Gdiplus::GdiplusStartup(&tok, &gi, nullptr);
+		{
+			Gdiplus::Bitmap gb(bm.hbmp, nullptr);
+			UINT n = 0, sz = 0; Gdiplus::GetImageEncodersSize(&n, &sz);
+			std::vector<char> buf(sz);
+			auto* enc = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buf.data());
+			Gdiplus::GetImageEncoders(n, sz, enc);
+			CLSID png = {};
+			for (UINT i = 0; i < n; ++i) if (wcscmp(enc[i].MimeType, L"image/png") == 0) png = enc[i].Clsid;
+			gb.Save(argv[5], &png, nullptr);
+		}
+		Gdiplus::GdiplusShutdown(tok);
+		std::printf("saved %dx%d\n", bm.width, bm.height);
+		return 0;
+	}
+
+	if (cmd == L"form") {
+		// form <in.pdf> <page>: the page's first Form XObject: its dict and the start of its content.
+		int pn = argc >= 4 ? _wtoi(argv[3]) - 1 : 0;
+		fz_context* ctx = doc.ctx();
+		pdf_document* pdf = pdf_document_from_fz_document(ctx, doc.doc());
+		fz_try(ctx) {
+			pdf_obj* page = pdf_lookup_page_obj(ctx, pdf, pn);
+			pdf_obj* res = pdf_dict_get_inheritable(ctx, page, PDF_NAME(Resources));
+			pdf_obj* xo = pdf_dict_get(ctx, res, PDF_NAME(XObject));
+			for (int i = 0; i < pdf_dict_len(ctx, xo); ++i) {
+				pdf_obj* f = pdf_dict_get_val(ctx, xo, i);
+				if (pdf_dict_get(ctx, f, PDF_NAME(Subtype)) != PDF_NAME(Form)) continue;
+				std::printf("form obj %d: Matrix=", pdf_to_num(ctx, f));
+				pdf_obj* m = pdf_dict_get(ctx, f, PDF_NAME(Matrix));
+				if (m) for (int k = 0; k < 6; ++k) std::printf("%g ", pdf_to_real(ctx, pdf_array_get(ctx, m, k)));
+				pdf_obj* bb = pdf_dict_get(ctx, f, PDF_NAME(BBox));
+				std::printf(" BBox=");
+				if (bb) for (int k = 0; k < 4; ++k) std::printf("%g ", pdf_to_real(ctx, pdf_array_get(ctx, bb, k)));
+				std::printf("\n");
+				fz_buffer* b = pdf_load_stream(ctx, f);
+				unsigned char* d = nullptr; size_t n = fz_buffer_storage(ctx, b, &d);
+				std::printf("content (%zu bytes): %.*s\n", n, (int)std::min<size_t>(n, 600), (const char*)d);
+				fz_drop_buffer(ctx, b);
+				pdf_obj* r2 = pdf_dict_get(ctx, f, PDF_NAME(Resources));
+				pdf_obj* x2 = pdf_dict_get(ctx, r2, PDF_NAME(XObject));
+				for (int k = 0; x2 && k < pdf_dict_len(ctx, x2); ++k)
+					std::printf("  inner /%s -> obj %d (%s)\n", pdf_to_name(ctx, pdf_dict_get_key(ctx, x2, k)), pdf_to_num(ctx, pdf_dict_get_val(ctx, x2, k)),
+						pdf_to_name(ctx, pdf_dict_get(ctx, pdf_dict_get_val(ctx, x2, k), PDF_NAME(Subtype))));
+				break;
+			}
+		}
+		fz_catch(ctx) { std::printf("form error: %s\n", fz_caught_message(ctx)); }
+		return 0;
+	}
+
+	if (cmd == L"compress") {
+		// compress <in.pdf> <out.pdf>: what the Compress menu item does, then Save.
+		if (argc < 4) return 2;
+		std::string err;
+		auto t0 = std::chrono::steady_clock::now();
+		if (!doc.compress(err)) { std::printf("compress FAILED: %s\n", err.c_str()); return 1; }
+		std::printf("compress() done in %.0f ms\n", Ms(t0));
+		if (!doc.save(argv[3], false, err)) { std::printf("save FAILED: %s\n", err.c_str()); return 1; }
+		WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+		GetFileAttributesExW(argv[2], GetFileExInfoStandard, &a);
+		GetFileAttributesExW(argv[3], GetFileExInfoStandard, &b);
+		double in = (double(a.nFileSizeHigh) * 4294967296.0 + a.nFileSizeLow), out = (double(b.nFileSizeHigh) * 4294967296.0 + b.nFileSizeLow);
+		std::printf("input %.2f MB -> output %.2f MB (%.0f%% smaller)\n", in / 1048576.0, out / 1048576.0, 100.0 * (1 - out / in));
+		return 0;
+	}
+
+	if (cmd == L"objs") {
+		// The biggest objects by stored stream size, with what kind of thing each is.
+		fz_context* ctx = doc.ctx();
+		pdf_document* pdf = pdf_document_from_fz_document(ctx, doc.doc());
+		struct Row { int num; size_t len; std::string what; };
+		std::vector<Row> rows;
+		size_t total = 0, images = 0, fonts = 0, other = 0;
+		int n = pdf_xref_len(ctx, pdf);
+		for (int i = 1; i < n; ++i) {
+			fz_try(ctx) {
+				if (pdf_obj_num_is_stream(ctx, pdf, i)) {
+					pdf_obj* o = pdf_load_object(ctx, pdf, i);
+					size_t len = static_cast<size_t>(pdf_to_int(ctx, pdf_dict_get(ctx, o, PDF_NAME(Length))));
+					std::string what = "stream";
+					pdf_obj* st = pdf_dict_get(ctx, o, PDF_NAME(Subtype));
+					if (st == PDF_NAME(Image)) {
+						char b[220];
+						pdf_obj* f = pdf_dict_get(ctx, o, PDF_NAME(Filter));
+						if (pdf_is_array(ctx, f)) f = pdf_array_get(ctx, f, 0);
+						pdf_obj* cs = pdf_dict_get(ctx, o, PDF_NAME(ColorSpace));
+						std::snprintf(b, sizeof b, "IMAGE %dx%d bpc=%d filter=%s cs=%s%s", pdf_to_int(ctx, pdf_dict_get(ctx, o, PDF_NAME(Width))),
+							pdf_to_int(ctx, pdf_dict_get(ctx, o, PDF_NAME(Height))), pdf_to_int(ctx, pdf_dict_get(ctx, o, PDF_NAME(BitsPerComponent))),
+							f ? pdf_to_name(ctx, f) : "none", cs && pdf_is_name(ctx, cs) ? pdf_to_name(ctx, cs) : (cs ? "array/ref" : "-"),
+							pdf_dict_get(ctx, o, PDF_NAME(SMask)) ? " +SMask" : "");
+						what = b; images += len;
+					} else if (pdf_dict_get(ctx, o, PDF_NAME(Length1)) || pdf_dict_get(ctx, o, PDF_NAME(Length2)) || st == PDF_NAME(OpenType) || st == PDF_NAME(CIDFontType0C)) {
+						what = "font file"; fonts += len;
+					} else if (st) { what = std::string("stream /") + pdf_to_name(ctx, st); other += len; }
+					else other += len;
+					total += len;
+					rows.push_back({ i, len, what });
+				}
+			}
+			fz_catch(ctx) {}
+		}
+		std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.len > b.len; });
+		std::printf("stream bytes: total %.2f MB  (images %.2f MB, font files %.2f MB, other %.2f MB)\n", total / 1048576.0, images / 1048576.0, fonts / 1048576.0, other / 1048576.0);
+		for (size_t i = 0; i < rows.size() && i < 14; ++i)
+			std::printf("  obj %5d  %9.1f KB  %s\n", rows[i].num, rows[i].len / 1024.0, rows[i].what.c_str());
 		return 0;
 	}
 
