@@ -1031,6 +1031,40 @@ int wmain(int argc, wchar_t** argv)
 				std::wprintf(L"  [%hs] \"%ls\" %ls\n", stage, x.c_str(), found ? L"present" : L"MISSING");
 				if (!found) ++failures;
 			}
+			// The text layer reading back right isn't enough: a glyph can
+			// decode to the right character yet draw nothing (a font subset
+			// with that outline emptied out). Every non-space character of an
+			// edited line must actually put ink on the page.
+			{
+				const float sc = 2.0f;
+				PageBitmap pb = d.renderPage(page, sc);
+				HDC hdc = CreateCompatibleDC(nullptr);
+				HGDIOBJ old = SelectObject(hdc, pb.hbmp);
+				for (const TextRun& r : after) {
+					std::wstring t = r.text;
+					while (!t.empty() && t.back() == L' ') t.pop_back();
+					if (std::find(expected.begin(), expected.end(), t) == expected.end()) continue;
+					std::wstring blanks;
+					for (size_t i = 0; i < r.glyphs.size(); ++i) {
+						const TextGlyph& g = r.glyphs[i];
+						if (g.synthetic || g.unicode == ' ') continue;
+						int x0 = static_cast<int>(g.x * sc), x1 = static_cast<int>(std::ceil(g.endX * sc));
+						int y0 = static_cast<int>((g.y - 0.75f * r.size) * sc), y1 = static_cast<int>((g.y + 0.1f * r.size) * sc);
+						int ink = 0;
+						for (int y = y0; y < y1 && !ink; ++y)
+							for (int x = x0; x < x1 && !ink; ++x) {
+								COLORREF c = GetPixel(hdc, x, y);
+								if (GetRValue(c) < 200 || GetGValue(c) < 200 || GetBValue(c) < 200) ink = 1;
+							}
+						if (!ink) blanks.push_back(static_cast<wchar_t>(g.unicode));
+					}
+					std::wprintf(L"  [%hs] ink check \"%ls\": %ls%ls\n", stage, t.c_str(),
+						blanks.empty() ? L"every character drawn" : L"BLANK GLYPHS: ", blanks.c_str());
+					if (!blanks.empty()) ++failures;
+				}
+				SelectObject(hdc, old);
+				DeleteDC(hdc);
+			}
 			// Every run we didn't edit must still be there, same text, same place.
 			int untouched = 0, lost = 0;
 			for (const TextRun& b : before) {

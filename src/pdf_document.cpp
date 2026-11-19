@@ -3699,8 +3699,11 @@ void mergeAdjacentRuns(std::vector<TextRun>& runs)
 				if (i == j) continue;
 				TextRun& a = runs[i];
 				const TextRun& b = runs[j];
-				if (a.fontName != b.fontName || std::fabs(a.size - b.size) > 0.05f ||
-					a.color != b.color || a.visible != b.visible) continue;
+				// Same family + style, not the raw font name: an edit that fell
+				// back to the installed font ("ArialMT") must still join the
+				// untouched part of its line drawn in the PDF's subset ("Arial").
+				if (_wcsicmp(a.family.c_str(), b.family.c_str()) != 0 || a.bold != b.bold || a.italic != b.italic ||
+					std::fabs(a.size - b.size) > 0.05f || a.color != b.color || a.visible != b.visible) continue;
 				if (std::fabs(a.dir.x - b.dir.x) > 0.01f || std::fabs(a.dir.y - b.dir.y) > 0.01f) continue;
 				const TextGlyph& ae = a.glyphs.back();
 				const TextGlyph& bs = b.glyphs.front();
@@ -3786,6 +3789,57 @@ int cmapCodeBytes(pdf_cmap* cm)
 	return 0;
 }
 
+// A new Type0 font object copied from `tmpl` (one made by pdf_add_cid_font)
+// but with its own embedded font program `fontFile`. The CIDFont dictionary,
+// descriptor and font file are fresh objects; /W and /ToUnicode, identical
+// for every copy, stay shared.
+pdf_obj* cidFontWithFile(fz_context* ctx, pdf_document* pdf, pdf_obj* tmpl, fz_buffer* fontFile)
+{
+	pdf_obj* ffDict = nullptr;
+	pdf_obj* ff = nullptr;
+	pdf_obj* fd = nullptr;
+	pdf_obj* cid = nullptr;
+	pdf_obj* arr = nullptr;
+	pdf_obj* type0 = nullptr;
+	pdf_obj* out = nullptr;
+	fz_try(ctx) {
+		pdf_obj* tCid = pdf_array_get(ctx, pdf_dict_get(ctx, tmpl, PDF_NAME(DescendantFonts)), 0);
+		pdf_obj* tFd = pdf_dict_get(ctx, tCid, PDF_NAME(FontDescriptor));
+		ffDict = pdf_new_dict(ctx, pdf, 1);
+		pdf_dict_put_int(ctx, ffDict, PDF_NAME(Length1), static_cast<int64_t>(fz_buffer_storage(ctx, fontFile, nullptr)));
+		ff = pdf_add_stream(ctx, pdf, fontFile, ffDict, 0);
+		fd = pdf_copy_dict(ctx, tFd);
+		pdf_dict_put(ctx, fd, PDF_NAME(FontFile2), ff);
+		cid = pdf_copy_dict(ctx, tCid);
+		pdf_dict_put_drop(ctx, cid, PDF_NAME(FontDescriptor), pdf_add_object(ctx, pdf, fd));
+		arr = pdf_new_array(ctx, pdf, 1);
+		pdf_array_push_drop(ctx, arr, pdf_add_object(ctx, pdf, cid));
+		type0 = pdf_copy_dict(ctx, tmpl);
+		pdf_dict_put(ctx, type0, PDF_NAME(DescendantFonts), arr);
+		out = pdf_add_object(ctx, pdf, type0);
+	}
+	fz_always(ctx) {
+		pdf_drop_obj(ctx, ffDict);
+		pdf_drop_obj(ctx, ff);
+		pdf_drop_obj(ctx, fd);
+		pdf_drop_obj(ctx, cid);
+		pdf_drop_obj(ctx, arr);
+		pdf_drop_obj(ctx, type0);
+	}
+	fz_catch(ctx) { fz_rethrow(ctx); }
+	return out;
+}
+
+// Whether `gid` actually draws something. Not fz_is_empty_rect on
+// fz_bound_glyph: MuPDF caches an outline-less glyph's box as 0..1e-7 (so it
+// isn't re-measured), which is NOT "empty" -- every glyph a subset had emptied
+// out passed that test, and an edit reusing such a font drew blanks.
+bool glyphHasInk(fz_context* ctx, fz_font* font, int gid)
+{
+	fz_rect b = fz_bound_glyph(ctx, font, gid, fz_identity); // em units
+	return (b.x1 - b.x0) > 1e-3f || (b.y1 - b.y0) > 1e-3f;
+}
+
 // unicode -> character code for every glyph this font can actually draw. An
 // embedded font is usually a SUBSET, so a code with a Unicode mapping can
 // still have an empty outline -- those are left out (space excepted).
@@ -3804,7 +3858,7 @@ std::unordered_map<int, unsigned> reverseFontEncoding(fz_context* ctx, pdf_font_
 		if (len != 1 || ucs[0] <= 0 || ucs[0] == 0xFFFD || out.count(ucs[0])) continue;
 		int gid = pdf_font_cid_to_gid(ctx, d, cid);
 		if (gid <= 0) continue;
-		if (ucs[0] != ' ' && fz_is_empty_rect(fz_bound_glyph(ctx, d->font, gid, fz_identity))) continue;
+		if (ucs[0] != ' ' && !glyphHasInk(ctx, d->font, gid)) continue;
 		out[ucs[0]] = code;
 	}
 	return out;
@@ -3941,36 +3995,57 @@ bool PdfDocument::replaceTextRun(int page, const TextRun& run, const std::wstrin
 			codeBytes = 2; // pdf_add_cid_font: Identity-H, CID == GID
 			std::string key = family + (bold ? "|B" : "") + (italic ? "|I" : "");
 			std::set<int>& used = editFontGids_[key];
-			used.insert(0);
-			for (size_t i = 0; i < emit.size(); ++i) if (!asGap[i]) used.insert(static_cast<int>(codes[i]));
+			bool covered = true;
+			for (size_t i = 0; i < emit.size(); ++i)
+				if (!asGap[i] && !used.count(static_cast<int>(codes[i]))) covered = false;
 			auto it = editFontObjs_.find(key);
-			if (it != editFontObjs_.end()) {
+			// Reuse this session's embedded font only if it already has every
+			// glyph needed. A font object is never changed once it exists:
+			// MuPDF caches the font it loaded for it, so glyphs added later
+			// would draw blank on screen until the file was reopened. A grown
+			// glyph set gets a new object; earlier text keeps its own.
+			if (it != editFontObjs_.end() && covered) {
 				fontObj = pdf_new_indirect(ctx_, pdf, it->second, 0);
 			} else {
-				fontObj = pdf_add_cid_font(ctx_, pdf, sysFont);
+				used.insert(0);
+				for (size_t i = 0; i < emit.size(); ++i) if (!asGap[i]) used.insert(static_cast<int>(codes[i]));
+				// The whole installed font is ~800KB (Calibri); embed only the
+				// glyphs edits have used. CID mode keeps every glyph's number,
+				// so CID == GID still holds.
+				fz_buffer* fontFile = nullptr;
+				fz_try(ctx_) {
+					std::vector<int> gids(used.begin(), used.end());
+					fontFile = fz_subset_ttf_for_gids(ctx_, sysFont->buffer, gids.data(), static_cast<int>(gids.size()), 0, 1);
+				}
+				fz_catch(ctx_) { fontFile = fz_keep_buffer(ctx_, sysFont->buffer); } // full font: bigger, still correct
+				// pdf_add_cid_font builds the widths and ToUnicode from the full
+				// font, but hands back the SAME object for the same font file
+				// every time -- so treat it as a read-only template and copy it.
+				pdf_obj* tmpl = nullptr;
+				fz_buffer* none = nullptr;
+				fz_try(ctx_) {
+					tmpl = pdf_add_cid_font(ctx_, pdf, sysFont);
+					fontObj = cidFontWithFile(ctx_, pdf, tmpl, fontFile);
+					// Nothing draws with the template, but it still holds the WHOLE
+					// installed font -- and a save that falls back to incremental
+					// writes even unreferenced objects. Empty its font file.
+					pdf_obj* tFf = pdf_dict_get(ctx_, pdf_dict_get(ctx_, pdf_array_get(ctx_,
+						pdf_dict_get(ctx_, tmpl, PDF_NAME(DescendantFonts)), 0), PDF_NAME(FontDescriptor)), PDF_NAME(FontFile2));
+					if (tFf) {
+						none = fz_new_buffer(ctx_, 1);
+						pdf_update_stream(ctx_, pdf, tFf, none, 0);
+						pdf_dict_put_int(ctx_, tFf, PDF_NAME(Length1), 0);
+					}
+				}
+				fz_always(ctx_) {
+					pdf_drop_obj(ctx_, tmpl);
+					fz_drop_buffer(ctx_, fontFile);
+					fz_drop_buffer(ctx_, none);
+				}
+				fz_catch(ctx_) { fz_rethrow(ctx_); }
 				editFontObjs_[key] = pdf_to_num(ctx_, fontObj);
 			}
 			ownFontObj = true;
-			// pdf_add_cid_font embeds the WHOLE installed font (Calibri alone is
-			// ~800KB). Swap in a subset of just the glyphs edits have used. CID
-			// mode keeps every glyph's number, so text drawn by earlier edits in
-			// this font still points at the right glyphs after a re-subset.
-			fz_try(ctx_) {
-				pdf_obj* cid = pdf_array_get(ctx_, pdf_dict_get(ctx_, fontObj, PDF_NAME(DescendantFonts)), 0);
-				pdf_obj* ff2 = pdf_dict_get(ctx_, pdf_dict_get(ctx_, cid, PDF_NAME(FontDescriptor)), PDF_NAME(FontFile2));
-				if (ff2 && sysFont->buffer) {
-					std::vector<int> gids(used.begin(), used.end());
-					fz_buffer* sub = fz_subset_ttf_for_gids(ctx_, sysFont->buffer, gids.data(),
-						static_cast<int>(gids.size()), 0, 1);
-					fz_try(ctx_) {
-						pdf_update_stream(ctx_, pdf, ff2, sub, 0);
-						pdf_dict_put_int(ctx_, ff2, PDF_NAME(Length1), static_cast<int64_t>(fz_buffer_storage(ctx_, sub, nullptr)));
-					}
-					fz_always(ctx_) { fz_drop_buffer(ctx_, sub); }
-					fz_catch(ctx_) { fz_rethrow(ctx_); }
-				}
-			}
-			fz_catch(ctx_) { /* keep the full font: bigger file, still correct */ }
 		}
 
 		// Remove the original glyphs from the first change onwards.
