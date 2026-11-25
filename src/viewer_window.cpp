@@ -1725,6 +1725,13 @@ private:
 	void clearTabMultiSelect();
 	static LRESULT CALLBACK TabStripSubclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 	RECT tabCloseRect(int idx) const; // hit-test rect for a tab's close "x", also used to draw it
+	// The "+" (new blank tab) button that sits just after the last tab. It is
+	// painted by TabStripSubclass over the tab control's own trailing area
+	// rather than being a separate window, so it always tracks the tabs.
+	// newTabButtonRect() is empty when the tabs leave no room for it.
+	RECT newTabButtonRect() const;
+	void syncNewTabButton();   // repaints old/new spots + moves the tooltip when the rect changed
+	void paintNewTabButton();
 	void drawTabItem(const DRAWITEMSTRUCT* dis);
 	void drawStatusBarItem(const DRAWITEMSTRUCT* dis);
 
@@ -1739,6 +1746,9 @@ private:
 	// apart from the toolbar's (see the handler for why that distinction
 	// matters: idFrom means something different for each).
 	HWND tabTooltip_ = nullptr;
+	RECT newTabRect_ = {};       // where the "+" was last laid out (see syncNewTabButton)
+	bool newTabHot_ = false;     // cursor is over the "+"
+	HWND newTabTip_ = nullptr;   // its own tooltip -- the tab control's serves only the tabs
 	std::vector<std::unique_ptr<DocTab>> tabs_;
 	int activeTab_ = -1;
 	// Paths of tabs closed in THIS window during THIS run, most recent first,
@@ -7289,6 +7299,21 @@ void FrameWindow::createChildren()
 	SendMessageW(tabStrip_, TCM_SETITEMSIZE, 0, MAKELPARAM(Scale(160, dpi), Scale(28, dpi)));
 	SetWindowSubclass(tabStrip_, TabStripSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
 	tabTooltip_ = reinterpret_cast<HWND>(SendMessageW(tabStrip_, TCM_GETTOOLTIPS, 0, 0));
+	// "+" tooltip: a separate tooltip control with fixed text (TTF_SUBCLASS
+	// has it watch the tab strip's mouse messages itself). Its tool rect is
+	// moved by syncNewTabButton() as tabs come and go.
+	newTabTip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+		WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+		hwnd_, nullptr, hInst_, nullptr);
+	if (newTabTip_) {
+		TOOLINFOW ti = {};
+		ti.cbSize = sizeof(ti);
+		ti.uFlags = TTF_SUBCLASS;
+		ti.hwnd = tabStrip_;
+		ti.uId = 1;
+		ti.lpszText = const_cast<LPWSTR>(L"New tab");
+		SendMessageW(newTabTip_, TTM_ADDTOOL, 0, reinterpret_cast<LPARAM>(&ti));
+	}
 
 	// Status bar
 	status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
@@ -10230,8 +10255,86 @@ void FrameWindow::updateTabWidths(int barW)
 	if (n <= 0) n = 1;
 	int maxW = Scale(160, dpi);
 	int minW = Scale(56, dpi);
-	int w = std::clamp(barW / n, minW, maxW);
+	// Leave room after the last tab for the "+" (gap + button + breathing room).
+	int reserve = Scale(4, dpi) + Scale(24, dpi) + Scale(10, dpi);
+	int w = std::clamp((barW - reserve) / n, minW, maxW);
 	SendMessageW(tabStrip_, TCM_SETITEMSIZE, 0, MAKELPARAM(w, Scale(28, dpi)));
+	syncNewTabButton();
+}
+
+RECT FrameWindow::newTabButtonRect() const
+{
+	RECT out = {};
+	int n = static_cast<int>(tabs_.size());
+	if (!tabStrip_ || n <= 0) return out;
+	RECT last = {};
+	if (!SendMessageW(tabStrip_, TCM_GETITEMRECT, n - 1, reinterpret_cast<LPARAM>(&last))) return out;
+	UINT dpi = GetDpiForWindow(hwnd_);
+	int size = Scale(24, dpi), gap = Scale(4, dpi);
+	RECT client;
+	GetClientRect(tabStrip_, &client);
+	RECT r;
+	r.left = last.right + gap;
+	r.right = r.left + size;
+	r.top = last.top + ((last.bottom - last.top) - size) / 2;
+	r.bottom = r.top + size;
+	// So many tabs that the strip is scrolling: no room, so no button (the
+	// strip's own scroll arrows occupy that end).
+	if (r.right > client.right) return out;
+	return r;
+}
+
+void FrameWindow::syncNewTabButton()
+{
+	if (!tabStrip_) return;
+	RECT r = newTabButtonRect();
+	if (EqualRect(&r, &newTabRect_)) return;
+	// Erase the old spot (a tab was closed, or the window resized) as well as
+	// painting the new one, or the old "+" would be left behind.
+	if (!IsRectEmpty(&newTabRect_)) InvalidateRect(tabStrip_, &newTabRect_, TRUE);
+	newTabRect_ = r;
+	if (!IsRectEmpty(&r)) InvalidateRect(tabStrip_, &r, TRUE);
+	newTabHot_ = false;
+	if (newTabTip_) {
+		TOOLINFOW ti = {};
+		ti.cbSize = sizeof(ti);
+		ti.hwnd = tabStrip_;
+		ti.uId = 1;
+		ti.rect = r;
+		SendMessageW(newTabTip_, TTM_NEWTOOLRECT, 0, reinterpret_cast<LPARAM>(&ti));
+	}
+}
+
+void FrameWindow::paintNewTabButton()
+{
+	RECT r = newTabButtonRect();
+	if (IsRectEmpty(&r)) return;
+	HDC dc = GetDC(tabStrip_);
+	if (!dc) return;
+	const ThemeColors& th = Theme(isDark_);
+	UINT dpi = GetDpiForWindow(hwnd_);
+	if (newTabHot_) {
+		HBRUSH b = CreateSolidBrush(th.tabBorder);
+		HGDIOBJ oldB = SelectObject(dc, b);
+		HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
+		int rad = Scale(6, dpi);
+		RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, rad, rad);
+		SelectObject(dc, oldP);
+		SelectObject(dc, oldB);
+		DeleteObject(b);
+	}
+	// Same muted ink as a tab's close "x", brightening under the cursor.
+	COLORREF ink = newTabHot_ ? th.tabText : (isDark_ ? RGB(150, 150, 150) : RGB(100, 100, 100));
+	HPEN pen = CreatePen(PS_SOLID, Scale(1, dpi), ink);
+	HGDIOBJ oldPen = SelectObject(dc, pen);
+	int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, half = Scale(5, dpi);
+	MoveToEx(dc, cx - half, cy, nullptr);
+	LineTo(dc, cx + half + 1, cy);
+	MoveToEx(dc, cx, cy - half, nullptr);
+	LineTo(dc, cx, cy + half + 1);
+	SelectObject(dc, oldPen);
+	DeleteObject(pen);
+	ReleaseDC(tabStrip_, dc);
 }
 
 LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
@@ -10249,8 +10352,52 @@ LRESULT CALLBACK FrameWindow::TabStripSubclass(HWND hwnd, UINT msg, WPARAM wp, L
 		DeleteObject(b);
 		return 1;
 	}
+	// The "+" button, painted over the control's own trailing area right after
+	// the default paint (which draws -- and, on a partial repaint, may have
+	// erased -- whatever is behind it).
+	if (msg == WM_PAINT) {
+		LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+		self->paintNewTabButton();
+		return r;
+	}
+	// The tab control answers HTTRANSPARENT for the blank area past its last
+	// tab, so real mouse input there falls through to the window behind it and
+	// never reaches this proc (messages posted straight at the control, as a
+	// test harness does, bypass hit-testing and so hid this). Claim the "+"
+	// for the control so it gets the hover and click.
+	if (msg == WM_NCHITTEST) {
+		POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+		ScreenToClient(hwnd, &pt);
+		RECT nb = self->newTabButtonRect();
+		if (!IsRectEmpty(&nb) && PtInRect(&nb, pt)) return HTCLIENT;
+	}
+	if (msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE) {
+		bool over = false;
+		if (msg == WM_MOUSEMOVE) {
+			POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+			RECT nb = self->newTabButtonRect();
+			over = !IsRectEmpty(&nb) && PtInRect(&nb, pt);
+			if (over && !self->newTabHot_) {
+				TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+				TrackMouseEvent(&tme);
+			}
+		}
+		if (over != self->newTabHot_) {
+			self->newTabHot_ = over;
+			RECT nb = self->newTabButtonRect();
+			if (!IsRectEmpty(&nb)) InvalidateRect(hwnd, &nb, TRUE);
+		}
+		// fall through: the tab drag/tooltip handling below still needs these
+	}
 	if (msg == WM_LBUTTONDOWN) {
 		POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+		RECT nb = self->newTabButtonRect();
+		if (!IsRectEmpty(&nb) && PtInRect(&nb, pt)) {
+			// The blank tab shows the home page (the tools grid); opening a
+			// file from it loads into that same tab (see openDocument).
+			self->switchToTab(self->newTab());
+			return 0;
+		}
 		TCHITTESTINFO hit = {}; hit.pt = pt;
 		int idx = TabCtrl_HitTest(hwnd, &hit);
 		if (idx >= 0) {
